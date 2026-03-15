@@ -69,25 +69,31 @@ if (fs.existsSync(dlmmMjs)) {
     src = 'import BN from "bn.js";\n' + src;
   }
 
-  // Handle aliased BN imports (very common in dlmm dist)
-  // e.g. import { BN as BN18 } from "@coral-xyz/anchor";
+  // Helper: remove BN or BN as alias from an import specifier list and clean up commas
+  function removeBNFromSpecifiers(specifiers) {
+    return specifiers
+      .split(",")
+      .map(s => s.trim())
+      .filter(s => s && !/^BN(\s+as\s+\w+)?$/.test(s))
+      .join(", ");
+  }
+
+  // Handle aliased BN imports: import { BN as BN18 } from "@coral-xyz/anchor";
   src = src.replace(
     /import \{([^}]*)\bBN as (\w+)\b([^}]*)\} from "@coral-xyz\/anchor";/g,
     (_, before, alias, after) => {
-      const remaining = [before.trim(), after.trim()].filter(Boolean).join(", ");
+      const remaining = removeBNFromSpecifiers(before + "," + after);
       const anchorImport = remaining ? `import { ${remaining} } from "@coral-xyz/anchor";` : "";
       return `${anchorImport}\nconst ${alias} = BN;`;
     }
   );
 
   // Handle named BN imports: import { BN } from "@coral-xyz/anchor";
-  // Use negative lookahead to avoid matching "BN as alias" (handled above)
   src = src.replace(
     /import \{([^}]*)\bBN\b(?!\s*as\b)([^}]*)\} from "@coral-xyz\/anchor";/g,
     (_, before, after) => {
-      const remaining = [before.trim(), after.trim()].filter(Boolean).join(", ");
-      const anchorImport = remaining ? `import { ${remaining} } from "@coral-xyz/anchor";` : "";
-      return anchorImport;
+      const remaining = removeBNFromSpecifiers(before + "," + after);
+      return remaining ? `import { ${remaining} } from "@coral-xyz/anchor";` : "";
     }
   );
 
