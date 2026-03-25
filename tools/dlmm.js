@@ -310,6 +310,44 @@ async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   }
 }
 
+function pickSymbol(...values) {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim();
+    if (!normalized) continue;
+    if (normalized.length > 20) continue;
+    return normalized.toUpperCase();
+  }
+  return null;
+}
+
+function buildDisplayPair({ tracked, pnlEntry, poolAddress }) {
+  const trackedName = tracked?.pool_name?.trim();
+  if (trackedName) return trackedName;
+
+  const base = pickSymbol(
+    pnlEntry?.mint_x_symbol,
+    pnlEntry?.mintXSymbol,
+    pnlEntry?.tokenXSymbol,
+    pnlEntry?.token_x?.symbol,
+    pnlEntry?.tokenX?.symbol,
+    pnlEntry?.baseToken?.symbol
+  );
+  const quote = pickSymbol(
+    pnlEntry?.mint_y_symbol,
+    pnlEntry?.mintYSymbol,
+    pnlEntry?.tokenYSymbol,
+    pnlEntry?.token_y?.symbol,
+    pnlEntry?.tokenY?.symbol,
+    pnlEntry?.quoteToken?.symbol
+  );
+
+  if (base && quote) return `${base}/${quote}`;
+  if (base) return base;
+  if (quote) return quote;
+  return poolAddress.slice(0, 8);
+}
+
 // ─── Get Position PnL (Meteora API) ─────────────────────────────
 export async function getPositionPnl({ pool_address, position_address }) {
   pool_address = normalizeMint(pool_address);
@@ -373,13 +411,11 @@ export async function getMyPositions({ force = false } = {}) {
     for (const acc of accounts) {
       const positionAddress = acc.pubkey.toBase58();
       const lbPairKey = new PublicKey(acc.account.data.slice(8, 40)).toBase58();
-      // Pair name: use tracked state pool_name if available
       const tracked = getTrackedPosition(positionAddress);
-      const pair = tracked?.pool_name || lbPairKey.slice(0, 8);
       raw.push({
         position: positionAddress,
         pool: lbPairKey,
-        pair,
+        pair: tracked?.pool_name || lbPairKey.slice(0, 8),
         base_mint: null, // enriched from PnL API below
         lower_bin: null,
         upper_bin: null,
@@ -421,7 +457,7 @@ export async function getMyPositions({ force = false } = {}) {
       return {
         position: r.position,
         pool: r.pool,
-        pair: r.pair,
+        pair: buildDisplayPair({ tracked, pnlEntry: p, poolAddress: r.pool }),
         base_mint: r.base_mint,
         lower_bin: lowerBin,
         upper_bin: upperBin,

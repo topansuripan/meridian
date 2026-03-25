@@ -528,6 +528,40 @@ function formatScheduleMode(mode, interval) {
   return mode === "manual" ? "manual" : `auto tiap ${interval}m`;
 }
 
+function formatUsd(value) {
+  return Number(value || 0).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatPositionName(position) {
+  const pair = position?.pair || "Unknown";
+  if (pair.includes("/")) return pair;
+  if (pair.length <= 18) return pair;
+  return `${pair.slice(0, 8)}...${pair.slice(-4)}`;
+}
+
+function positionMood(position) {
+  if (!position.in_range) return "⚠️";
+  if ((position.pnl_usd || 0) > 0 || (position.unclaimed_fees_usd || 0) > 0) return "🟢";
+  return "🔵";
+}
+
+function rangeLabel(position) {
+  if (position.in_range) return "In range";
+  const minutes = position.minutes_out_of_range ?? 0;
+  return `Out of range ${minutes}m`;
+}
+
+function ageLabel(minutes) {
+  if (minutes == null) return "?";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
+
 async function sendTelegramStatusCard() {
   const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
   const inRange = positions.positions.filter((p) => p.in_range).length;
@@ -535,21 +569,21 @@ async function sendTelegramStatusCard() {
   const lastMgmt = timers.managementLastRun ? new Date(timers.managementLastRun).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "--.--";
   const lastScreen = timers.screeningLastRun ? new Date(timers.screeningLastRun).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "--.--";
   await sendHTML([
-    `☀️ <b>Meridian Control Center</b>`,
+    `🌟 <b>Meridian Control Center</b>`,
     `────────────────`,
     ``,
-    `<b>Wallet</b>`,
+    `<b>Wallet Snapshot</b>`,
     `💠 SOL Balance: <b>${wallet.sol}</b>`,
-    `💵 Est. USD: $${wallet.sol_usd}`,
+    `💵 Est. Value: <b>$${formatUsd(wallet.sol_usd)}</b>`,
     ``,
-    `<b>Portfolio</b>`,
-    `📂 Open Positions: ${positions.total_positions}`,
-    `✅ In Range: ${inRange}`,
-    `⚠️ Out of Range: ${outOfRange}`,
+    `<b>Portfolio Pulse</b>`,
+    `📂 Open Positions: <b>${positions.total_positions}</b>`,
+    `🟢 Healthy: ${inRange}`,
+    `⚠️ Need Attention: ${outOfRange}`,
     ``,
-    `<b>Cycle Settings</b>`,
-    `🔄 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
-    `🔍 Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    `<b>Automation</b>`,
+    `🤖 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
+    `🧭 Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
     `🩺 Health Check: ${config.schedule.healthCheckEnabled ? `on / ${config.schedule.healthCheckIntervalMin}m` : "off"}`,
     ``,
     `<b>Recent Activity</b>`,
@@ -562,14 +596,22 @@ async function sendTelegramStatusCard() {
 async function sendTelegramPositionsCard() {
   const { positions, total_positions } = await getMyPositions({ force: true });
   if (total_positions === 0) {
-    await sendHTML(`📂 <b>Open Positions</b>\n\nBelum ada posisi terbuka.`);
+    await sendHTML(`🗂️ <b>Open Positions</b>\n\nBelum ada posisi terbuka. Saatnya cari peluang baru.`);
     return;
   }
   const lines = positions.map((p, i) => {
-    const oor = p.in_range ? "In range" : `Out of range ${p.minutes_out_of_range ?? 0}m`;
-    return `${i + 1}. <b>${p.pair}</b>\n💼 Value: $${p.total_value_usd} | 💎 Fees: $${p.unclaimed_fees_usd}\n📍 ${oor}`;
+    const mood = positionMood(p);
+    const pnlLine = (p.pnl_usd || 0) >= 0
+      ? `📈 PnL: +$${formatUsd(p.pnl_usd)}`
+      : `📉 PnL: -$${formatUsd(Math.abs(p.pnl_usd || 0))}`;
+    return [
+      `${i + 1}. ${mood} <b>${formatPositionName(p)}</b>`,
+      `💼 Value: <b>$${formatUsd(p.total_value_usd)}</b>   💎 Fees: <b>$${formatUsd(p.unclaimed_fees_usd)}</b>`,
+      `${pnlLine}   ⏳ Age: ${ageLabel(p.age_minutes)}`,
+      `📍 Status: ${rangeLabel(p)}`,
+    ].join("\n");
   });
-  await sendHTML(`📂 <b>Open Positions</b> (${total_positions})\n\n${lines.join("\n\n")}\n\n<i>Pilih tombol posisi di bawah untuk detail cepat.</i>`, {
+  await sendHTML(`🗂️ <b>Open Positions</b> (${total_positions})\n\n${lines.join("\n\n")}\n\n<i>Tap tombol posisi di bawah untuk detail cepat.</i>`, {
     reply_markup: getPositionsMenuMarkup(positions),
   });
 }
@@ -592,7 +634,7 @@ async function sendTelegramConfigCard() {
   const m = config.management;
   const r = config.risk;
   await sendHTML([
-    `⚙️ <b>Settings</b>`,
+    `⚙️ <b>Settings Hub</b>`,
     `────────────────`,
     ``,
     `<b>Cycle Modes</b>`,
@@ -619,9 +661,9 @@ async function sendTelegramTradeSettingsCard() {
   await sendHTML([
     `🎛️ <b>Trade Settings</b>`,
     `────────────────`,
-    `Deploy amount: <b>${m.deployAmountSol} SOL</b>`,
-    `Take profit: <b>${m.takeProfitFeePct}%</b>`,
-    `Claim threshold: <b>$${m.minClaimAmount}</b>`,
+    `🚀 Deploy amount: <b>${m.deployAmountSol} SOL</b>`,
+    `🎯 Take profit: <b>${m.takeProfitFeePct}%</b>`,
+    `💎 Claim threshold: <b>$${m.minClaimAmount}</b>`,
     ``,
     `Pilih preset dari tombol di bawah.`,
     `────────────────`,
@@ -633,8 +675,8 @@ async function sendTelegramRiskSettingsCard() {
   await sendHTML([
     `🛡️ <b>Risk Settings</b>`,
     `────────────────`,
-    `Max positions: <b>${r.maxPositions}</b>`,
-    `Max deploy amount: <b>${r.maxDeployAmount} SOL</b>`,
+    `📚 Max positions: <b>${r.maxPositions}</b>`,
+    `🏦 Max deploy amount: <b>${r.maxDeployAmount} SOL</b>`,
     ``,
     `Pilih batas maksimum posisi dari tombol di bawah.`,
     `────────────────`,
@@ -645,8 +687,8 @@ async function sendTelegramScheduleSettingsCard() {
   await sendHTML([
     `⏱️ <b>Schedule Settings</b>`,
     `────────────────`,
-    `Management: <b>${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}</b>`,
-    `Screening: <b>${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}</b>`,
+    `🤖 Management: <b>${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}</b>`,
+    `🧭 Screening: <b>${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}</b>`,
     ``,
     `Mode manual = hanya jalan saat kamu tekan menu.`,
     `────────────────`,
@@ -663,16 +705,20 @@ async function sendTelegramPositionDetail(index) {
   const pos = positions[idx];
   const tracked = getTrackedPosition(pos.position);
   const instruction = tracked?.instruction || pos.instruction || "none";
+  const pnlLine = (pos.pnl_usd || 0) >= 0
+    ? `📈 PnL: +$${formatUsd(pos.pnl_usd)}`
+    : `📉 PnL: -$${formatUsd(Math.abs(pos.pnl_usd || 0))}`;
   await sendHTML([
-    `📌 <b>Position #${index}</b>`,
+    `${positionMood(pos)} <b>Position #${index}</b>`,
     `────────────────`,
-    `<b>${pos.pair}</b>`,
-    `Value: $${pos.total_value_usd}`,
-    `Fees: $${pos.unclaimed_fees_usd}`,
-    `Status: ${pos.in_range ? "In range" : `Out of range ${pos.minutes_out_of_range ?? 0}m`}`,
-    `Age: ${pos.age_minutes ?? "?"}m`,
-    `Instruction: ${instruction}`,
-    `Position: <code>${pos.position}</code>`,
+    `🪙 <b>${formatPositionName(pos)}</b>`,
+    `💼 Position Value: <b>$${formatUsd(pos.total_value_usd)}</b>`,
+    `💎 Unclaimed Fees: <b>$${formatUsd(pos.unclaimed_fees_usd)}</b>`,
+    `${pnlLine}`,
+    `📍 Status: ${rangeLabel(pos)}`,
+    `⏳ Age: ${ageLabel(pos.age_minutes)}`,
+    `🧠 Instruction: ${instruction}`,
+    `🔗 Position ID: <code>${pos.position}</code>`,
     `────────────────`,
   ].join("\n"), { reply_markup: getPositionActionMenuMarkup(index) });
 }
