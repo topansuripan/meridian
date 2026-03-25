@@ -1026,5 +1026,73 @@ Blacklisted tokens are filtered BEFORE the LLM even sees pool candidates.`,
         properties: {}
       }
     }
+  },
+
+  // ─── Agent Memory ────────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "add_memory",
+      description: `Save a persistent memory entry to your long-term agent memory.
+Use this to record things you've learned, decisions you've made, or patterns you've observed that go beyond a single lesson.
+
+Memory types:
+- SELF-TUNED:   Record when you change a config and WHY (e.g. "Changed minClaimAmount=10 — gas cost not worth it below this")
+- USER-TAUGHT:  Record explicit instructions or preferences from the operator
+- OBSERVED:     Record a market pattern or behaviour you observed
+- EVOLUTION:    Record when thresholds auto-evolved and what data drove it
+
+Memory is injected into every system prompt so you always have context about your own history.
+Use 'pinned: true' for critical memories that must always appear.
+
+Examples:
+- text: "Changed minClaimAmount=10 — User request: only claim fees when worthwhile to justify gas costs", type: "SELF-TUNED"
+- text: "User prefers holding positions longer even when OOR if volume is still healthy", type: "USER-TAUGHT", pinned: true
+- text: "BONK-SOL pools at bs=80 have had high range efficiency (>80%) consistently", type: "OBSERVED"`,
+      parameters: {
+        type: "object",
+        properties: {
+          text: {
+            type: "string",
+            description: "The memory text — be specific and actionable (max 500 chars)"
+          },
+          type: {
+            type: "string",
+            enum: ["SELF-TUNED", "USER-TAUGHT", "OBSERVED", "EVOLUTION"],
+            description: "Memory type — describes how this entry was created"
+          },
+          pinned: {
+            type: "boolean",
+            description: "Pin this memory so it always appears in the prompt regardless of cap"
+          },
+          role: {
+            type: "string",
+            enum: ["SCREENER", "MANAGER", "GENERAL"],
+            description: "Limit this memory to a specific agent role. Omit for all roles."
+          }
+        },
+        required: ["text", "type"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "list_memory",
+      description: `Browse your persistent agent memory entries.
+Use when the user asks what you remember, or when you want to review your own history of decisions and self-tuning.
+Returns entries filtered by type, role, or pinned status.`,
+      parameters: {
+        type: "object",
+        properties: {
+          type:   { type: "string", enum: ["SELF-TUNED", "USER-TAUGHT", "OBSERVED", "EVOLUTION"], description: "Filter by memory type" },
+          role:   { type: "string", enum: ["SCREENER", "MANAGER", "GENERAL"], description: "Filter by role" },
+          pinned: { type: "boolean", description: "Filter to only pinned (true) or unpinned (false) entries" },
+          limit:  { type: "number", description: "Max entries to return (default 30)" }
+        }
+      }
+    }
   }
 ];
