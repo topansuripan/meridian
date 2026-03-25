@@ -26,6 +26,7 @@ import {
   getRiskSettingsMenuMarkup,
   getPositionsMenuMarkup,
   getPositionActionMenuMarkup,
+  syncTelegramCommands,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction } from "./state.js";
@@ -239,7 +240,7 @@ After all positions, add one summary line:
       mgmtReport = `Management cycle failed: ${error.message}`;
     } finally {
       if (!silent && telegramEnabled()) {
-        if (mgmtReport) sendMessage(`🔄 Management Cycle\n\n${mgmtReport}`).catch(() => {});
+        if (mgmtReport) sendHTML(formatManagementTelegramReport(mgmtReport) || `🔄 <b>Management Cycle</b>\n\n${escapeHtml(mgmtReport)}`).catch(() => {});
         for (const p of positions) {
           if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
             notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => {});
@@ -395,11 +396,7 @@ STEPS:
       _screeningBusy = false;
       if (!silent && telegramEnabled()) {
         if (screenReport) {
-          // Prepend a compact rejection summary to the Telegram report
-          const rejectLine = rejected.length > 0
-            ? `❌ Pre-filtered: ${rejected.map(r => r.pool).join(", ")}\n\n`
-            : "";
-          sendMessage(`🔍 Screening Cycle\n\n${rejectLine}${screenReport}`).catch(() => {});
+          sendHTML(formatScreeningTelegramReport(screenReport, rejected) || `🔍 <b>Screening Cycle</b>\n\n${escapeHtml(screenReport)}`).catch(() => {});
         }
       }
     }
@@ -572,6 +569,114 @@ function ageLabel(minutes) {
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
   return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function stripMarkdown(value) {
+  return String(value ?? "")
+    .replace(/\*\*/g, "")
+    .replace(/^#+\s*/gm, "")
+    .replace(/`/g, "")
+    .trim();
+}
+
+function formatManagementTelegramReport(report) {
+  const text = String(report || "").trim();
+  if (!text) return null;
+
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const blocks = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(/^\*\*\[(.+?)\]\*\*\s+\|\s+Age:\s+(.+?)\s+\|\s+Unclaimed:\s+\$?(.+?)\s+\|\s+PnL:\s+(.+?)\s+\|\s+(STAY|CLOSE)$/i);
+    if (!match) continue;
+
+    const [, pair, age, unclaimed, pnl, action] = match;
+    const range = lines[i + 1]?.startsWith("Range:") ? lines[i + 1].replace(/^Range:\s*/i, "") : null;
+    const rule = lines[i + 2]?.startsWith("Rule") ? lines[i + 2] : null;
+    blocks.push({ pair, age, unclaimed, pnl, action: action.toUpperCase(), range, rule });
+  }
+
+  const summaryLine = lines.find((line) => line.startsWith("💼")) || null;
+  if (blocks.length === 0) {
+    return `🔄 <b>Management Cycle</b>\n────────────────\n${escapeHtml(stripMarkdown(text))}`;
+  }
+
+  const formattedBlocks = blocks.map((block) => {
+    const pnlNum = parseFloat(String(block.pnl).replace("%", "")) || 0;
+    const mood = block.action === "CLOSE" ? "🔴" : pnlNum >= 0 ? "🟢" : "🟡";
+    const pnlEmoji = pnlNum >= 0 ? "📈" : "📉";
+    const actionText = block.action === "CLOSE" ? "Close / rotate" : "Stay / monitor";
+    return [
+      `${mood} <b>${escapeHtml(block.pair)}</b>`,
+      `⏳ Age: ${escapeHtml(block.age)}   💎 Fees: $${escapeHtml(block.unclaimed)}   ${pnlEmoji} PnL: ${escapeHtml(block.pnl)}`,
+      `🧭 Action: <b>${escapeHtml(actionText)}</b>`,
+      block.rule ? `⚠️ Trigger: ${escapeHtml(stripMarkdown(block.rule))}` : null,
+      block.range ? `📊 Range: <code>${escapeHtml(block.range)}</code>` : null,
+    ].filter(Boolean).join("\n");
+  });
+
+  return [
+    `🔄 <b>Management Cycle</b>`,
+    `────────────────`,
+    ...formattedBlocks,
+    summaryLine ? `💼 <b>Portfolio Summary</b>\n${escapeHtml(stripMarkdown(summaryLine.replace(/^💼\s*/, "")))}` : null,
+  ].filter(Boolean).join("\n\n");
+}
+
+function formatScreeningTelegramReport(report, rejected = []) {
+  const text = String(report || "").trim();
+  if (!text) return null;
+
+  const rawLines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const cleanedLines = [];
+
+  for (const line of rawLines) {
+    if (/^\|[-\s|]+\|?$/.test(line)) continue;
+    if (line.startsWith("|")) {
+      const cells = line.split("|").map((cell) => cell.trim()).filter(Boolean);
+      if (cells.length >= 2) cleanedLines.push(`• ${cells[0]}: ${cells.slice(1).join(" | ")}`);
+      continue;
+    }
+    cleanedLines.push(stripMarkdown(line));
+  }
+
+  const insufficient = cleanedLines.find((line) => /Insufficient SOL/i.test(line));
+  const walletReason = cleanedLines.find((line) => /wallet SOL balance/i.test(line) || /required .*deploy/i.test(line));
+  const noAction = cleanedLines.find((line) => /NO ACTION/i.test(line));
+  const currentStateIndex = cleanedLines.findIndex((line) => /Current State/i.test(line));
+  const nextStepsIndex = cleanedLines.findIndex((line) => /Next Steps/i.test(line));
+
+  const currentState = currentStateIndex >= 0
+    ? cleanedLines.slice(currentStateIndex + 1, nextStepsIndex >= 0 ? nextStepsIndex : undefined).filter((line) => line.startsWith("-"))
+    : [];
+  const nextSteps = nextStepsIndex >= 0
+    ? cleanedLines.slice(nextStepsIndex + 1).filter(Boolean)
+    : [];
+  const highlights = cleanedLines
+    .filter((line) =>
+      !/Pre-filtered|Insufficient SOL|Current State|Next Steps|NO ACTION/i.test(line) &&
+      !line.startsWith("-")
+    )
+    .slice(0, 4);
+
+  return [
+    `🔍 <b>Screening Cycle</b>`,
+    `────────────────`,
+    rejected.length ? `🚫 <b>Pre-filtered:</b> ${escapeHtml(rejected.map((r) => r.pool).join(", "))}` : null,
+    insufficient ? `🧯 <b>Capital Check:</b> Insufficient SOL to deploy safely.` : null,
+    walletReason ? `💸 ${escapeHtml(walletReason)}` : null,
+    noAction ? `🧊 <b>Result:</b> No action this cycle.` : null,
+    currentState.length ? `<b>Current State</b>\n${currentState.map((line) => `• ${escapeHtml(line.replace(/^-+\s*/, ""))}`).join("\n")}` : null,
+    highlights.length ? `<b>Highlights</b>\n${highlights.map((line) => `• ${escapeHtml(line)}`).join("\n")}` : null,
+    nextSteps.length ? `<b>Next Step</b>\n${nextSteps.map((line) => `• ${escapeHtml(line.replace(/^-+\s*/, ""))}`).join("\n")}` : null,
+  ].filter(Boolean).join("\n\n");
 }
 
 async function sendTelegramStatusCard() {
@@ -864,6 +969,7 @@ if (isTTY) {
   // Always start autonomous cycles on launch
   launchCron();
   maybeRunMissedBriefing().catch(() => {});
+  syncTelegramCommands().catch(() => {});
 
   // Telegram bot
   startPolling(async (text) => {
@@ -873,20 +979,22 @@ if (isTTY) {
     }
 
     const normalized = text.trim();
-    if ([TELEGRAM_LABELS.MENU, "/menu", "/start"].includes(normalized)) {
+    if ([TELEGRAM_LABELS.MENU, "/menu", "/start", "/home"].includes(normalized)) {
       await sendMainMenu();
       return;
     }
 
     if ([TELEGRAM_LABELS.HELP, "/help"].includes(normalized)) {
       await sendHTML(
-        `🧭 <b>Meridian Menu</b>\n\n` +
-        `${TELEGRAM_LABELS.STATUS}: ringkasan wallet dan cycle\n` +
-        `${TELEGRAM_LABELS.POSITIONS}: daftar posisi aktif\n` +
-        `${TELEGRAM_LABELS.MANAGEMENT}: jalankan management sekali\n` +
-        `${TELEGRAM_LABELS.SCREENING}: jalankan screening sekali\n` +
-        `${TELEGRAM_LABELS.SETTINGS}: ubah manual/interval/24-7\n\n` +
-        `Kamu juga tetap bisa kirim chat bebas untuk minta agent analisa atau aksi.`
+        `🧭 <b>Meridian Command Menu</b>\n\n` +
+        `<code>/home</code> buka menu utama\n` +
+        `<code>/status</code> ringkasan wallet dan cycle\n` +
+        `<code>/positions</code> daftar posisi aktif\n` +
+        `<code>/manage</code> jalankan management sekarang\n` +
+        `<code>/screen</code> jalankan screening sekarang\n` +
+        `<code>/briefing</code> tampilkan morning briefing\n` +
+        `<code>/settings</code> ubah manual/interval/24-7\n\n` +
+        `Klik tombol <b>Menu</b> di kiri bawah Telegram untuk melihat daftar command seperti contoh yang kamu mau.`
       );
       return;
     }
@@ -1084,13 +1192,13 @@ if (isTTY) {
       return;
     }
 
-    if (normalized === TELEGRAM_LABELS.MANAGEMENT) {
+    if (normalized === TELEGRAM_LABELS.MANAGEMENT || normalized === "/manage") {
       try {
         await sendHTML(`🔄 <b>Management Cycle</b>\n\nMenjalankan management sekali sekarang...`);
         _managementBusy = true;
         timers.managementLastRun = Date.now();
         const report = await runManagementCycle({ silent: true });
-        if (report) await sendMessage(`🔄 Management Cycle\n\n${report}`);
+        if (report) await sendHTML(formatManagementTelegramReport(report) || `🔄 <b>Management Cycle</b>\n\n${escapeHtml(report)}`);
       } catch (e) {
         await sendMessage(`Error: ${e.message}`).catch(() => {});
       } finally {
@@ -1099,11 +1207,11 @@ if (isTTY) {
       return;
     }
 
-    if (normalized === TELEGRAM_LABELS.SCREENING) {
+    if (normalized === TELEGRAM_LABELS.SCREENING || normalized === "/screen") {
       try {
         await sendHTML(`🔍 <b>Screening Cycle</b>\n\nMenjalankan screening sekali sekarang...`);
         const report = await runScreeningCycle({ silent: true });
-        if (report) await sendMessage(`🔍 Screening Cycle\n\n${report}`);
+        if (report) await sendHTML(formatScreeningTelegramReport(report) || `🔍 <b>Screening Cycle</b>\n\n${escapeHtml(report)}`);
       } catch (e) {
         await sendMessage(`Error: ${e.message}`).catch(() => {});
       }

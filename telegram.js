@@ -50,6 +50,18 @@ export const TELEGRAM_LABELS = {
   BACK: "Back to Menu",
 };
 
+const BOT_COMMANDS = [
+  { command: "home", description: "open the main control menu" },
+  { command: "status", description: "show wallet and cycle status" },
+  { command: "positions", description: "show open positions" },
+  { command: "manage", description: "run one management cycle now" },
+  { command: "screen", description: "run one screening cycle now" },
+  { command: "briefing", description: "show the morning briefing" },
+  { command: "memory", description: "show agent memory" },
+  { command: "settings", description: "open settings menu" },
+  { command: "help", description: "show command help" },
+];
+
 function keyboard(rows) {
   return {
     keyboard: rows.map((row) => row.map((text) => ({ text }))),
@@ -150,6 +162,10 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+export function removeKeyboardMarkup() {
+  return { remove_keyboard: true };
+}
+
 export async function sendMessage(text, options = {}) {
   if (!TOKEN || !chatId) return;
   try {
@@ -159,7 +175,7 @@ export async function sendMessage(text, options = {}) {
       body: JSON.stringify({
         chat_id: chatId,
         text: String(text).slice(0, 4096),
-        reply_markup: options.reply_markup || getMainMenuMarkup(),
+        reply_markup: options.reply_markup,
         parse_mode: options.parse_mode,
       }),
     });
@@ -212,7 +228,7 @@ export async function sendHTML(html, options = {}) {
           chat_id: chatId,
           text: chunk,
           parse_mode: "HTML",
-          reply_markup: options.reply_markup || getMainMenuMarkup(),
+          reply_markup: options.reply_markup,
         }),
       });
       if (!res.ok) {
@@ -235,11 +251,36 @@ export async function notifyConfigChange(key, oldVal, newVal, reason = "") {
 }
 
 export async function sendMainMenu(text = "Menu siap. Pilih aksi di bawah atau ketik pesan bebas.") {
-  await sendMessage(text, { reply_markup: getMainMenuMarkup() });
+  await sendMessage(text, { reply_markup: removeKeyboardMarkup() });
 }
 
 export async function sendSettingsMenu(text = "Atur jadwal agent dari tombol di bawah. Mode manual artinya hanya jalan saat kamu tekan menu.") {
   await sendMessage(text, { reply_markup: getSettingsMenuMarkup() });
+}
+
+export async function syncTelegramCommands() {
+  if (!TOKEN) return;
+
+  try {
+    await fetch(`${BASE}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands: BOT_COMMANDS }),
+    });
+
+    if (chatId) {
+      await fetch(`${BASE}/setChatMenuButton`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          menu_button: { type: "commands" },
+        }),
+      });
+    }
+  } catch (e) {
+    log("telegram_error", `syncTelegramCommands failed: ${e.message}`);
+  }
 }
 
 
@@ -265,6 +306,7 @@ async function poll(onMessage) {
           chatId = incomingChatId;
           saveChatId(chatId);
           log("telegram", `Registered chat ID: ${chatId}`);
+          await syncTelegramCommands();
           await sendMessage("Connected! I'm your LP agent. Ask me anything or use commands like /status.");
         }
 
