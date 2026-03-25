@@ -12,6 +12,7 @@ import {
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
+import { addMemory, listMemory, MemoryType } from "../memory.js";
 import { setPositionInstruction } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
@@ -99,6 +100,11 @@ const toolMap = {
     addLesson(rule, tags || [], { pinned: !!pinned, role: role || null });
     return { saved: true, rule, pinned: !!pinned, role: role || "all" };
   },
+  add_memory: ({ text, type, pinned, role }) => {
+    const entry = addMemory(text, type || MemoryType.OBSERVED, { pinned: !!pinned, role: role || null });
+    return { saved: true, id: entry.id, type: entry.type, text: entry.text };
+  },
+  list_memory: ({ type, role, pinned, limit } = {}) => listMemory({ type, role, pinned, limit }),
   pin_lesson:   ({ id }) => pinLesson(id),
   unpin_lesson: ({ id }) => unpinLesson(id),
   list_lessons: ({ role, pinned, tag, limit } = {}) => listLessons({ role, pinned, tag, limit }),
@@ -157,8 +163,13 @@ const toolMap = {
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
       // schedule
+      managementMode: ["schedule", "managementMode"],
+      screeningMode: ["schedule", "screeningMode"],
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
+      autoAdjustManagementInterval: ["schedule", "autoAdjustManagementInterval"],
+      healthCheckEnabled: ["schedule", "healthCheckEnabled"],
+      healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
       // models
       managementModel: ["llm", "managementModel"],
       screeningModel: ["llm", "screeningModel"],
@@ -205,7 +216,13 @@ const toolMap = {
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
     // Restart cron jobs if intervals changed
-    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
+    const intervalChanged =
+      applied.managementMode != null ||
+      applied.screeningMode != null ||
+      applied.managementIntervalMin != null ||
+      applied.screeningIntervalMin != null ||
+      applied.healthCheckEnabled != null ||
+      applied.healthCheckIntervalMin != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
@@ -220,6 +237,8 @@ const toolMap = {
     if (lessonsKeys.length > 0) {
       const summary = lessonsKeys.map(k => `${k}=${applied[k]}`).join(", ");
       addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, ["self_tune", "config_change"]);
+      // Also persist to agent memory so it's visible in briefings and /memory command
+      addMemory(`Changed ${summary} — ${reason || "no reason given"}`, MemoryType.SELF_TUNED);
     }
 
     log("config", `Agent self-tuned: ${JSON.stringify(applied)} — ${reason}`);

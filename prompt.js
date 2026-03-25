@@ -10,9 +10,12 @@
  * @returns {string} - Complete system prompt
  */
 import { config } from "./config.js";
+import { getMemoryForPrompt } from "./memory.js";
 
 export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null) {
   const s = config.screening;
+
+  const memory = getMemoryForPrompt(agentType);
 
   let basePrompt = `You are an autonomous DLMM LP (Liquidity Provider) agent operating on Meteora, Solana.
 Role: ${agentType || "GENERAL"}
@@ -37,6 +40,11 @@ ${lessons ? `══════════════════════�
 ═══════════════════════════════════════════
 ${lessons}` : ""}
 
+${memory ? `═══════════════════════════════════════════
+ LONG-TERM MEMORY
+═══════════════════════════════════════════
+${memory}` : ""}  
+
 ═══════════════════════════════════════════
  BEHAVIORAL CORE
 ═══════════════════════════════════════════
@@ -48,6 +56,7 @@ ${lessons}` : ""}
    - volatility >= 5  → update_config management.managementIntervalMin = 3
    - volatility 2–5   → update_config management.managementIntervalMin = 5
    - volatility < 2   → update_config management.managementIntervalMin = 10
+5. SELF-TUNING MEMORY: After calling update_config with any meaningful change (not just interval adjustments), always follow with add_memory(type="SELF-TUNED", text="Changed X=Y — [reason]"). This keeps your long-term memory accurate for future briefings and decisions.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
 The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectations accordingly:

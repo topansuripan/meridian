@@ -66,8 +66,12 @@ export const config = {
 
   // ─── Scheduling ─────────────────────────
   schedule: {
+    managementMode:         u.managementMode         ?? "manual",
+    screeningMode:          u.screeningMode          ?? "manual",
     managementIntervalMin:  u.managementIntervalMin  ?? 10,
     screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
+    autoAdjustManagementInterval: u.autoAdjustManagementInterval ?? false,
+    healthCheckEnabled:     u.healthCheckEnabled     ?? false,
     healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
   },
 
@@ -136,4 +140,3 @@ export function reloadScreeningThresholds() {
     if (fresh.category       != null) s.category       = fresh.category;
   } catch { /* ignore */ }
 }
-

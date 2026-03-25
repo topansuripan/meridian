@@ -1,5 +1,6 @@
 import "dotenv/config";
 import cron from "node-cron";
+import fs from "fs";
 import readline from "readline";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
@@ -7,11 +8,28 @@ import { getMyPositions, getPositionPnl, closePosition } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary, listLessons } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
-import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
+import {
+  startPolling,
+  stopPolling,
+  sendMessage,
+  sendHTML,
+  sendTyping,
+  notifyOutOfRange,
+  isEnabled as telegramEnabled,
+  sendMainMenu,
+  sendSettingsMenu,
+  TELEGRAM_LABELS,
+  getScheduleMenuMarkup,
+  getTradeSettingsMenuMarkup,
+  getRiskSettingsMenuMarkup,
+  getPositionsMenuMarkup,
+  getPositionActionMenuMarkup,
+} from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction } from "./state.js";
+import { listMemory, addMemory, MemoryType } from "./memory.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -23,6 +41,7 @@ log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
 
 const TP_PCT  = config.management.takeProfitFeePct;
 const DEPLOY  = config.management.deployAmountSol;
+const USER_CONFIG_PATH = "./user-config.json";
 
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
@@ -46,8 +65,12 @@ function formatCountdown(seconds) {
 }
 
 function buildPrompt() {
-  const mgmt  = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
-  const scrn  = formatCountdown(nextRunIn(timers.screeningLastRun,  config.schedule.screeningIntervalMin));
+  const mgmt  = config.schedule.managementMode === "manual"
+    ? "manual"
+    : formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
+  const scrn  = config.schedule.screeningMode === "manual"
+    ? "manual"
+    : formatCountdown(nextRunIn(timers.screeningLastRun,  config.schedule.screeningIntervalMin));
   return `[manage: ${mgmt} | screen: ${scrn}]\n> `;
 }
 
@@ -106,26 +129,34 @@ export async function runManagementCycle({ silent = false } = {}) {
       positions = livePositions?.positions || [];
 
       if (positions.length === 0) {
-        log("cron", "No open positions — triggering screening cycle");
-        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
-        return;
+        log("cron", "No open positions");
+        if (config.schedule.screeningMode === "interval") {
+          log("cron", "No open positions — triggering screening cycle because screening mode is interval");
+          runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+        }
+        return "No open positions.";
       }
 
-      // Enforce management interval based on most volatile open position
-      const maxVolatility = positions.reduce((max, p) => {
-        const tracked = getTrackedPosition(p.position);
-        return Math.max(max, tracked?.volatility ?? 0);
-      }, 0);
-      const targetInterval = maxVolatility >= 5 ? 3 : maxVolatility >= 2 ? 5 : 10;
-      if (config.schedule.managementIntervalMin !== targetInterval) {
-        config.schedule.managementIntervalMin = targetInterval;
-        log("cron", `Management interval adjusted to ${targetInterval}m (max volatility: ${maxVolatility})`);
-        if (cronStarted) startCronJobs();
+      if (config.schedule.autoAdjustManagementInterval && config.schedule.managementMode === "interval") {
+        const maxVolatility = positions.reduce((max, p) => {
+          const tracked = getTrackedPosition(p.position);
+          return Math.max(max, tracked?.volatility ?? 0);
+        }, 0);
+        const targetInterval = maxVolatility >= 5 ? 3 : maxVolatility >= 2 ? 5 : 10;
+        if (config.schedule.managementIntervalMin !== targetInterval) {
+          config.schedule.managementIntervalMin = targetInterval;
+          log("cron", `Management interval adjusted to ${targetInterval}m (max volatility: ${maxVolatility})`);
+          if (cronStarted) startCronJobs();
+        }
       }
 
-      // Also trigger screening if under max positions — cooldown 5min to avoid spamming
+      // Also trigger screening if under max positions, but only when screening is interval-based
       const screeningCooldownMs = 5 * 60 * 1000;
-      if (positions.length < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+      if (
+        config.schedule.screeningMode === "interval" &&
+        positions.length < config.risk.maxPositions &&
+        Date.now() - _screeningLastTriggered > screeningCooldownMs
+      ) {
         _screeningLastTriggered = Date.now();
         log("cron", `Positions (${positions.length}/${config.risk.maxPositions}) — triggering screening in background`);
         runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
@@ -220,6 +251,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard guards — don't even run the agent if preconditions aren't met
     let prePositions, preBalance;
+    let rejected = [];
     try {
       [prePositions, preBalance] = await Promise.all([getMyPositions(), getWalletBalances()]);
       if (prePositions.total_positions >= config.risk.maxPositions) {
@@ -255,6 +287,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
       // Pre-load top candidates + all recon data in parallel (saves 4-6 LLM steps)
       const topCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
       const candidates = topCandidates?.candidates || topCandidates?.pools || [];
+      rejected = topCandidates?.rejected || [];
+      const pipelineSummary = topCandidates?.pipeline_summary;
 
       const candidateBlocks = [];
       for (const pool of candidates.slice(0, 5)) {
@@ -293,8 +327,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
           // Build compact block
           const lines = [
             `POOL: ${pool.name} (${pool.pool})`,
-            `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}`,
+            `  metrics: score=${pool.score ?? "?"}/100, bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}`,
             `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+            pool.screening_summary ? `  pipeline: ${pool.screening_summary}` : null,
             `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
             priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
             n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
@@ -307,6 +342,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
       let candidateContext = candidateBlocks.length > 0
         ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, holders, narrative already fetched):\n${candidateBlocks.join("\n\n")}\n`
         : "";
+
+      if (pipelineSummary) {
+        candidateContext += `\nPIPELINE SUMMARY:\n  hard_rejects=${pipelineSummary.hard_rejects}, ownership_rejects=${pipelineSummary.ownership_rejects}, shortlisted=${pipelineSummary.shortlisted}, watchlist=${pipelineSummary.watchlist}\n`;
+      }
+
+      // Add pre-filter skip summary so the agent knows what was already rejected
+      if (rejected.length > 0) {
+        const skipBlock = rejected.map(r => `  SKIPPED: ${r.pool} — ${r.reason}`).join("\n");
+        candidateContext += `\nPRE-FILTER REJECTIONS (code-level, do NOT re-evaluate these):\n${skipBlock}\n`;
+      }
 
       // Hive mind consensus (if enabled)
       try {
@@ -345,7 +390,13 @@ STEPS:
     } finally {
       _screeningBusy = false;
       if (!silent && telegramEnabled()) {
-        if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
+        if (screenReport) {
+          // Prepend a compact rejection summary to the Telegram report
+          const rejectLine = rejected.length > 0
+            ? `❌ Pre-filtered: ${rejected.map(r => r.pool).join(", ")}\n\n`
+            : "";
+          sendMessage(`🔍 Screening Cycle\n\n${rejectLine}${screenReport}`).catch(() => {});
+        }
       }
     }
     return screenReport;
@@ -354,32 +405,41 @@ STEPS:
 export function startCronJobs() {
   stopCronJobs();
 
-  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
-    timers.managementLastRun = Date.now();
-    try { await runManagementCycle(); }
-    finally { _managementBusy = false; }
-  });
+  if (config.schedule.managementMode === "interval") {
+    const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+      if (_managementBusy) return;
+      _managementBusy = true;
+      timers.managementLastRun = Date.now();
+      try { await runManagementCycle(); }
+      finally { _managementBusy = false; }
+    });
+    _cronTasks.push(mgmtTask);
+  }
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+  if (config.schedule.screeningMode === "interval") {
+    const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+    _cronTasks.push(screenTask);
+  }
 
-  const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
-    log("cron", "Starting health check");
-    try {
-      await agentLoop(`
+  if (config.schedule.healthCheckEnabled) {
+    const healthTask = cron.schedule(`*/${Math.max(1, config.schedule.healthCheckIntervalMin)} * * * *`, async () => {
+      if (_managementBusy) return;
+      _managementBusy = true;
+      log("cron", "Starting health check");
+      try {
+        await agentLoop(`
 HEALTH CHECK
 
 Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
       `, config.llm.maxSteps, [], "MANAGER");
-    } catch (error) {
-      log("cron_error", `Health check failed: ${error.message}`);
-    } finally {
-      _managementBusy = false;
-    }
-  });
+      } catch (error) {
+        log("cron_error", `Health check failed: ${error.message}`);
+      } finally {
+        _managementBusy = false;
+      }
+    });
+    _cronTasks.push(healthTask);
+  }
 
   // Morning Briefing at 8:00 AM UTC+7 (1:00 AM UTC)
   const briefingTask = cron.schedule(`0 1 * * *`, async () => {
@@ -391,8 +451,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+  _cronTasks.push(briefingTask, briefingWatchdog);
+  log(
+    "cron",
+    `Cycles started — management ${config.schedule.managementMode}${config.schedule.managementMode === "interval" ? `/${config.schedule.managementIntervalMin}m` : ""}, screening ${config.schedule.screeningMode}${config.schedule.screeningMode === "interval" ? `/${config.schedule.screeningIntervalMin}m` : ""}, health ${config.schedule.healthCheckEnabled ? `${config.schedule.healthCheckIntervalMin}m` : "off"}`
+  );
 }
 
 // ═══════════════════════════════════════════
@@ -417,16 +480,17 @@ function formatCandidates(candidates) {
 
   const lines = candidates.map((p, i) => {
     const name   = (p.name || "unknown").padEnd(20);
+    const score  = String(p.score ?? "?").padStart(4);
     const ftvl   = `${p.fee_active_tvl_ratio ?? p.fee_tvl_ratio}%`.padStart(8);
-    const vol    = `$${((p.volume_24h || 0) / 1000).toFixed(1)}k`.padStart(8);
+    const vol    = `$${((p.volume_window || 0) / 1000).toFixed(1)}k`.padStart(8);
     const active = `${p.active_pct}%`.padStart(6);
     const org    = String(p.organic_score).padStart(4);
-    return `  [${i + 1}]  ${name}  fee/aTVL:${ftvl}  vol:${vol}  in-range:${active}  organic:${org}`;
+    return `  [${i + 1}]  ${name}  score:${score}  fee/aTVL:${ftvl}  vol:${vol}  active:${active}  organic:${org}`;
   });
 
   return [
-    "  #   pool                  fee/aTVL     vol    in-range  organic",
-    "  " + "─".repeat(68),
+    "  #   pool                  score  fee/aTVL     vol    active  organic",
+    "  " + "─".repeat(78),
     ...lines,
   ].join("\n");
 }
@@ -447,6 +511,214 @@ function appendHistory(userMsg, assistantMsg) {
   if (sessionHistory.length > MAX_HISTORY) {
     sessionHistory.splice(0, sessionHistory.length - MAX_HISTORY);
   }
+}
+
+function captureOperatorPreference(text, source = "operator") {
+  if (!text || text.startsWith("/")) return;
+  const compact = text.trim();
+  const preferenceSignal = /^(aku mau|saya mau|gue mau|tolong|jangan|prefer|always|please|buat|ubah|set)/i.test(compact);
+  if (!preferenceSignal || compact.length < 20) return;
+  addMemory(`Operator preference (${source}): ${compact}`, MemoryType.USER_TAUGHT, {
+    pinned: true,
+    role: "GENERAL",
+  });
+}
+
+function formatScheduleMode(mode, interval) {
+  return mode === "manual" ? "manual" : `auto tiap ${interval}m`;
+}
+
+async function sendTelegramStatusCard() {
+  const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+  const inRange = positions.positions.filter((p) => p.in_range).length;
+  const outOfRange = positions.total_positions - inRange;
+  const lastMgmt = timers.managementLastRun ? new Date(timers.managementLastRun).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "--.--";
+  const lastScreen = timers.screeningLastRun ? new Date(timers.screeningLastRun).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "--.--";
+  await sendHTML([
+    `☀️ <b>Meridian Control Center</b>`,
+    `────────────────`,
+    ``,
+    `<b>Wallet</b>`,
+    `💠 SOL Balance: <b>${wallet.sol}</b>`,
+    `💵 Est. USD: $${wallet.sol_usd}`,
+    ``,
+    `<b>Portfolio</b>`,
+    `📂 Open Positions: ${positions.total_positions}`,
+    `✅ In Range: ${inRange}`,
+    `⚠️ Out of Range: ${outOfRange}`,
+    ``,
+    `<b>Cycle Settings</b>`,
+    `🔄 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
+    `🔍 Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    `🩺 Health Check: ${config.schedule.healthCheckEnabled ? `on / ${config.schedule.healthCheckIntervalMin}m` : "off"}`,
+    ``,
+    `<b>Recent Activity</b>`,
+    `🕒 Last Management: ${lastMgmt}`,
+    `🕒 Last Screening: ${lastScreen}`,
+    `────────────────`,
+  ].join("\n"));
+}
+
+async function sendTelegramPositionsCard() {
+  const { positions, total_positions } = await getMyPositions({ force: true });
+  if (total_positions === 0) {
+    await sendHTML(`📂 <b>Open Positions</b>\n\nBelum ada posisi terbuka.`);
+    return;
+  }
+  const lines = positions.map((p, i) => {
+    const oor = p.in_range ? "In range" : `Out of range ${p.minutes_out_of_range ?? 0}m`;
+    return `${i + 1}. <b>${p.pair}</b>\n💼 Value: $${p.total_value_usd} | 💎 Fees: $${p.unclaimed_fees_usd}\n📍 ${oor}`;
+  });
+  await sendHTML(`📂 <b>Open Positions</b> (${total_positions})\n\n${lines.join("\n\n")}\n\n<i>Pilih tombol posisi di bawah untuk detail cepat.</i>`, {
+    reply_markup: getPositionsMenuMarkup(positions),
+  });
+}
+
+async function sendTelegramMemoryCard() {
+  const { total, entries } = listMemory({ limit: 12 });
+  if (total === 0) {
+    await sendHTML(`🧠 <b>Agent Memory</b>\n\nBelum ada memory tersimpan.`);
+    return;
+  }
+  const lines = entries.slice(-12).reverse().map((e) => {
+    const pin = e.pinned ? "📌 " : "";
+    return `${pin}[${e.type}] ${e.text.slice(0, 140)}\nUsed: ${e.usage_count || 0}x`;
+  });
+  await sendHTML(`🧠 <b>Agent Memory</b> (${total})\n\n${lines.join("\n\n")}`);
+}
+
+async function sendTelegramConfigCard() {
+  const s = config.screening;
+  const m = config.management;
+  const r = config.risk;
+  await sendHTML([
+    `⚙️ <b>Settings</b>`,
+    `────────────────`,
+    ``,
+    `<b>Cycle Modes</b>`,
+    `Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
+    `Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    ``,
+    `<b>Screening</b>`,
+    `timeframe: ${s.timeframe} | category: ${s.category}`,
+    `organic >= ${s.minOrganic} | holders >= ${s.minHolders}`,
+    `fee/TVL >= ${s.minFeeActiveTvlRatio} | token fees >= ${s.minTokenFeesSol} SOL`,
+    ``,
+    `<b>Management</b>`,
+    `deploy: ${m.deployAmountSol} SOL | TP: ${m.takeProfitFeePct}%`,
+    `claim >= $${m.minClaimAmount} | OOR wait: ${m.outOfRangeWaitMinutes}m`,
+    ``,
+    `<b>Risk</b>`,
+    `max positions: ${r.maxPositions} | max deploy: ${r.maxDeployAmount} SOL`,
+    `────────────────`,
+  ].join("\n"));
+}
+
+async function sendTelegramTradeSettingsCard() {
+  const m = config.management;
+  await sendHTML([
+    `🎛️ <b>Trade Settings</b>`,
+    `────────────────`,
+    `Deploy amount: <b>${m.deployAmountSol} SOL</b>`,
+    `Take profit: <b>${m.takeProfitFeePct}%</b>`,
+    `Claim threshold: <b>$${m.minClaimAmount}</b>`,
+    ``,
+    `Pilih preset dari tombol di bawah.`,
+    `────────────────`,
+  ].join("\n"), { reply_markup: getTradeSettingsMenuMarkup() });
+}
+
+async function sendTelegramRiskSettingsCard() {
+  const r = config.risk;
+  await sendHTML([
+    `🛡️ <b>Risk Settings</b>`,
+    `────────────────`,
+    `Max positions: <b>${r.maxPositions}</b>`,
+    `Max deploy amount: <b>${r.maxDeployAmount} SOL</b>`,
+    ``,
+    `Pilih batas maksimum posisi dari tombol di bawah.`,
+    `────────────────`,
+  ].join("\n"), { reply_markup: getRiskSettingsMenuMarkup() });
+}
+
+async function sendTelegramScheduleSettingsCard() {
+  await sendHTML([
+    `⏱️ <b>Schedule Settings</b>`,
+    `────────────────`,
+    `Management: <b>${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}</b>`,
+    `Screening: <b>${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}</b>`,
+    ``,
+    `Mode manual = hanya jalan saat kamu tekan menu.`,
+    `────────────────`,
+  ].join("\n"), { reply_markup: getScheduleMenuMarkup() });
+}
+
+async function sendTelegramPositionDetail(index) {
+  const { positions } = await getMyPositions({ force: true });
+  const idx = index - 1;
+  if (idx < 0 || idx >= positions.length) {
+    await sendMessage("Posisi tidak ditemukan.");
+    return;
+  }
+  const pos = positions[idx];
+  const tracked = getTrackedPosition(pos.position);
+  const instruction = tracked?.instruction || pos.instruction || "none";
+  await sendHTML([
+    `📌 <b>Position #${index}</b>`,
+    `────────────────`,
+    `<b>${pos.pair}</b>`,
+    `Value: $${pos.total_value_usd}`,
+    `Fees: $${pos.unclaimed_fees_usd}`,
+    `Status: ${pos.in_range ? "In range" : `Out of range ${pos.minutes_out_of_range ?? 0}m`}`,
+    `Age: ${pos.age_minutes ?? "?"}m`,
+    `Instruction: ${instruction}`,
+    `Position: <code>${pos.position}</code>`,
+    `────────────────`,
+  ].join("\n"), { reply_markup: getPositionActionMenuMarkup(index) });
+}
+
+function applyConfigPreset(changes, reason) {
+  Object.entries(changes).forEach(([key, val]) => {
+    if (key === "deployAmountSol" || key === "takeProfitFeePct" || key === "minClaimAmount") {
+      config.management[key] = val;
+    } else if (key === "maxPositions") {
+      config.risk[key] = val;
+    }
+  });
+  persistUserConfig(changes);
+  addMemory(`Changed ${Object.entries(changes).map(([k, v]) => `${k}=${v}`).join(", ")} — ${reason}`, MemoryType.SELF_TUNED);
+}
+
+async function applySchedulePreset(kind, mode, interval = null) {
+  if (kind === "management") {
+    config.schedule.managementMode = mode;
+    if (interval != null) config.schedule.managementIntervalMin = interval;
+  } else {
+    config.schedule.screeningMode = mode;
+    if (interval != null) config.schedule.screeningIntervalMin = interval;
+  }
+
+  persistUserConfig({
+    managementMode: config.schedule.managementMode,
+    managementIntervalMin: config.schedule.managementIntervalMin,
+    screeningMode: config.schedule.screeningMode,
+    screeningIntervalMin: config.schedule.screeningIntervalMin,
+  });
+  if (cronStarted) startCronJobs();
+  await sendTelegramConfigCard();
+  await sendSettingsMenu(`Pengaturan ${kind} diperbarui ke ${formatScheduleMode(mode, interval ?? (kind === "management" ? config.schedule.managementIntervalMin : config.schedule.screeningIntervalMin))}.`);
+}
+
+function persistUserConfig(changes) {
+  let current = {};
+  if (fs.existsSync(USER_CONFIG_PATH)) {
+    try {
+      current = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+    } catch {
+      current = {};
+    }
+  }
+  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify({ ...current, ...changes }, null, 2));
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
@@ -541,7 +813,189 @@ if (isTTY) {
       return;
     }
 
-    if (text === "/briefing") {
+    const normalized = text.trim();
+    if ([TELEGRAM_LABELS.MENU, "/menu", "/start"].includes(normalized)) {
+      await sendMainMenu();
+      return;
+    }
+
+    if ([TELEGRAM_LABELS.HELP, "/help"].includes(normalized)) {
+      await sendHTML(
+        `🧭 <b>Meridian Menu</b>\n\n` +
+        `${TELEGRAM_LABELS.STATUS}: ringkasan wallet dan cycle\n` +
+        `${TELEGRAM_LABELS.POSITIONS}: daftar posisi aktif\n` +
+        `${TELEGRAM_LABELS.MANAGEMENT}: jalankan management sekali\n` +
+        `${TELEGRAM_LABELS.SCREENING}: jalankan screening sekali\n` +
+        `${TELEGRAM_LABELS.SETTINGS}: ubah manual/auto interval\n\n` +
+        `Kamu juga tetap bisa kirim chat bebas untuk minta agent analisa atau aksi.`
+      );
+      return;
+    }
+
+    if ([TELEGRAM_LABELS.SETTINGS, "/settings"].includes(normalized)) {
+      await sendTelegramConfigCard();
+      await sendSettingsMenu();
+      return;
+    }
+
+    if (normalized === TELEGRAM_LABELS.SETTINGS_SCHEDULE) {
+      await sendTelegramScheduleSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.SETTINGS_TRADE) {
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.SETTINGS_RISK) {
+      await sendTelegramRiskSettingsCard();
+      return;
+    }
+
+    if (normalized === TELEGRAM_LABELS.BACK) {
+      await sendMainMenu();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.POSITIONS_BACK) {
+      await sendTelegramPositionsCard();
+      return;
+    }
+
+    if (normalized === TELEGRAM_LABELS.MGMT_MANUAL) {
+      await applySchedulePreset("management", "manual");
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.MGMT_15M) {
+      await applySchedulePreset("management", "interval", 15);
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.MGMT_30M) {
+      await applySchedulePreset("management", "interval", 30);
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.SCREEN_MANUAL) {
+      await applySchedulePreset("screening", "manual");
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.SCREEN_30M) {
+      await applySchedulePreset("screening", "interval", 30);
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.SCREEN_60M) {
+      await applySchedulePreset("screening", "interval", 60);
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.DEPLOY_05) {
+      applyConfigPreset({ deployAmountSol: 0.5 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.DEPLOY_10) {
+      applyConfigPreset({ deployAmountSol: 1 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.DEPLOY_20) {
+      applyConfigPreset({ deployAmountSol: 2 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.TP_3) {
+      applyConfigPreset({ takeProfitFeePct: 3 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.TP_5) {
+      applyConfigPreset({ takeProfitFeePct: 5 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.TP_8) {
+      applyConfigPreset({ takeProfitFeePct: 8 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.CLAIM_5) {
+      applyConfigPreset({ minClaimAmount: 5 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.CLAIM_10) {
+      applyConfigPreset({ minClaimAmount: 10 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.CLAIM_20) {
+      applyConfigPreset({ minClaimAmount: 20 }, "Telegram trade preset");
+      await sendTelegramTradeSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.MAXPOS_1) {
+      applyConfigPreset({ maxPositions: 1 }, "Telegram risk preset");
+      await sendTelegramRiskSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.MAXPOS_3) {
+      applyConfigPreset({ maxPositions: 3 }, "Telegram risk preset");
+      await sendTelegramRiskSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.MAXPOS_5) {
+      applyConfigPreset({ maxPositions: 5 }, "Telegram risk preset");
+      await sendTelegramRiskSettingsCard();
+      return;
+    }
+
+    const positionButtonMatch = normalized.match(/^(\d+)\.\s+/);
+    if (positionButtonMatch) {
+      await sendTelegramPositionDetail(parseInt(positionButtonMatch[1], 10));
+      return;
+    }
+
+    const positionCloseMatch = normalized.match(/^Close\s+#(\d+)$/i);
+    if (positionCloseMatch) {
+      try {
+        const idx = parseInt(positionCloseMatch[1], 10) - 1;
+        const { positions } = await getMyPositions({ force: true });
+        if (idx < 0 || idx >= positions.length) { await sendMessage("Posisi tidak ditemukan."); return; }
+        const pos = positions[idx];
+        await sendMessage(`Closing ${pos.pair}...`);
+        const result = await closePosition({ position_address: pos.position });
+        if (result.success) {
+          await sendHTML(`✅ <b>Closed</b> ${pos.pair}\nPnL: $${result.pnl_usd ?? "?"}\nTx: ${result.txs?.[0] || result.tx || "-"}`);
+        } else {
+          await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+        }
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    const holdButtonMatch = normalized.match(/^Hold\s+#(\d+)$/i);
+    if (holdButtonMatch) {
+      try {
+        const idx = parseInt(holdButtonMatch[1], 10) - 1;
+        const { positions } = await getMyPositions({ force: true });
+        if (idx < 0 || idx >= positions.length) { await sendMessage("Posisi tidak ditemukan."); return; }
+        const pos = positions[idx];
+        setPositionInstruction(pos.position, "Hold until manual review");
+        await sendTelegramPositionDetail(idx + 1);
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    const tpButtonMatch = normalized.match(/^TP5\s+#(\d+)$/i);
+    if (tpButtonMatch) {
+      try {
+        const idx = parseInt(tpButtonMatch[1], 10) - 1;
+        const { positions } = await getMyPositions({ force: true });
+        if (idx < 0 || idx >= positions.length) { await sendMessage("Posisi tidak ditemukan."); return; }
+        const pos = positions[idx];
+        setPositionInstruction(pos.position, "Close at 5% profit");
+        await sendTelegramPositionDetail(idx + 1);
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    if (normalized === TELEGRAM_LABELS.BRIEFING || normalized === "/briefing") {
       try {
         const briefing = await generateBriefing();
         await sendHTML(briefing);
@@ -551,18 +1005,41 @@ if (isTTY) {
       return;
     }
 
-    if (text === "/positions") {
+    if (normalized === TELEGRAM_LABELS.POSITIONS || normalized === "/positions") {
+      try { await sendTelegramPositionsCard(); }
+      catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    if (normalized === TELEGRAM_LABELS.STATUS || normalized === "/status") {
+      try { await sendTelegramStatusCard(); }
+      catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    if (normalized === TELEGRAM_LABELS.MANAGEMENT) {
       try {
-        const { positions, total_positions } = await getMyPositions({ force: true });
-        if (total_positions === 0) { await sendMessage("No open positions."); return; }
-        const lines = positions.map((p, i) => {
-          const pnl = p.pnl_usd >= 0 ? `+$${p.pnl_usd}` : `-$${Math.abs(p.pnl_usd)}`;
-          const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-          const oor = !p.in_range ? " ⚠️OOR" : "";
-          return `${i + 1}. ${p.pair} | $${p.total_value_usd} | PnL: ${pnl} | fees: $${p.unclaimed_fees_usd} | ${age}${oor}`;
-        });
-        await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
-      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+        await sendHTML(`🔄 <b>Management Cycle</b>\n\nMenjalankan management sekali sekarang...`);
+        _managementBusy = true;
+        timers.managementLastRun = Date.now();
+        const report = await runManagementCycle({ silent: true });
+        if (report) await sendMessage(`🔄 Management Cycle\n\n${report}`);
+      } catch (e) {
+        await sendMessage(`Error: ${e.message}`).catch(() => {});
+      } finally {
+        _managementBusy = false;
+      }
+      return;
+    }
+
+    if (normalized === TELEGRAM_LABELS.SCREENING) {
+      try {
+        await sendHTML(`🔍 <b>Screening Cycle</b>\n\nMenjalankan screening sekali sekarang...`);
+        const report = await runScreeningCycle({ silent: true });
+        if (report) await sendMessage(`🔍 Screening Cycle\n\n${report}`);
+      } catch (e) {
+        await sendMessage(`Error: ${e.message}`).catch(() => {});
+      }
       return;
     }
 
@@ -598,14 +1075,59 @@ if (isTTY) {
       return;
     }
 
+    // ── /memory ─────────────────────────────────────────────────────
+    if (normalized === TELEGRAM_LABELS.MEMORY || normalized === "/memory" || normalized.startsWith("/memory ")) {
+      try {
+        const addMatch = normalized.match(/^\/memory add\s+(.+)$/i);
+        if (addMatch) {
+          const memText = addMatch[1].trim();
+          addMemory(memText, MemoryType.USER_TAUGHT, { pinned: false });
+          await sendMessage(`✅ Memory saved:\n"${memText}"`);
+          return;
+        }
+        await sendTelegramMemoryCard();
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    // ── /lessons ─────────────────────────────────────────────────────
+    if (text === "/lessons" || text.startsWith("/lessons ")) {
+      try {
+        const roleMatch = text.match(/^\/lessons\s+(SCREENER|MANAGER|GENERAL)$/i);
+        const role = roleMatch ? roleMatch[1].toUpperCase() : null;
+        const { total, lessons } = listLessons({ role, limit: 15 });
+        if (total === 0) {
+          await sendMessage("No lessons yet.");
+          return;
+        }
+        const lines = lessons.map((l) => {
+          const pin = l.pinned ? "📌 " : "";
+          return `${pin}[${l.outcome.toUpperCase()}] ${l.rule.slice(0, 120)}`;
+        });
+        await sendHTML(`📚 <b>Lessons</b> (${total} total${role ? `, ${role}` : ""})\n\n${lines.join("\n")}`);
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    // ── /config ──────────────────────────────────────────────────────
+    if (normalized === "/config") {
+      try {
+        await sendTelegramConfigCard();
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
     busy = true;
     try {
-      log("telegram", `Incoming: ${text}`);
-      const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(text);
-      const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
+      log("telegram", `Incoming: ${normalized}`);
+      sendTyping().catch(() => {}); // show "typing..." indicator
+      captureOperatorPreference(normalized, "telegram");
+      const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(normalized);
+      const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(normalized);
       const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
-      const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, config.llm.generalModel);
-      appendHistory(text, content);
+      const model = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
+      const { content } = await agentLoop(normalized, config.llm.maxSteps, sessionHistory, agentRole, model);
+      appendHistory(normalized, content);
       await sendMessage(content);
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
