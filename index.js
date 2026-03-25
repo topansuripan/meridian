@@ -67,9 +67,13 @@ function formatCountdown(seconds) {
 function buildPrompt() {
   const mgmt  = config.schedule.managementMode === "manual"
     ? "manual"
+    : config.schedule.managementMode === "nonstop"
+      ? "24/7"
     : formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
   const scrn  = config.schedule.screeningMode === "manual"
     ? "manual"
+    : config.schedule.screeningMode === "nonstop"
+      ? "24/7"
     : formatCountdown(nextRunIn(timers.screeningLastRun,  config.schedule.screeningIntervalMin));
   return `[manage: ${mgmt} | screen: ${scrn}]\n> `;
 }
@@ -130,8 +134,8 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       if (positions.length === 0) {
         log("cron", "No open positions");
-        if (config.schedule.screeningMode === "interval") {
-          log("cron", "No open positions — triggering screening cycle because screening mode is interval");
+        if (config.schedule.screeningMode === "interval" || config.schedule.screeningMode === "nonstop") {
+          log("cron", `No open positions — triggering screening cycle because screening mode is ${config.schedule.screeningMode}`);
           runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
         }
         return "No open positions.";
@@ -153,7 +157,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       // Also trigger screening if under max positions, but only when screening is interval-based
       const screeningCooldownMs = 5 * 60 * 1000;
       if (
-        config.schedule.screeningMode === "interval" &&
+        (config.schedule.screeningMode === "interval" || config.schedule.screeningMode === "nonstop") &&
         positions.length < config.risk.maxPositions &&
         Date.now() - _screeningLastTriggered > screeningCooldownMs
       ) {
@@ -405,8 +409,11 @@ STEPS:
 export function startCronJobs() {
   stopCronJobs();
 
-  if (config.schedule.managementMode === "interval") {
-    const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+  if (config.schedule.managementMode === "interval" || config.schedule.managementMode === "nonstop") {
+    const managementSchedule = config.schedule.managementMode === "nonstop"
+      ? "* * * * *"
+      : `*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`;
+    const mgmtTask = cron.schedule(managementSchedule, async () => {
       if (_managementBusy) return;
       _managementBusy = true;
       timers.managementLastRun = Date.now();
@@ -416,8 +423,11 @@ export function startCronJobs() {
     _cronTasks.push(mgmtTask);
   }
 
-  if (config.schedule.screeningMode === "interval") {
-    const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+  if (config.schedule.screeningMode === "interval" || config.schedule.screeningMode === "nonstop") {
+    const screeningSchedule = config.schedule.screeningMode === "nonstop"
+      ? "* * * * *"
+      : `*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`;
+    const screenTask = cron.schedule(screeningSchedule, runScreeningCycle);
     _cronTasks.push(screenTask);
   }
 
@@ -525,7 +535,9 @@ function captureOperatorPreference(text, source = "operator") {
 }
 
 function formatScheduleMode(mode, interval) {
-  return mode === "manual" ? "manual" : `auto tiap ${interval}m`;
+  if (mode === "manual") return "manual";
+  if (mode === "nonstop") return "24/7 nonstop";
+  return `auto tiap ${interval}m`;
 }
 
 function formatUsd(value) {
@@ -691,6 +703,7 @@ async function sendTelegramScheduleSettingsCard() {
     `🧭 Screening: <b>${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}</b>`,
     ``,
     `Mode manual = hanya jalan saat kamu tekan menu.`,
+    `Mode 24/7 = scheduler aktif terus tiap menit dengan guard anti-overlap.`,
     `────────────────`,
   ].join("\n"), { reply_markup: getScheduleMenuMarkup() });
 }
@@ -872,7 +885,7 @@ if (isTTY) {
         `${TELEGRAM_LABELS.POSITIONS}: daftar posisi aktif\n` +
         `${TELEGRAM_LABELS.MANAGEMENT}: jalankan management sekali\n` +
         `${TELEGRAM_LABELS.SCREENING}: jalankan screening sekali\n` +
-        `${TELEGRAM_LABELS.SETTINGS}: ubah manual/auto interval\n\n` +
+        `${TELEGRAM_LABELS.SETTINGS}: ubah manual/interval/24-7\n\n` +
         `Kamu juga tetap bisa kirim chat bebas untuk minta agent analisa atau aksi.`
       );
       return;
@@ -910,6 +923,10 @@ if (isTTY) {
       await applySchedulePreset("management", "manual");
       return;
     }
+    if (normalized === TELEGRAM_LABELS.MGMT_247) {
+      await applySchedulePreset("management", "nonstop");
+      return;
+    }
     if (normalized === TELEGRAM_LABELS.MGMT_15M) {
       await applySchedulePreset("management", "interval", 15);
       return;
@@ -920,6 +937,10 @@ if (isTTY) {
     }
     if (normalized === TELEGRAM_LABELS.SCREEN_MANUAL) {
       await applySchedulePreset("screening", "manual");
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.SCREEN_247) {
+      await applySchedulePreset("screening", "nonstop");
       return;
     }
     if (normalized === TELEGRAM_LABELS.SCREEN_30M) {

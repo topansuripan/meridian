@@ -282,6 +282,7 @@ const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes
 let _positionsCache = null;
 let _positionsCacheAt = 0;
 let _positionsInflight = null; // deduplicates concurrent calls
+const _poolMetadataCache = new Map();
 
 // ─── Fetch DLMM PnL API for all positions in a pool ────────────
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
@@ -310,6 +311,30 @@ async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   }
 }
 
+async function fetchPoolMetadata(poolAddress) {
+  if (_poolMetadataCache.has(poolAddress)) {
+    return _poolMetadataCache.get(poolAddress);
+  }
+
+  const promise = (async () => {
+    try {
+      const { getPoolDetail } = await import("./screening.js");
+      const detail = await getPoolDetail({ pool_address: poolAddress, timeframe: "5m" });
+      return {
+        name: detail?.name || null,
+        baseSymbol: detail?.token_x?.symbol || null,
+        quoteSymbol: detail?.token_y?.symbol || null,
+      };
+    } catch (error) {
+      log("pool_meta", `Metadata fetch failed for ${poolAddress.slice(0, 8)}: ${error.message}`);
+      return null;
+    }
+  })();
+
+  _poolMetadataCache.set(poolAddress, promise);
+  return promise;
+}
+
 function pickSymbol(...values) {
   for (const value of values) {
     if (typeof value !== "string") continue;
@@ -321,11 +346,15 @@ function pickSymbol(...values) {
   return null;
 }
 
-function buildDisplayPair({ tracked, pnlEntry, poolAddress }) {
+function buildDisplayPair({ tracked, pnlEntry, poolMeta, poolAddress }) {
   const trackedName = tracked?.pool_name?.trim();
   if (trackedName) return trackedName;
 
+  const metaName = poolMeta?.name?.trim();
+  if (metaName) return metaName;
+
   const base = pickSymbol(
+    poolMeta?.baseSymbol,
     pnlEntry?.mint_x_symbol,
     pnlEntry?.mintXSymbol,
     pnlEntry?.tokenXSymbol,
@@ -334,6 +363,7 @@ function buildDisplayPair({ tracked, pnlEntry, poolAddress }) {
     pnlEntry?.baseToken?.symbol
   );
   const quote = pickSymbol(
+    poolMeta?.quoteSymbol,
     pnlEntry?.mint_y_symbol,
     pnlEntry?.mintYSymbol,
     pnlEntry?.tokenYSymbol,
@@ -424,12 +454,18 @@ export async function getMyPositions({ force = false } = {}) {
 
     // Enrich with DLMM PnL API for each unique pool in parallel
     const uniquePools = [...new Set(raw.map((p) => p.pool))];
-    const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, walletAddress)));
+    const [pnlMaps, poolMetaMaps] = await Promise.all([
+      Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, walletAddress))),
+      Promise.all(uniquePools.map((pool) => fetchPoolMetadata(pool))),
+    ]);
     const pnlByPool = {};
+    const poolMetaByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+    uniquePools.forEach((pool, i) => { poolMetaByPool[pool] = poolMetaMaps[i]; });
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
+      const poolMeta = poolMetaByPool[r.pool] || null;
 
       const inRange = p ? !p.isOutOfRange : true;
       if (inRange) markInRange(r.position);
@@ -457,7 +493,7 @@ export async function getMyPositions({ force = false } = {}) {
       return {
         position: r.position,
         pool: r.pool,
-        pair: buildDisplayPair({ tracked, pnlEntry: p, poolAddress: r.pool }),
+        pair: buildDisplayPair({ tracked, pnlEntry: p, poolMeta, poolAddress: r.pool }),
         base_mint: r.base_mint,
         lower_bin: lowerBin,
         upper_bin: upperBin,
