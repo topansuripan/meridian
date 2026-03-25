@@ -29,7 +29,15 @@ import {
   syncTelegramCommands,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction } from "./state.js";
+import {
+  getLastBriefingDate,
+  setLastBriefingDate,
+  getTrackedPosition,
+  setPositionInstruction,
+  setLastCycleReport,
+  getLastCycleReport,
+  shouldSendAlert,
+} from "./state.js";
 import { listMemory, addMemory, MemoryType } from "./memory.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
@@ -124,7 +132,7 @@ function stopCronJobs() {
   _cronTasks = [];
 }
 
-export async function runManagementCycle({ silent = false } = {}) {
+export async function runManagementCycle({ delivery = "full" } = {}) {
   log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
   let mgmtReport = null;
   let positions = [];
@@ -135,11 +143,12 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       if (positions.length === 0) {
         log("cron", "No open positions");
+        mgmtReport = "No open positions.";
         if (config.schedule.screeningMode === "interval" || config.schedule.screeningMode === "nonstop") {
           log("cron", `No open positions — triggering screening cycle because screening mode is ${config.schedule.screeningMode}`);
-          runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+          runScreeningCycle({ delivery: "alerts" }).catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
         }
-        return "No open positions.";
+        return mgmtReport;
       }
 
       if (config.schedule.autoAdjustManagementInterval && config.schedule.managementMode === "interval") {
@@ -164,7 +173,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       ) {
         _screeningLastTriggered = Date.now();
         log("cron", `Positions (${positions.length}/${config.risk.maxPositions}) — triggering screening in background`);
-        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+        runScreeningCycle({ delivery: "alerts" }).catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       }
 
       // Snapshot + PnL fetch in parallel for all positions
@@ -239,11 +248,17 @@ After all positions, add one summary line:
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
     } finally {
-      if (!silent && telegramEnabled()) {
-        if (mgmtReport) sendHTML(formatManagementTelegramReport(mgmtReport) || `🔄 <b>Management Cycle</b>\n\n${escapeHtml(mgmtReport)}`).catch(() => {});
+      cacheCycleReport("management", mgmtReport, { generated_at: new Date().toISOString() });
+      if (delivery === "full" && telegramEnabled() && mgmtReport) {
+        sendHTML(formatManagementTelegramReport(mgmtReport) || `🔄 <b>Management Cycle</b>\n\n${escapeHtml(mgmtReport)}`).catch(() => {});
+      }
+      if (delivery !== "silent" && telegramEnabled()) {
         for (const p of positions) {
           if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-            notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => {});
+            const alertKey = `oor:${p.position}`;
+            if (shouldSendAlert(alertKey, 2 * 60 * 60_000)) {
+              notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => {});
+            }
           }
         }
       }
@@ -251,22 +266,49 @@ After all positions, add one summary line:
   return mgmtReport;
 }
 
-export async function runScreeningCycle({ silent = false } = {}) {
+export async function runScreeningCycle({ delivery = "full" } = {}) {
     if (_screeningBusy) return;
 
     // Hard guards — don't even run the agent if preconditions aren't met
     let prePositions, preBalance;
     let rejected = [];
+    let screenReport = null;
     try {
       [prePositions, preBalance] = await Promise.all([getMyPositions(), getWalletBalances()]);
       if (prePositions.total_positions >= config.risk.maxPositions) {
         log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
-        return;
+        screenReport = `Risk limit reached. Open positions ${prePositions.total_positions}/${config.risk.maxPositions}. Screening paused until a slot opens.`;
+        cacheCycleReport("screening", screenReport, { rejected, generated_at: new Date().toISOString(), reason: "max_positions" });
+        if (delivery !== "silent") {
+          await sendScreeningAlert(
+            "Risk Limit Reached",
+            [
+              `Open positions: ${prePositions.total_positions}/${config.risk.maxPositions}`,
+              "Screening menemukan tidak ada slot baru untuk deploy.",
+            ],
+            "screening:max_positions",
+            60 * 60_000
+          );
+        }
+        return screenReport;
       }
       const minRequired = config.management.deployAmountSol + config.management.gasReserve;
       if (preBalance.sol < minRequired) {
         log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-        return;
+        screenReport = `Insufficient SOL. Wallet has ${preBalance.sol.toFixed(4)} SOL, but ${minRequired.toFixed(4)} SOL is needed for deploy + gas reserve.`;
+        cacheCycleReport("screening", screenReport, { rejected, generated_at: new Date().toISOString(), reason: "insufficient_sol" });
+        if (delivery !== "silent") {
+          await sendScreeningAlert(
+            "Saldo Kurang Untuk Screening",
+            [
+              `SOL tersedia: ${preBalance.sol.toFixed(4)}`,
+              `Minimal aman untuk deploy: ${minRequired.toFixed(4)} SOL`,
+            ],
+            "screening:insufficient_sol",
+            45 * 60_000
+          );
+        }
+        return screenReport;
       }
     } catch (e) {
       log("cron_error", `Screening pre-check failed: ${e.message}`);
@@ -276,7 +318,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = true;
     timers.screeningLastRun = Date.now();
     log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
-    let screenReport = null;
     try {
       // Reuse pre-fetched balance — no extra RPC call needed
       const currentBalance = preBalance;
@@ -394,8 +435,18 @@ STEPS:
       screenReport = `Screening cycle failed: ${error.message}`;
     } finally {
       _screeningBusy = false;
-      if (!silent && telegramEnabled()) {
-        if (screenReport) {
+      cacheCycleReport("screening", screenReport, { rejected, generated_at: new Date().toISOString() });
+      if (telegramEnabled()) {
+        const deployFailureReason = extractDeployFailureReason(screenReport);
+        if (delivery !== "silent" && deployFailureReason) {
+          sendScreeningAlert(
+            "Candidate Bagus Tapi Deploy Gagal",
+            [deployFailureReason],
+            "screening:deploy_failed",
+            30 * 60_000
+          ).catch(() => {});
+        }
+        if (delivery === "full" && screenReport) {
           sendHTML(formatScreeningTelegramReport(screenReport, rejected) || `🔍 <b>Screening Cycle</b>\n\n${escapeHtml(screenReport)}`).catch(() => {});
         }
       }
@@ -414,7 +465,7 @@ export function startCronJobs() {
       if (_managementBusy) return;
       _managementBusy = true;
       timers.managementLastRun = Date.now();
-      try { await runManagementCycle(); }
+      try { await runManagementCycle({ delivery: "alerts" }); }
       finally { _managementBusy = false; }
     });
     _cronTasks.push(mgmtTask);
@@ -424,7 +475,7 @@ export function startCronJobs() {
     const screeningSchedule = config.schedule.screeningMode === "nonstop"
       ? "* * * * *"
       : `*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`;
-    const screenTask = cron.schedule(screeningSchedule, runScreeningCycle);
+    const screenTask = cron.schedule(screeningSchedule, () => runScreeningCycle({ delivery: "alerts" }));
     _cronTasks.push(screenTask);
   }
 
@@ -535,6 +586,26 @@ function formatScheduleMode(mode, interval) {
   if (mode === "manual") return "manual";
   if (mode === "nonstop") return "24/7 nonstop";
   return `auto tiap ${interval}m`;
+}
+
+function formatLastRunLabel(timestamp) {
+  if (!timestamp) return "belum ada";
+  return new Date(timestamp).toLocaleString("id-ID", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function screeningAlertModeLabel() {
+  if (config.schedule.screeningMode === "manual") return "manual";
+  return "alert only";
+}
+
+function managementAlertModeLabel() {
+  if (config.schedule.managementMode === "manual") return "manual";
+  return "silent + critical alerts";
 }
 
 function formatUsd(value) {
@@ -679,12 +750,60 @@ function formatScreeningTelegramReport(report, rejected = []) {
   ].filter(Boolean).join("\n\n");
 }
 
+function cacheCycleReport(kind, report, extra = {}) {
+  if (!report) return;
+  setLastCycleReport(kind, {
+    report,
+    ...extra,
+  });
+}
+
+async function sendLastCycleReport(kind) {
+  const cached = getLastCycleReport(kind);
+  if (!cached?.report) {
+    await sendMessage(kind === "management"
+      ? "Belum ada management report tersimpan."
+      : "Belum ada screening report tersimpan.");
+    return false;
+  }
+
+  const formatted = kind === "management"
+    ? formatManagementTelegramReport(cached.report)
+    : formatScreeningTelegramReport(cached.report, cached.rejected || []);
+  const stamped = `🕒 Last run: ${escapeHtml(formatLastRunLabel(cached.updated_at || cached.generated_at))}`;
+
+  await sendHTML([stamped, "", formatted || escapeHtml(cached.report)].join("\n"));
+  return true;
+}
+
+async function sendScreeningAlert(title, bodyLines, alertKey, cooldownMs = 30 * 60_000) {
+  if (!telegramEnabled()) return;
+  if (!shouldSendAlert(alertKey, cooldownMs)) return;
+  await sendHTML([
+    `🚨 <b>${escapeHtml(title)}</b>`,
+    ...bodyLines.map((line) => escapeHtml(line)),
+  ].join("\n")).catch(() => {});
+}
+
+function extractDeployFailureReason(report) {
+  const text = stripMarkdown(report || "");
+  if (!text) return null;
+  if (!/deploy|open position/i.test(text) || !/fail|failed|error|unable|rejected/i.test(text)) {
+    return null;
+  }
+
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  return lines.find((line) => /fail|failed|error|unable|rejected/i.test(line)) || "Candidate looked good, but deploy failed.";
+}
+
 async function sendTelegramStatusCard() {
   const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
   const inRange = positions.positions.filter((p) => p.in_range).length;
   const outOfRange = positions.total_positions - inRange;
-  const lastMgmt = timers.managementLastRun ? new Date(timers.managementLastRun).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "--.--";
-  const lastScreen = timers.screeningLastRun ? new Date(timers.screeningLastRun).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "--.--";
+  const lastMgmtReport = getLastCycleReport("management");
+  const lastScreenReport = getLastCycleReport("screening");
+  const lastMgmt = formatLastRunLabel(lastMgmtReport?.updated_at || timers.managementLastRun);
+  const lastScreen = formatLastRunLabel(lastScreenReport?.updated_at || timers.screeningLastRun);
   await sendHTML([
     `🌟 <b>Meridian Control Center</b>`,
     `────────────────`,
@@ -701,7 +820,8 @@ async function sendTelegramStatusCard() {
     `<b>Automation</b>`,
     `🤖 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
     `🧭 Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
-    `🩺 Health Check: ${config.schedule.healthCheckEnabled ? `on / ${config.schedule.healthCheckIntervalMin}m` : "off"}`,
+    `🔕 Mgmt feed: ${managementAlertModeLabel()}`,
+    `🚨 Screen feed: ${screeningAlertModeLabel()}`,
     ``,
     `<b>Recent Activity</b>`,
     `🕒 Last Management: ${lastMgmt}`,
@@ -757,6 +877,8 @@ async function sendTelegramConfigCard() {
     `<b>Cycle Modes</b>`,
     `Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
     `Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    `Mgmt feed: ${managementAlertModeLabel()}`,
+    `Screen feed: ${screeningAlertModeLabel()}`,
     ``,
     `<b>Screening</b>`,
     `timeframe: ${s.timeframe} | category: ${s.category}`,
@@ -806,9 +928,12 @@ async function sendTelegramScheduleSettingsCard() {
     `────────────────`,
     `🤖 Management: <b>${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}</b>`,
     `🧭 Screening: <b>${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}</b>`,
+    `🔕 Management auto-report: <b>${managementAlertModeLabel()}</b>`,
+    `🚨 Screening auto-report: <b>${screeningAlertModeLabel()}</b>`,
     ``,
     `Mode manual = hanya jalan saat kamu tekan menu.`,
-    `Mode 24/7 = scheduler aktif terus tiap menit dengan guard anti-overlap.`,
+    `Mode 24/7 = background aktif terus, report lengkap tetap muncul saat kamu tekan tombol.`,
+    `Auto alert hanya keluar untuk event penting seperti OOR, saldo kurang, atau deploy gagal.`,
     `────────────────`,
   ].join("\n"), { reply_markup: getScheduleMenuMarkup() });
 }
@@ -990,8 +1115,8 @@ if (isTTY) {
         `<code>/home</code> buka menu utama\n` +
         `<code>/status</code> ringkasan wallet dan cycle\n` +
         `<code>/positions</code> daftar posisi aktif\n` +
-        `<code>/manage</code> jalankan management sekarang\n` +
-        `<code>/screen</code> jalankan screening sekarang\n` +
+        `<code>/manage</code> lihat report management terakhir, atau jalankan kalau mode manual\n` +
+        `<code>/screen</code> lihat report screening terakhir, atau jalankan kalau mode manual\n` +
         `<code>/briefing</code> tampilkan morning briefing\n` +
         `<code>/settings</code> ubah manual/interval/24-7\n\n` +
         `Klik tombol <b>Menu</b> di kiri bawah Telegram untuk melihat daftar command seperti contoh yang kamu mau.`
@@ -1194,10 +1319,13 @@ if (isTTY) {
 
     if (normalized === TELEGRAM_LABELS.MANAGEMENT || normalized === "/manage") {
       try {
+        if (config.schedule.managementMode !== "manual" && await sendLastCycleReport("management")) {
+          return;
+        }
         await sendHTML(`🔄 <b>Management Cycle</b>\n\nMenjalankan management sekali sekarang...`);
         _managementBusy = true;
         timers.managementLastRun = Date.now();
-        const report = await runManagementCycle({ silent: true });
+        const report = await runManagementCycle({ delivery: "silent" });
         if (report) await sendHTML(formatManagementTelegramReport(report) || `🔄 <b>Management Cycle</b>\n\n${escapeHtml(report)}`);
       } catch (e) {
         await sendMessage(`Error: ${e.message}`).catch(() => {});
@@ -1209,8 +1337,11 @@ if (isTTY) {
 
     if (normalized === TELEGRAM_LABELS.SCREENING || normalized === "/screen") {
       try {
+        if (config.schedule.screeningMode !== "manual" && await sendLastCycleReport("screening")) {
+          return;
+        }
         await sendHTML(`🔍 <b>Screening Cycle</b>\n\nMenjalankan screening sekali sekarang...`);
-        const report = await runScreeningCycle({ silent: true });
+        const report = await runScreeningCycle({ delivery: "silent" });
         if (report) await sendHTML(formatScreeningTelegramReport(report) || `🔍 <b>Screening Cycle</b>\n\n${escapeHtml(report)}`);
       } catch (e) {
         await sendMessage(`Error: ${e.message}`).catch(() => {});

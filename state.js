@@ -17,13 +17,13 @@ const MAX_RECENT_EVENTS = 20;
 
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
+    return { positions: {}, recentEvents: [], alerts: {}, lastReports: {}, lastUpdated: null };
   }
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch (err) {
     log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
+    return { positions: {}, recentEvents: [], alerts: {}, lastReports: {}, lastUpdated: null };
   }
 }
 
@@ -295,4 +295,38 @@ export function syncOpenPositions(active_addresses) {
   }
 
   if (changed) save(state);
+}
+
+// ─── Cycle Report Cache ─────────────────────────────────────────
+
+export function setLastCycleReport(kind, payload) {
+  const state = load();
+  if (!state.lastReports) state.lastReports = {};
+  state.lastReports[kind] = {
+    ...payload,
+    updated_at: new Date().toISOString(),
+  };
+  save(state);
+}
+
+export function getLastCycleReport(kind) {
+  const state = load();
+  return state.lastReports?.[kind] || null;
+}
+
+// ─── Alert Throttling ───────────────────────────────────────────
+
+export function shouldSendAlert(key, cooldownMs = 30 * 60_000) {
+  const state = load();
+  if (!state.alerts) state.alerts = {};
+
+  const now = Date.now();
+  const lastSent = state.alerts[key] ? new Date(state.alerts[key]).getTime() : 0;
+  if (lastSent && now - lastSent < cooldownMs) {
+    return false;
+  }
+
+  state.alerts[key] = new Date(now).toISOString();
+  save(state);
+  return true;
 }
