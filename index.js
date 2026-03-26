@@ -671,6 +671,41 @@ function riskModeBrief() {
   return "balanced, selective rotation";
 }
 
+function isLightweightTelegramCommand(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) return false;
+
+  const directMatches = new Set([
+    TELEGRAM_LABELS.MENU,
+    TELEGRAM_LABELS.HELP,
+    TELEGRAM_LABELS.STATUS,
+    TELEGRAM_LABELS.POSITIONS,
+    TELEGRAM_LABELS.BRIEFING,
+    TELEGRAM_LABELS.MEMORY,
+    TELEGRAM_LABELS.SETTINGS,
+    TELEGRAM_LABELS.SETTINGS_SCHEDULE,
+    TELEGRAM_LABELS.SETTINGS_TRADE,
+    TELEGRAM_LABELS.SETTINGS_RISK,
+    TELEGRAM_LABELS.BACK,
+    TELEGRAM_LABELS.POSITIONS_BACK,
+    "/menu",
+    "/start",
+    "/home",
+    "/help",
+    "/status",
+    "/positions",
+    "/briefing",
+    "/memory",
+    "/settings",
+    "/config",
+  ]);
+
+  if (directMatches.has(normalized)) return true;
+  if (/^\d+\.\s+/.test(normalized)) return true;
+  if (/^(Close|Hold|TP5)\s+#\d+$/i.test(normalized)) return true;
+  return false;
+}
+
 function isRiskModeButton(text, mode) {
   const normalized = String(text || "").trim();
   if (mode === "safe") return /safe$/i.test(normalized);
@@ -1248,7 +1283,7 @@ if (isTTY) {
 
   // Telegram bot
   startPolling(async (text) => {
-    if (_managementBusy || _screeningBusy || busy) {
+    if ((_managementBusy || _screeningBusy || busy) && !isLightweightTelegramCommand(text)) {
       sendMessage("Agent is busy right now — try again in a moment.").catch(() => {});
       return;
     }
