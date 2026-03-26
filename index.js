@@ -96,6 +96,7 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
+let _screeningPausedForCapacity = false; // when full, let management own the loop until a slot opens
 
 async function runBriefing() {
   log("cron", "Starting morning briefing");
@@ -142,10 +143,12 @@ export async function runManagementCycle({ delivery = "full" } = {}) {
       // Pre-load all positions + PnL in parallel — LLM gets everything, no fetch steps needed
       const livePositions = await getMyPositions().catch(() => null);
       positions = livePositions?.positions || [];
+      _screeningPausedForCapacity = positions.length >= config.risk.maxPositions;
 
       if (positions.length === 0) {
         log("cron", "No open positions");
         mgmtReport = "No open positions.";
+        _screeningPausedForCapacity = false;
         if (config.schedule.screeningMode === "interval" || config.schedule.screeningMode === "nonstop") {
           log("cron", `No open positions — triggering screening cycle because screening mode is ${config.schedule.screeningMode}`);
           runScreeningCycle({ delivery: "alerts" }).catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
@@ -270,6 +273,10 @@ After all positions, add one summary line:
 
 export async function runScreeningCycle({ delivery = "full" } = {}) {
     if (_screeningBusy) return;
+    if (_screeningPausedForCapacity) {
+      log("cron", "Screening paused — portfolio already at max positions, waiting for management to free a slot");
+      return "Screening paused until a position slot opens.";
+    }
 
     // Hard guards — don't even run the agent if preconditions aren't met
     let prePositions, preBalance;
@@ -278,6 +285,7 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
     try {
       [prePositions, preBalance] = await Promise.all([getMyPositions(), getWalletBalances()]);
       if (prePositions.total_positions >= config.risk.maxPositions) {
+        _screeningPausedForCapacity = true;
         log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
         screenReport = `Risk limit reached. Open positions ${prePositions.total_positions}/${config.risk.maxPositions}. Screening paused until a slot opens.`;
         cacheCycleReport("screening", screenReport, { rejected, generated_at: new Date().toISOString(), reason: "max_positions" });
@@ -294,6 +302,7 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
         }
         return screenReport;
       }
+      _screeningPausedForCapacity = false;
       const minRequired = config.management.deployAmountSol + config.management.gasReserve;
       if (preBalance.sol < minRequired) {
         log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
@@ -888,7 +897,7 @@ async function sendTelegramStatusCard() {
     ``,
     `<b>Automation</b>`,
     `🤖 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
-    `🧭 Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    `🧭 Screening: ${_screeningPausedForCapacity ? "paused (max positions)" : formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
     `🔥 Risk Mode: ${riskModeLabel()} (${riskModeBrief()})`,
     `🔕 Mgmt feed: ${managementAlertModeLabel()}`,
     `🚨 Screen feed: ${screeningAlertModeLabel()}`,
@@ -946,7 +955,7 @@ async function sendTelegramConfigCard() {
     ``,
     `<b>Cycle Modes</b>`,
     `Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
-    `Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    `Screening: ${_screeningPausedForCapacity ? "paused (max positions)" : formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
     `Risk mode: ${riskModeLabel()} (${riskModeBrief()})`,
     `Mgmt feed: ${managementAlertModeLabel()}`,
     `Screen feed: ${screeningAlertModeLabel()}`,
@@ -1416,12 +1425,14 @@ if (isTTY) {
         if (result.success) {
           const tx = result.txs?.[0] || result.tx || null;
           const txLink = tx ? `https://solscan.io/tx/${tx}` : null;
+          const pnlLink = tx ? `https://www.metlex.io/pnl2/${tx}` : null;
           const poolLink = pos.pool ? `https://app.meteora.ag/dlmm/${pos.pool}` : null;
           await sendHTML([
             `🔒 <b>Closed ${escapeHtml(pos.pair)}</b>`,
             `━━━━━━━━━━━━━━`,
             `📊 <b>PnL:</b> $${escapeHtml(result.pnl_usd ?? "?")}`,
             txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
+            pnlLink ? `📈 <a href="${pnlLink}">Open PnL Card</a>` : null,
             poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
             tx ? `🔹 <b>Tx ID:</b> <code>${shortHash(tx)}</code>` : null,
           ].filter(Boolean).join("\n"));
@@ -1524,11 +1535,13 @@ if (isTTY) {
         if (result.success) {
           const tx = result.txs?.[0] || result.tx || null;
           const txLink = tx ? `https://solscan.io/tx/${tx}` : null;
+          const pnlLink = tx ? `https://www.metlex.io/pnl2/${tx}` : null;
           const poolLink = pos.pool ? `https://app.meteora.ag/dlmm/${pos.pool}` : null;
           await sendHTML([
             `🔒 <b>Closed ${escapeHtml(pos.pair)}</b>`,
             `📊 <b>PnL:</b> $${escapeHtml(result.pnl_usd ?? "?")}`,
             txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
+            pnlLink ? `📈 <a href="${pnlLink}">Open PnL Card</a>` : null,
             poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
           ].filter(Boolean).join("\n"));
         } else {

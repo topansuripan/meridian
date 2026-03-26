@@ -363,6 +363,10 @@ function meteoraPoolLink(poolAddress) {
   return poolAddress ? `https://app.meteora.ag/dlmm/${poolAddress}` : null;
 }
 
+function metlexPnlLink(tx) {
+  return tx ? `https://www.metlex.io/pnl2/${tx}` : null;
+}
+
 function shortCode(value, head = 8, tail = 4) {
   const text = String(value || "");
   if (!text) return "-";
@@ -396,11 +400,13 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, tx, poolAddress }) {
   const sign = pnlUsd >= 0 ? "+" : "";
   const txLink = solscanTxLink(tx);
   const poolLink = meteoraPoolLink(poolAddress);
+  const pnlLink = metlexPnlLink(tx);
   await sendHTML([
     `🔒 <b>Closed ${pair}</b>`,
     `━━━━━━━━━━━━━━`,
     `📊 <b>PnL:</b> ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`,
     txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
+    pnlLink ? `📈 <a href="${pnlLink}">Open PnL Card</a>` : null,
     poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
   ].filter(Boolean).join("\n"));
 }
