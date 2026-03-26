@@ -46,6 +46,9 @@ export const TELEGRAM_LABELS = {
   MAXPOS_1: "MaxPos 1",
   MAXPOS_3: "MaxPos 3",
   MAXPOS_5: "MaxPos 5",
+  RISK_SAFE: "Mode Safe",
+  RISK_MODERATE: "Mode Moderate",
+  RISK_DEGEN: "Mode Degen",
   POSITIONS_BACK: "Back to Positions",
   BACK: "Back to Menu",
 };
@@ -106,6 +109,7 @@ export function getTradeSettingsMenuMarkup() {
 export function getRiskSettingsMenuMarkup() {
   return keyboard([
     [TELEGRAM_LABELS.MAXPOS_1, TELEGRAM_LABELS.MAXPOS_3, TELEGRAM_LABELS.MAXPOS_5],
+    [TELEGRAM_LABELS.RISK_SAFE, TELEGRAM_LABELS.RISK_MODERATE, TELEGRAM_LABELS.RISK_DEGEN],
     [TELEGRAM_LABELS.SETTINGS, TELEGRAM_LABELS.BACK],
   ]);
 }

@@ -972,8 +972,10 @@ async function sendTelegramRiskSettingsCard() {
     `────────────────`,
     `📚 Max positions: <b>${r.maxPositions}</b>`,
     `🏦 Max deploy amount: <b>${r.maxDeployAmount} SOL</b>`,
+    `🔥 Risk mode: <b>${riskModeLabel()}</b>`,
+    `🧠 Style: ${riskModeBrief()}`,
     ``,
-    `Pilih batas maksimum posisi dari tombol di bawah.`,
+    `Pilih batas maksimum posisi atau ganti mode risiko dari tombol di bawah.`,
     `────────────────`,
   ].join("\n"), { reply_markup: getRiskSettingsMenuMarkup() });
 }
@@ -1064,6 +1066,69 @@ function persistUserConfig(changes) {
     }
   }
   fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify({ ...current, ...changes }, null, 2));
+}
+
+function getRiskModePreset(mode) {
+  if (mode === "degen") {
+    return {
+      riskMode: "degen",
+      timeframe: "30m",
+      maxVolatility: 12,
+      maxPriceChangePct: 900,
+      minOrganic: 60,
+      minHolders: 200,
+      takeProfitFeePct: 10,
+      outOfRangeWaitMinutes: 15,
+      managementIntervalMin: 5,
+      screeningIntervalMin: 15,
+    };
+  }
+  if (mode === "safe") {
+    return {
+      riskMode: "safe",
+      timeframe: "24h",
+      maxVolatility: 4,
+      maxPriceChangePct: 120,
+      minOrganic: 75,
+      minHolders: 1000,
+      takeProfitFeePct: 3,
+      outOfRangeWaitMinutes: 60,
+      managementIntervalMin: 15,
+      screeningIntervalMin: 60,
+    };
+  }
+  return {
+    riskMode: "moderate",
+    timeframe: "4h",
+    maxVolatility: 8,
+    maxPriceChangePct: 300,
+    minOrganic: 65,
+    minHolders: 500,
+    takeProfitFeePct: 5,
+    outOfRangeWaitMinutes: 30,
+    managementIntervalMin: 10,
+    screeningIntervalMin: 30,
+  };
+}
+
+async function applyRiskModePreset(mode) {
+  const preset = getRiskModePreset(mode);
+  config.profile.riskMode = preset.riskMode;
+  config.screening.timeframe = preset.timeframe;
+  config.screening.maxVolatility = preset.maxVolatility;
+  config.screening.maxPriceChangePct = preset.maxPriceChangePct;
+  config.screening.minOrganic = preset.minOrganic;
+  config.screening.minHolders = preset.minHolders;
+  config.management.takeProfitFeePct = preset.takeProfitFeePct;
+  config.management.outOfRangeWaitMinutes = preset.outOfRangeWaitMinutes;
+  config.schedule.managementIntervalMin = preset.managementIntervalMin;
+  config.schedule.screeningIntervalMin = preset.screeningIntervalMin;
+
+  persistUserConfig(preset);
+  if (cronStarted) startCronJobs();
+  addMemory(`Changed riskMode=${mode}, timeframe=${preset.timeframe}, maxVolatility=${preset.maxVolatility}, maxPriceChangePct=${preset.maxPriceChangePct} — Telegram risk mode preset`, MemoryType.SELF_TUNED);
+  await sendTelegramRiskSettingsCard();
+  await sendSettingsMenu(`Risk mode diubah ke ${mode}. Screening dan management preset ikut disesuaikan.`);
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
@@ -1298,6 +1363,18 @@ if (isTTY) {
     if (normalized === TELEGRAM_LABELS.MAXPOS_5) {
       applyConfigPreset({ maxPositions: 5 }, "Telegram risk preset");
       await sendTelegramRiskSettingsCard();
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.RISK_SAFE) {
+      await applyRiskModePreset("safe");
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.RISK_MODERATE) {
+      await applyRiskModePreset("moderate");
+      return;
+    }
+    if (normalized === TELEGRAM_LABELS.RISK_DEGEN) {
+      await applyRiskModePreset("degen");
       return;
     }
 
