@@ -711,6 +711,13 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;");
 }
 
+function shortHash(value, head = 10, tail = 6) {
+  const text = String(value || "");
+  if (!text) return "-";
+  if (text.length <= head + tail + 3) return text;
+  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+}
+
 function stripMarkdown(value) {
   return String(value ?? "")
     .replace(/\*\*/g, "")
@@ -1405,9 +1412,19 @@ if (isTTY) {
         if (idx < 0 || idx >= positions.length) { await sendMessage("Posisi tidak ditemukan."); return; }
         const pos = positions[idx];
         await sendMessage(`Closing ${pos.pair}...`);
-        const result = await closePosition({ position_address: pos.position });
+        const result = await closePosition({ position_address: pos.position, pool_address: pos.pool });
         if (result.success) {
-          await sendHTML(`✅ <b>Closed</b> ${pos.pair}\nPnL: $${result.pnl_usd ?? "?"}\nTx: ${result.txs?.[0] || result.tx || "-"}`);
+          const tx = result.txs?.[0] || result.tx || null;
+          const txLink = tx ? `https://solscan.io/tx/${tx}` : null;
+          const poolLink = pos.pool ? `https://app.meteora.ag/dlmm/${pos.pool}` : null;
+          await sendHTML([
+            `🔒 <b>Closed ${escapeHtml(pos.pair)}</b>`,
+            `━━━━━━━━━━━━━━`,
+            `📊 <b>PnL:</b> $${escapeHtml(result.pnl_usd ?? "?")}`,
+            txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
+            poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
+            tx ? `🔹 <b>Tx ID:</b> <code>${shortHash(tx)}</code>` : null,
+          ].filter(Boolean).join("\n"));
         } else {
           await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
         }
@@ -1503,9 +1520,17 @@ if (isTTY) {
         if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
         const pos = positions[idx];
         await sendMessage(`Closing ${pos.pair}...`);
-        const result = await closePosition({ position_address: pos.position });
+        const result = await closePosition({ position_address: pos.position, pool_address: pos.pool });
         if (result.success) {
-          await sendMessage(`✅ Closed ${pos.pair}\nPnL: $${result.pnl_usd ?? "?"} | txs: ${result.txs?.join(", ")}`);
+          const tx = result.txs?.[0] || result.tx || null;
+          const txLink = tx ? `https://solscan.io/tx/${tx}` : null;
+          const poolLink = pos.pool ? `https://app.meteora.ag/dlmm/${pos.pool}` : null;
+          await sendHTML([
+            `🔒 <b>Closed ${escapeHtml(pos.pair)}</b>`,
+            `📊 <b>PnL:</b> $${escapeHtml(result.pnl_usd ?? "?")}`,
+            txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
+            poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
+          ].filter(Boolean).join("\n"));
         } else {
           await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
         }

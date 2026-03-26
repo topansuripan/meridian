@@ -355,43 +355,73 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
-export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, binStep, baseFee }) {
-  const priceStr = priceRange
-    ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
-    : "";
-  const poolStr = (binStep || baseFee)
-    ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
-    : "";
-  await sendHTML(
-    `✅ <b>Deployed</b> ${pair}\n` +
-    `Amount: ${amountSol} SOL\n` +
-    priceStr +
-    poolStr +
-    `Position: <code>${position?.slice(0, 8)}...</code>\n` +
-    `Tx: <code>${tx?.slice(0, 16)}...</code>`
-  );
+function solscanTxLink(tx) {
+  return tx ? `https://solscan.io/tx/${tx}` : null;
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+function meteoraPoolLink(poolAddress) {
+  return poolAddress ? `https://app.meteora.ag/dlmm/${poolAddress}` : null;
+}
+
+function shortCode(value, head = 8, tail = 4) {
+  const text = String(value || "");
+  if (!text) return "-";
+  if (text.length <= head + tail + 3) return text;
+  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+}
+
+function formatPrice(value) {
+  if (value == null) return "?";
+  return value < 0.0001 ? value.toExponential(3) : value.toFixed(6);
+}
+
+export async function notifyDeploy({ pair, amountSol, position, tx, poolAddress, priceRange, binStep, baseFee }) {
+  const txLink = solscanTxLink(tx);
+  const poolLink = meteoraPoolLink(poolAddress);
+  await sendHTML([
+    `✅ <b>Deployed ${pair}</b>`,
+    `━━━━━━━━━━━━━━`,
+    `💰 <b>Amount:</b> ${amountSol} SOL`,
+    priceRange ? `🎯 <b>Range:</b> ${formatPrice(priceRange.min)} - ${formatPrice(priceRange.max)}` : null,
+    (binStep || baseFee != null) ? `⚙️ <b>Setup:</b> Bin ${binStep ?? "?"} | Fee ${baseFee != null ? `${baseFee}%` : "?"}` : null,
+    txLink || poolLink ? "" : null,
+    txLink ? `🔗 <a href="${txLink}">View Tx</a>` : null,
+    poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
+    `🧾 <b>Position ID:</b> <code>${shortCode(position)}</code>`,
+    tx ? `🔹 <b>Tx ID:</b> <code>${shortCode(tx, 10, 6)}</code>` : null,
+  ].filter(Boolean).join("\n"));
+}
+
+export async function notifyClose({ pair, pnlUsd, pnlPct, tx, poolAddress }) {
   const sign = pnlUsd >= 0 ? "+" : "";
-  await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
-  );
+  const txLink = solscanTxLink(tx);
+  const poolLink = meteoraPoolLink(poolAddress);
+  await sendHTML([
+    `🔒 <b>Closed ${pair}</b>`,
+    `━━━━━━━━━━━━━━`,
+    `📊 <b>PnL:</b> ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`,
+    txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
+    poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
+  ].filter(Boolean).join("\n"));
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
+  const txLink = solscanTxLink(tx);
   await sendHTML(
-    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
-    `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
-    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+    [
+      `🔄 <b>Swap Executed</b>`,
+      `💱 <b>${inputSymbol}</b> → <b>${outputSymbol}</b>`,
+      `📥 In: ${amountIn ?? "?"} | 📤 Out: ${amountOut ?? "?"}`,
+      txLink ? `🔗 <a href="${txLink}">View Tx</a>` : null,
+    ].filter(Boolean).join("\n")
   );
 }
 
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
-    `Been OOR for ${minutesOOR} minutes`
+    `⚠️ <b>${pair} Out of Range</b>\n` +
+    `🕒 Been out of range for <b>${minutesOOR}m</b>\n` +
+    `👀 Marked for management attention`
   );
 }
 
