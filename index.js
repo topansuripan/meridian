@@ -662,6 +662,14 @@ function riskModeBrief() {
   return "balanced, selective rotation";
 }
 
+function isRiskModeButton(text, mode) {
+  const normalized = String(text || "").trim();
+  if (mode === "safe") return /safe$/i.test(normalized);
+  if (mode === "moderate") return /moderate$/i.test(normalized);
+  if (mode === "degen") return /degen$/i.test(normalized);
+  return false;
+}
+
 function formatUsd(value) {
   return Number(value || 0).toLocaleString("en-US", {
     minimumFractionDigits: 2,
@@ -967,13 +975,18 @@ async function sendTelegramTradeSettingsCard() {
 
 async function sendTelegramRiskSettingsCard() {
   const r = config.risk;
+  const mode = riskModeLabel();
+  const safeBadge = mode === "safe" ? "✅ Safe active" : "Safe";
+  const moderateBadge = mode === "moderate" ? "✅ Moderate active" : "Moderate";
+  const degenBadge = mode === "degen" ? "✅ Degen active" : "Degen";
   await sendHTML([
     `🛡️ <b>Risk Settings</b>`,
     `────────────────`,
     `📚 Max positions: <b>${r.maxPositions}</b>`,
     `🏦 Max deploy amount: <b>${r.maxDeployAmount} SOL</b>`,
-    `🔥 Risk mode: <b>${riskModeLabel()}</b>`,
+    `🔥 Risk mode: <b>${mode}</b>`,
     `🧠 Style: ${riskModeBrief()}`,
+    `🧭 Modes: ${safeBadge} | ${moderateBadge} | ${degenBadge}`,
     ``,
     `Pilih batas maksimum posisi atau ganti mode risiko dari tombol di bawah.`,
     `────────────────`,
@@ -1365,15 +1378,15 @@ if (isTTY) {
       await sendTelegramRiskSettingsCard();
       return;
     }
-    if (normalized === TELEGRAM_LABELS.RISK_SAFE) {
+    if (isRiskModeButton(normalized, "safe")) {
       await applyRiskModePreset("safe");
       return;
     }
-    if (normalized === TELEGRAM_LABELS.RISK_MODERATE) {
+    if (isRiskModeButton(normalized, "moderate")) {
       await applyRiskModePreset("moderate");
       return;
     }
-    if (normalized === TELEGRAM_LABELS.RISK_DEGEN) {
+    if (isRiskModeButton(normalized, "degen")) {
       await applyRiskModePreset("degen");
       return;
     }

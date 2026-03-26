@@ -107,9 +107,24 @@ export function getTradeSettingsMenuMarkup() {
 }
 
 export function getRiskSettingsMenuMarkup() {
+  const currentMode = (() => {
+    try {
+      if (!fs.existsSync(USER_CONFIG_PATH)) return "moderate";
+      const cfg = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+      return cfg.riskMode || (["safe", "moderate", "degen"].includes(cfg.preset) ? cfg.preset : "moderate");
+    } catch {
+      return "moderate";
+    }
+  })();
+
+  const riskButton = (mode, label, emoji) => currentMode === mode ? `✅ ${emoji} ${label}` : `${emoji} ${label}`;
   return keyboard([
     [TELEGRAM_LABELS.MAXPOS_1, TELEGRAM_LABELS.MAXPOS_3, TELEGRAM_LABELS.MAXPOS_5],
-    [TELEGRAM_LABELS.RISK_SAFE, TELEGRAM_LABELS.RISK_MODERATE, TELEGRAM_LABELS.RISK_DEGEN],
+    [
+      riskButton("safe", TELEGRAM_LABELS.RISK_SAFE, "🛡️"),
+      riskButton("moderate", TELEGRAM_LABELS.RISK_MODERATE, "⚖️"),
+      riskButton("degen", TELEGRAM_LABELS.RISK_DEGEN, "🔥"),
+    ],
     [TELEGRAM_LABELS.SETTINGS, TELEGRAM_LABELS.BACK],
   ]);
 }
