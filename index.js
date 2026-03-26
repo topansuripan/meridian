@@ -1459,16 +1459,12 @@ if (isTTY) {
         const result = await closePosition({ position_address: pos.position, pool_address: pos.pool });
         if (result.success) {
           const tx = result.txs?.[0] || result.tx || null;
-          const txLink = tx ? `https://solscan.io/tx/${tx}` : null;
           const pnlLink = tx ? `https://www.metlex.io/pnl2/${tx}` : null;
-          const poolLink = pos.pool ? `https://app.meteora.ag/dlmm/${pos.pool}` : null;
           await sendHTML([
             `🔒 <b>Closed ${escapeHtml(pos.pair)}</b>`,
             `━━━━━━━━━━━━━━`,
             `📊 <b>PnL:</b> $${escapeHtml(result.pnl_usd ?? "?")}`,
-            txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
             pnlLink ? `📈 <a href="${pnlLink}">Open PnL Card</a>` : null,
-            poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
             tx ? `🔹 <b>Tx ID:</b> <code>${shortHash(tx)}</code>` : null,
           ].filter(Boolean).join("\n"));
         } else {
@@ -1569,15 +1565,11 @@ if (isTTY) {
         const result = await closePosition({ position_address: pos.position, pool_address: pos.pool });
         if (result.success) {
           const tx = result.txs?.[0] || result.tx || null;
-          const txLink = tx ? `https://solscan.io/tx/${tx}` : null;
           const pnlLink = tx ? `https://www.metlex.io/pnl2/${tx}` : null;
-          const poolLink = pos.pool ? `https://app.meteora.ag/dlmm/${pos.pool}` : null;
           await sendHTML([
             `🔒 <b>Closed ${escapeHtml(pos.pair)}</b>`,
             `📊 <b>PnL:</b> $${escapeHtml(result.pnl_usd ?? "?")}`,
-            txLink ? `🔗 <a href="${txLink}">View Close Tx</a>` : null,
             pnlLink ? `📈 <a href="${pnlLink}">Open PnL Card</a>` : null,
-            poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
           ].filter(Boolean).join("\n"));
         } else {
           await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
