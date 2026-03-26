@@ -8,6 +8,7 @@ const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
+const inferredRiskMode = u.riskMode ?? (["degen", "moderate", "safe"].includes(u.preset) ? u.preset : "moderate");
 
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
@@ -39,6 +40,8 @@ export const config = {
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     maxBundlersPct:    u.maxBundlersPct    ?? 30,  // max bot/bundler holders % (from Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    maxVolatility:     u.maxVolatility     ?? 8,
+    maxPriceChangePct: u.maxPriceChangePct ?? 300,
     blockedLaunchpads: u.blockedLaunchpads ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
   },
 
@@ -73,6 +76,13 @@ export const config = {
     autoAdjustManagementInterval: u.autoAdjustManagementInterval ?? false,
     healthCheckEnabled:     u.healthCheckEnabled     ?? false,
     healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+  },
+
+  profile: {
+    riskMode: inferredRiskMode,
+    autoLearnTopLps: u.autoLearnTopLps ?? true,
+    topLpStudyTtlHours: u.topLpStudyTtlHours ?? 24,
+    topLpAutoLearnLimit: u.topLpAutoLearnLimit ?? 2,
   },
 
   // ─── LLM Settings ──────────────────────
@@ -136,7 +146,10 @@ export function reloadScreeningThresholds() {
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
+    if (fresh.maxVolatility  != null) s.maxVolatility  = fresh.maxVolatility;
+    if (fresh.maxPriceChangePct != null) s.maxPriceChangePct = fresh.maxPriceChangePct;
     if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
     if (fresh.category       != null) s.category       = fresh.category;
+    if (fresh.riskMode       != null) config.profile.riskMode = fresh.riskMode;
   } catch { /* ignore */ }
 }

@@ -103,6 +103,19 @@ export async function recordPerformance(perf) {
       strategy: perf.strategy,
       volatility: perf.volatility,
     });
+
+    const { recordHolographicOutcome } = await import("./holographic-memory.js");
+    recordHolographicOutcome({
+      poolAddress: perf.pool,
+      poolName: perf.pool_name,
+      baseMint: perf.base_mint,
+      strategy: perf.strategy,
+      pnlPct: entry.pnl_pct,
+      pnlUsd: entry.pnl_usd,
+      minutesHeld: perf.minutes_held,
+      rangeEfficiency: entry.range_efficiency,
+      closeReason: perf.close_reason,
+    });
   }
 
   // Evolve thresholds every 5 closed positions

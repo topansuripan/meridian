@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
+import { getHolographicStrategyHint } from "../holographic-memory.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 
@@ -85,6 +86,28 @@ const LAUNCHPAD_ORGANIC_PENALTY = {
   "moonshot":       -3,
 };
 
+function getRiskModeProfile(mode = config.profile?.riskMode || "moderate") {
+  if (mode === "degen") {
+    return {
+      maxVolatility: Math.max(config.screening.maxVolatility, 12),
+      maxPriceChangePct: Math.max(config.screening.maxPriceChangePct, 900),
+      momentumBias: 8,
+    };
+  }
+  if (mode === "safe") {
+    return {
+      maxVolatility: Math.min(config.screening.maxVolatility, 4),
+      maxPriceChangePct: Math.min(config.screening.maxPriceChangePct, 120),
+      momentumBias: -4,
+    };
+  }
+  return {
+    maxVolatility: config.screening.maxVolatility,
+    maxPriceChangePct: config.screening.maxPriceChangePct,
+    momentumBias: 0,
+  };
+}
+
 /**
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code (with skip reasons), agent picks the best one.
@@ -137,6 +160,24 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
   }
 
+  for (const candidate of candidates) {
+    const hint = getHolographicStrategyHint({
+      pool_address: candidate.pool,
+      base_mint: candidate.base?.mint,
+      risk_mode: config.profile?.riskMode || "moderate",
+    });
+    if (!hint) continue;
+
+    candidate.score = Math.max(0, Math.min(100, candidate.score + (hint.score_boost || 0)));
+    candidate.lp_strategy_hint = hint.strategy;
+    candidate.bins_below_hint = hint.bins_below;
+    candidate.bins_above_hint = hint.bins_above;
+    candidate.holographic_summary = hint.summary;
+    candidate.screening_summary = [candidate.screening_summary, `LP edge: ${hint.summary}`]
+      .filter(Boolean)
+      .join(" | ");
+  }
+
   candidates.sort((a, b) => (b.score || 0) - (a.score || 0));
 
   const top = candidates.slice(0, limit);
@@ -155,6 +196,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 }
 
 function evaluatePool(pool, screeningConfig) {
+  const riskProfile = getRiskModeProfile();
   const reasons = [];
   const strengths = [];
   const warnings = [];
@@ -172,6 +214,12 @@ function evaluatePool(pool, screeningConfig) {
 
   if (pool.price_change_pct != null && pool.price_change_pct < -20) {
     reasons.push(`Price freefall: ${pool.price_change_pct}% (threshold: -20%)`);
+  }
+  if (pool.price_change_pct != null && pool.price_change_pct > riskProfile.maxPriceChangePct) {
+    reasons.push(`Price too extended: ${pool.price_change_pct}% (max for ${config.profile?.riskMode || "moderate"}: ${riskProfile.maxPriceChangePct}%)`);
+  }
+  if (pool.volatility != null && pool.volatility > riskProfile.maxVolatility) {
+    reasons.push(`Volatility too high: ${pool.volatility} (max for ${config.profile?.riskMode || "moderate"}: ${riskProfile.maxVolatility})`);
   }
   if (pool.volume_change_pct != null && pool.volume_change_pct < -60) {
     reasons.push(`Volume collapse: ${pool.volume_change_pct}% change (threshold: -60%)`);
@@ -203,16 +251,23 @@ function evaluatePool(pool, screeningConfig) {
     : pool.price_change_pct < 0
       ? Math.max(0, 5 + pool.price_change_pct / 4)
       : Math.min(5, 1 + pool.price_change_pct / 8);
+  const modeScore = pool.price_change_pct == null
+    ? 0
+    : pool.price_change_pct > 0
+      ? Math.min(8, pool.price_change_pct / 25) + riskProfile.momentumBias
+      : riskProfile.momentumBias / 2;
 
   const score = Math.max(0, Math.min(100, Math.round(
-    feeScore + volumeScore + liquidityScore + organicScore + participationScore + momentumScore
+    feeScore + volumeScore + liquidityScore + organicScore + participationScore + momentumScore + modeScore
   )));
 
   if ((pool.fee_active_tvl_ratio || 0) >= screeningConfig.minFeeActiveTvlRatio * 2) strengths.push(`strong fee/TVL ${pool.fee_active_tvl_ratio}%`);
   if ((pool.volume_window || 0) >= screeningConfig.minVolume * 3) strengths.push(`volume ${pool.volume_window}`);
   if ((pool.active_pct || 0) >= 35) strengths.push(`healthy active range ${pool.active_pct}%`);
+  if ((config.profile?.riskMode || "moderate") === "degen" && (pool.price_change_pct || 0) > 20) strengths.push(`degen momentum ${pool.price_change_pct}%`);
   if ((pool.price_change_pct || 0) < 0) warnings.push(`price trend ${pool.price_change_pct}%`);
   if ((pool.volume_change_pct || 0) < 0) warnings.push(`volume trend ${pool.volume_change_pct}%`);
+  if ((config.profile?.riskMode || "moderate") === "safe" && (pool.price_change_pct || 0) > 50) warnings.push(`too hot for safe mode`);
 
   return {
     eligible: true,

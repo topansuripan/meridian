@@ -141,6 +141,8 @@ const toolMap = {
       maxMcap: ["screening", "maxMcap"],
       minBinStep: ["screening", "minBinStep"],
       maxBinStep: ["screening", "maxBinStep"],
+      maxVolatility: ["screening", "maxVolatility"],
+      maxPriceChangePct: ["screening", "maxPriceChangePct"],
       timeframe: ["screening", "timeframe"],
       category: ["screening", "category"],
       minTokenFeesSol: ["screening", "minTokenFeesSol"],
@@ -170,6 +172,11 @@ const toolMap = {
       autoAdjustManagementInterval: ["schedule", "autoAdjustManagementInterval"],
       healthCheckEnabled: ["schedule", "healthCheckEnabled"],
       healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
+      // profile
+      riskMode: ["profile", "riskMode"],
+      autoLearnTopLps: ["profile", "autoLearnTopLps"],
+      topLpStudyTtlHours: ["profile", "topLpStudyTtlHours"],
+      topLpAutoLearnLimit: ["profile", "topLpAutoLearnLimit"],
       // models
       managementModel: ["llm", "managementModel"],
       screeningModel: ["llm", "screeningModel"],

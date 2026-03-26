@@ -3,6 +3,9 @@
  * Used by the /learn command — not called on every cycle.
  */
 
+import { recordTopLPStudy } from "../holographic-memory.js";
+import { addMemory, MemoryType } from "../memory.js";
+
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
 const LPAGENT_KEY = process.env.LPAGENT_API_KEY;
 
@@ -12,7 +15,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Fetch top LPers for a pool, filter to credible performers,
  * and return condensed behaviour patterns for LLM consumption.
  */
-export async function studyTopLPers({ pool_address, limit = 4 }) {
+export async function studyTopLPers({ pool_address, limit = 4, pool_name = null, base_mint = null }) {
   if (!LPAGENT_KEY) {
     return { pool: pool_address, message: "LPAGENT_API_KEY not set in .env — study_top_lpers is disabled.", patterns: [], lpers: [] };
   }
@@ -110,11 +113,28 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
     holder_count: top.filter((l) => l.avg_age_hour >= 4).length,
   };
 
-  return {
+  const result = {
     pool: pool_address,
     patterns,
     lpers: historicalSamples,
   };
+
+  const playbook = recordTopLPStudy({
+    poolAddress: pool_address,
+    poolName: pool_name || historicalSamples[0]?.positions?.[0]?.pair || pool_address,
+    baseMint: base_mint || null,
+    study: result,
+  });
+
+  if (playbook) {
+    addMemory(
+      `Holographic LP recall refreshed for ${pool_address.slice(0, 8)}: ${playbook.playbook_summary}`,
+      MemoryType.HOLOGRAPHIC,
+      { role: "SCREENER" }
+    );
+  }
+
+  return result;
 }
 
 function avg(arr) {

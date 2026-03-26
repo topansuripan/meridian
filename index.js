@@ -41,8 +41,10 @@ import {
 import { listMemory, addMemory, MemoryType } from "./memory.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
+import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { studyTopLPers } from "./tools/study.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -326,6 +328,12 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
 
       // Load active strategy
       const activeStrategy = getActiveStrategy();
+      const riskMode = config.profile?.riskMode || "moderate";
+      const riskModeBlock = riskMode === "degen"
+        ? `RISK MODE: DEGEN — be more aggressive only when top-LP playbook confidence is strong, momentum is real, and organic/smart-wallet evidence confirms the move.`
+        : riskMode === "safe"
+          ? `RISK MODE: SAFE — prefer durable, lower-volatility setups and avoid overextended momentum.`
+          : `RISK MODE: MODERATE — balance safety and upside; demand both fees and believable narrative.`;
       const strategyBlock = activeStrategy
         ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
         : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
@@ -337,8 +345,25 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
       const pipelineSummary = topCandidates?.pipeline_summary;
 
       const candidateBlocks = [];
-      for (const pool of candidates.slice(0, 5)) {
+      for (const [index, pool] of candidates.slice(0, 5).entries()) {
         const mint = pool.base?.mint;
+        if (
+          index < (config.profile?.topLpAutoLearnLimit ?? 0) &&
+          config.profile?.autoLearnTopLps &&
+          mint &&
+          isTopLPStudyStale({
+            pool_address: pool.pool,
+            base_mint: mint,
+            ttlHours: config.profile?.topLpStudyTtlHours ?? 24,
+          })
+        ) {
+          try {
+            await studyTopLPers({ pool_address: pool.pool, limit: 4, pool_name: pool.name, base_mint: mint });
+          } catch (error) {
+            log("screening", `Top LP auto-learn skipped for ${pool.name}: ${error.message}`);
+          }
+        }
+
         const [smartWallets, holders, narrative, tokenInfo, poolMemory] = await Promise.allSettled([
             checkSmartWalletsOnPool({ pool_address: pool.pool }),
             mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
@@ -361,6 +386,16 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
           const top10Pct  = ti?.audit?.top_holders_pct ?? h?.top_10_real_holders_pct ?? "?";
           const launchpad = ti?.launchpad ?? null;
           const feesSol   = ti?.global_fees_sol ?? h?.global_fees_sol ?? "?";
+          const holographicRecall = getHolographicRecall({
+            pool_address: pool.pool,
+            base_mint: mint,
+            risk_mode: riskMode,
+          });
+          const strategyHint = getHolographicStrategyHint({
+            pool_address: pool.pool,
+            base_mint: mint,
+            risk_mode: riskMode,
+          });
 
           // Hard filter: skip blocked launchpads before even showing to LLM
           if (launchpad && config.screening.blockedLaunchpads.length > 0) {
@@ -376,10 +411,12 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
             `  metrics: score=${pool.score ?? "?"}/100, bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}`,
             `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
             pool.screening_summary ? `  pipeline: ${pool.screening_summary}` : null,
+            strategyHint ? `  strategy_hint: ${strategyHint.summary}` : null,
             `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
             priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
             n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
             mem ? `  memory: ${mem}` : null,
+            holographicRecall ? `  holographic: ${holographicRecall}` : null,
           ].filter(Boolean);
 
           candidateBlocks.push(lines.join("\n"));
@@ -414,6 +451,7 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
       const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
+${riskModeBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 ${candidateContext}
 DECISION RULES:
@@ -423,6 +461,8 @@ ${config.screening.blockedLaunchpads.length ? `- HARD SKIP if launchpad is any o
 - SKIP if narrative is empty/null or pure hype with no specific story (unless smart wallets present)
 - Bots 5–25% are normal, not a skip reason on their own
 - Smart wallets present → strong confidence boost
+- If a candidate includes strategy_hint / holographic recall, prefer that deploy style unless live metrics clearly contradict it
+- In degen mode, only lean aggressive when LP playbook confidence is high and the pool still passes safety filters
 
 STEPS:
 1. Pick the best candidate. If none pass, report why and stop.
@@ -606,6 +646,20 @@ function screeningAlertModeLabel() {
 function managementAlertModeLabel() {
   if (config.schedule.managementMode === "manual") return "manual";
   return "silent + critical alerts";
+}
+
+function riskModeLabel() {
+  const mode = config.profile?.riskMode || "moderate";
+  if (mode === "degen") return "degen";
+  if (mode === "safe") return "safe";
+  return "moderate";
+}
+
+function riskModeBrief() {
+  const mode = config.profile?.riskMode || "moderate";
+  if (mode === "degen") return "aggressive, LP-backed momentum";
+  if (mode === "safe") return "defensive, capital-preserving";
+  return "balanced, selective rotation";
 }
 
 function formatUsd(value) {
@@ -820,6 +874,7 @@ async function sendTelegramStatusCard() {
     `<b>Automation</b>`,
     `🤖 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
     `🧭 Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    `🔥 Risk Mode: ${riskModeLabel()} (${riskModeBrief()})`,
     `🔕 Mgmt feed: ${managementAlertModeLabel()}`,
     `🚨 Screen feed: ${screeningAlertModeLabel()}`,
     ``,
@@ -877,6 +932,7 @@ async function sendTelegramConfigCard() {
     `<b>Cycle Modes</b>`,
     `Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
     `Screening: ${formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
+    `Risk mode: ${riskModeLabel()} (${riskModeBrief()})`,
     `Mgmt feed: ${managementAlertModeLabel()}`,
     `Screen feed: ${screeningAlertModeLabel()}`,
     ``,

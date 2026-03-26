@@ -255,6 +255,7 @@ rl.close();
 // ─── Save ──────────────────────────────────────────────────────────────────────
 const userConfig = {
   preset: presetChoice.key,
+  riskMode: presetChoice.key === "custom" ? e("riskMode", "moderate") : presetChoice.key,
   rpcUrl,
   ...(walletKey && !walletKey.startsWith("***") ? { walletKey } : {}),
   deployAmountSol,
@@ -271,6 +272,9 @@ const userConfig = {
   outOfRangeWaitMinutes,
   managementIntervalMin,
   screeningIntervalMin,
+  autoLearnTopLps: e("autoLearnTopLps", true),
+  topLpStudyTtlHours: e("topLpStudyTtlHours", 24),
+  topLpAutoLearnLimit: e("topLpAutoLearnLimit", 2),
   llmModel,
   dryRun: dryRun === "true",
 };

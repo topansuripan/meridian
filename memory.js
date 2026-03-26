@@ -29,6 +29,8 @@ export const MemoryType = {
   USER_TAUGHT: "USER-TAUGHT",
   OBSERVED:    "OBSERVED",
   EVOLUTION:   "EVOLUTION",
+  LP_LEARNED:  "LP-LEARNED",
+  HOLOGRAPHIC: "HOLOGRAPHIC",
 };
 
 // ─── Storage ─────────────────────────────────────────────
