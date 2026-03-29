@@ -28,7 +28,7 @@ import {
   getPositionActionMenuMarkup,
   syncTelegramCommands,
 } from "./telegram.js";
-import { generateBriefing } from "./briefing.js";
+import { generateBriefing, generateDailySummary } from "./briefing.js";
 import {
   getLastBriefingDate,
   setLastBriefingDate,
@@ -682,7 +682,8 @@ function isLightweightTelegramCommand(text) {
     TELEGRAM_LABELS.HELP,
     TELEGRAM_LABELS.STATUS,
     TELEGRAM_LABELS.POSITIONS,
-    TELEGRAM_LABELS.BRIEFING,
+      TELEGRAM_LABELS.BRIEFING,
+      TELEGRAM_LABELS.DAILY,
     TELEGRAM_LABELS.MEMORY,
     TELEGRAM_LABELS.SETTINGS,
     TELEGRAM_LABELS.SETTINGS_SCHEDULE,
@@ -697,6 +698,7 @@ function isLightweightTelegramCommand(text) {
     "/status",
     "/positions",
     "/briefing",
+    "/daily",
     "/memory",
     "/settings",
     "/config",
@@ -1302,9 +1304,8 @@ if (isTTY) {
         `<code>/home</code> buka menu utama\n` +
         `<code>/status</code> ringkasan wallet dan cycle\n` +
         `<code>/positions</code> daftar posisi aktif\n` +
-        `<code>/manage</code> lihat report management terakhir, atau jalankan kalau mode manual\n` +
-        `<code>/screen</code> lihat report screening terakhir, atau jalankan kalau mode manual\n` +
         `<code>/briefing</code> tampilkan morning briefing\n` +
+        `<code>/daily</code> tampilkan summary realized hari ini\n` +
         `<code>/settings</code> ubah manual/interval/24-7\n\n` +
         `Klik tombol <b>Menu</b> di kiri bawah Telegram untuk melihat daftar command seperti contoh yang kamu mau.`
       );
@@ -1512,6 +1513,16 @@ if (isTTY) {
       return;
     }
 
+    if (normalized === TELEGRAM_LABELS.DAILY || normalized === "/daily") {
+      try {
+        const summary = await generateDailySummary();
+        await sendHTML(summary);
+      } catch (e) {
+        await sendMessage(`Error: ${e.message}`).catch(() => {});
+      }
+      return;
+    }
+
     if (normalized === TELEGRAM_LABELS.POSITIONS || normalized === "/positions") {
       try { await sendTelegramPositionsCard(); }
       catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
@@ -1521,38 +1532,6 @@ if (isTTY) {
     if (normalized === TELEGRAM_LABELS.STATUS || normalized === "/status") {
       try { await sendTelegramStatusCard(); }
       catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
-      return;
-    }
-
-    if (normalized === TELEGRAM_LABELS.MANAGEMENT || normalized === "/manage") {
-      try {
-        if (config.schedule.managementMode !== "manual" && await sendLastCycleReport("management")) {
-          return;
-        }
-        await sendHTML(`🔄 <b>Management Cycle</b>\n\nMenjalankan management sekali sekarang...`);
-        _managementBusy = true;
-        timers.managementLastRun = Date.now();
-        const report = await runManagementCycle({ delivery: "silent" });
-        if (report) await sendHTML(formatManagementTelegramReport(report) || `🔄 <b>Management Cycle</b>\n\n${escapeHtml(report)}`);
-      } catch (e) {
-        await sendMessage(`Error: ${e.message}`).catch(() => {});
-      } finally {
-        _managementBusy = false;
-      }
-      return;
-    }
-
-    if (normalized === TELEGRAM_LABELS.SCREENING || normalized === "/screen") {
-      try {
-        if (config.schedule.screeningMode !== "manual" && await sendLastCycleReport("screening")) {
-          return;
-        }
-        await sendHTML(`🔍 <b>Screening Cycle</b>\n\nMenjalankan screening sekali sekarang...`);
-        const report = await runScreeningCycle({ delivery: "silent" });
-        if (report) await sendHTML(formatScreeningTelegramReport(report) || `🔍 <b>Screening Cycle</b>\n\n${escapeHtml(report)}`);
-      } catch (e) {
-        await sendMessage(`Error: ${e.message}`).catch(() => {});
-      }
       return;
     }
 
@@ -1664,6 +1643,7 @@ Commands:
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
   /briefing      Show morning briefing (last 24h)
+  /daily         Show today's realized summary
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address
   /thresholds    Show current screening thresholds + performance stats
@@ -1739,6 +1719,14 @@ Commands:
       await runBusy(async () => {
         const briefing = await generateBriefing();
         console.log(`\n${briefing.replace(/<[^>]*>/g, "")}\n`);
+      });
+      return;
+    }
+
+    if (input === "/daily") {
+      await runBusy(async () => {
+        const summary = await generateDailySummary();
+        console.log(`\n${summary.replace(/<[^>]*>/g, "")}\n`);
       });
       return;
     }

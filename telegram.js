@@ -17,9 +17,8 @@ export const TELEGRAM_LABELS = {
   MENU: "Menu",
   STATUS: "Status",
   POSITIONS: "Positions",
-  MANAGEMENT: "Run Management",
-  SCREENING: "Run Screening",
   BRIEFING: "Briefing",
+  DAILY: "Daily",
   MEMORY: "Memory",
   SETTINGS: "Settings",
   HELP: "Help",
@@ -57,9 +56,8 @@ const BOT_COMMANDS = [
   { command: "home", description: "open the main control menu" },
   { command: "status", description: "show wallet and cycle status" },
   { command: "positions", description: "show open positions" },
-  { command: "manage", description: "run one management cycle now" },
-  { command: "screen", description: "run one screening cycle now" },
   { command: "briefing", description: "show the morning briefing" },
+  { command: "daily", description: "show today's realized summary" },
   { command: "memory", description: "show agent memory" },
   { command: "settings", description: "open settings menu" },
   { command: "help", description: "show command help" },
@@ -76,9 +74,9 @@ function keyboard(rows) {
 export function getMainMenuMarkup() {
   return keyboard([
     [TELEGRAM_LABELS.STATUS, TELEGRAM_LABELS.POSITIONS],
-    [TELEGRAM_LABELS.MANAGEMENT, TELEGRAM_LABELS.SCREENING],
-    [TELEGRAM_LABELS.BRIEFING, TELEGRAM_LABELS.MEMORY],
-    [TELEGRAM_LABELS.SETTINGS, TELEGRAM_LABELS.HELP],
+    [TELEGRAM_LABELS.BRIEFING, TELEGRAM_LABELS.DAILY],
+    [TELEGRAM_LABELS.MEMORY, TELEGRAM_LABELS.SETTINGS],
+    [TELEGRAM_LABELS.HELP],
   ]);
 }
 

@@ -20,6 +20,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { normalizeMint } from "./wallet.js";
+import { getOpeningPositionMap, getPositionDetail, hasLpAgentKey } from "./lpagent.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -386,22 +387,44 @@ export async function getPositionPnl({ pool_address, position_address }) {
   try {
     const byAddress = await fetchDlmmPnlForPool(pool_address, walletAddress);
     const p = byAddress[position_address];
-    if (!p) return { error: "Position not found in PnL API" };
+    const lpagent = hasLpAgentKey()
+      ? await getPositionDetail({ position: position_address }).catch(() => null)
+      : null;
+    if (!p && !lpagent) return { error: "Position not found in portfolio source" };
 
-    const unclaimedUsd    = parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0);
-    const currentValueUsd = parseFloat(p.unrealizedPnl?.balances || 0);
+    const unclaimedUsd = lpagent
+      ? parseFloat(lpagent.unCollectedFee ?? lpagent.uncollectedFee ?? 0)
+      : parseFloat(p?.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p?.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0);
+    const currentValueUsd = lpagent
+      ? parseFloat(lpagent.currentValue ?? lpagent.value ?? 0)
+      : parseFloat(p?.unrealizedPnl?.balances || 0);
+    const pnlUsd = lpagent?.pnl?.value ?? p?.pnlUsd ?? 0;
+    const pnlPct = lpagent?.pnl?.percent ?? p?.pnlPctChange ?? 0;
+    const collectedFeesUsd = parseFloat(lpagent?.collectedFee ?? 0);
+    const totalFeesUsd = lpagent
+      ? collectedFeesUsd + unclaimedUsd
+      : parseFloat(p?.allTimeFees?.total?.usd || 0);
+    const lowerBin = lpagent?.tickLower ?? p?.lowerBinId ?? null;
+    const upperBin = lpagent?.tickUpper ?? p?.upperBinId ?? null;
+    const activeBin = Array.isArray(lpagent?.range) ? (lpagent.range[2] ?? null) : (p?.poolActiveBinId ?? null);
+    const ageMinutes = lpagent?.createdAt
+      ? Math.floor((Date.now() - new Date(lpagent.createdAt).getTime()) / 60000)
+      : p?.createdAt
+        ? Math.floor((Date.now() - p.createdAt * 1000) / 60000)
+        : null;
+
     return {
-      pnl_usd:           Math.round((p.pnlUsd ?? 0) * 100) / 100,
-      pnl_pct:           Math.round((p.pnlPctChange ?? 0) * 100) / 100,
+      pnl_usd:           Math.round(Number(pnlUsd) * 100) / 100,
+      pnl_pct:           Math.round(Number(pnlPct) * 100) / 100,
       current_value_usd: Math.round(currentValueUsd * 100) / 100,
       unclaimed_fee_usd: Math.round(unclaimedUsd * 100) / 100,
-      all_time_fees_usd: Math.round(parseFloat(p.allTimeFees?.total?.usd || 0) * 100) / 100,
-      fee_per_tvl_24h:   Math.round(parseFloat(p.feePerTvl24h || 0) * 100) / 100,
-      in_range:    !p.isOutOfRange,
-      lower_bin:   p.lowerBinId      ?? null,
-      upper_bin:   p.upperBinId      ?? null,
-      active_bin:  p.poolActiveBinId ?? null,
-      age_minutes: p.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null,
+      all_time_fees_usd: Math.round(Number(totalFeesUsd) * 100) / 100,
+      fee_per_tvl_24h:   Math.round(parseFloat(p?.feePerTvl24h || 0) * 100) / 100,
+      in_range:    lpagent?.inRange ?? (p ? !p.isOutOfRange : null),
+      lower_bin:   lowerBin,
+      upper_bin:   upperBin,
+      active_bin:  activeBin,
+      age_minutes: ageMinutes,
     };
   } catch (error) {
     log("pnl_error", error.message);
@@ -454,9 +477,10 @@ export async function getMyPositions({ force = false } = {}) {
 
     // Enrich with DLMM PnL API for each unique pool in parallel
     const uniquePools = [...new Set(raw.map((p) => p.pool))];
-    const [pnlMaps, poolMetaMaps] = await Promise.all([
+    const [pnlMaps, poolMetaMaps, lpagentByPosition] = await Promise.all([
       Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, walletAddress))),
       Promise.all(uniquePools.map((pool) => fetchPoolMetadata(pool))),
+      hasLpAgentKey() ? getOpeningPositionMap({ owner: walletAddress, force }) : Promise.resolve({}),
     ]);
     const pnlByPool = {};
     const poolMetaByPool = {};
@@ -466,35 +490,50 @@ export async function getMyPositions({ force = false } = {}) {
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
       const poolMeta = poolMetaByPool[r.pool] || null;
+      const lp = lpagentByPosition[r.position] || null;
 
-      const inRange = p ? !p.isOutOfRange : true;
+      const inRange = lp?.inRange ?? (p ? !p.isOutOfRange : true);
       if (inRange) markInRange(r.position);
       else markOutOfRange(r.position);
 
-      const lowerBin  = p?.lowerBinId      ?? r.lower_bin;
-      const upperBin  = p?.upperBinId      ?? r.upper_bin;
-      const activeBin = p?.poolActiveBinId ?? null;
+      const lowerBin  = lp?.tickLower ?? p?.lowerBinId ?? r.lower_bin;
+      const upperBin  = lp?.tickUpper ?? p?.upperBinId ?? r.upper_bin;
+      const activeBin = Array.isArray(lp?.range) ? (lp.range[2] ?? null) : (p?.poolActiveBinId ?? null);
 
-      const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
-      const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
-      const collectedFees = p ? parseFloat(p.allTimeFees?.total?.usd || 0) : 0;
-      const pnlUsd        = p?.pnlUsd       ?? 0;
-      const pnlPct        = p?.pnlPctChange ?? 0;
+      const unclaimedFees = lp
+        ? parseFloat(lp.unCollectedFee ?? lp.uncollectedFee ?? 0)
+        : p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
+      const totalValue = lp
+        ? parseFloat(lp.currentValue ?? lp.value ?? 0)
+        : p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
+      const collectedFees = lp
+        ? parseFloat(lp.collectedFee ?? 0)
+        : p ? parseFloat(p.allTimeFees?.total?.usd || 0) : 0;
+      const pnlUsd = lp?.pnl?.value ?? p?.pnlUsd ?? 0;
+      const pnlPct = lp?.pnl?.percent ?? p?.pnlPctChange ?? 0;
 
       const tracked = getTrackedPosition(r.position);
+      const ageFromLpAgent = lp?.createdAt
+        ? Math.floor((Date.now() - new Date(lp.createdAt).getTime()) / 60000)
+        : null;
       const ageFromPnlApi = p?.createdAt
         ? Math.floor((Date.now() - p.createdAt * 1000) / 60000)
         : null;
       const ageFromState = tracked?.deployed_at
         ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
         : null;
-      const ageMinutes = Math.max(ageFromPnlApi ?? 0, ageFromState ?? 0) || null;
+      const ageMinutes = Math.max(ageFromLpAgent ?? 0, ageFromPnlApi ?? 0, ageFromState ?? 0) || null;
+
+      const pair = lp?.tokenName0 && lp?.tokenName1
+        ? `${lp.tokenName0}/${lp.tokenName1}`
+        : buildDisplayPair({ tracked, pnlEntry: p, poolMeta, poolAddress: r.pool });
+      const baseMint = lp?.token0 || r.base_mint;
 
       return {
         position: r.position,
         pool: r.pool,
-        pair: buildDisplayPair({ tracked, pnlEntry: p, poolMeta, poolAddress: r.pool }),
-        base_mint: r.base_mint,
+        pair,
+        base_mint: baseMint,
         lower_bin: lowerBin,
         upper_bin: upperBin,
         active_bin: activeBin,
@@ -544,25 +583,29 @@ export async function getWalletPositions({ wallet_address }) {
 
     // Enrich with PnL API
     const uniquePools = [...new Set(raw.map((r) => r.pool))];
-    const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
+    const [pnlMaps, lpagentByPosition] = await Promise.all([
+      Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address))),
+      hasLpAgentKey() ? getOpeningPositionMap({ owner: wallet_address }) : Promise.resolve({}),
+    ]);
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
+      const lp = lpagentByPosition[r.position] || null;
 
       return {
         position:           r.position,
         pool:               r.pool,
-        lower_bin:          p?.lowerBinId      ?? null,
-        upper_bin:          p?.upperBinId      ?? null,
-        active_bin:         p?.poolActiveBinId ?? null,
-        in_range:           p ? !p.isOutOfRange : null,
-        unclaimed_fees_usd: Math.round((p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0) * 100) / 100,
-        total_value_usd:    Math.round((p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0) * 100) / 100,
-        pnl_usd:            Math.round((p?.pnlUsd ?? 0) * 100) / 100,
-        pnl_pct:            Math.round((p?.pnlPctChange ?? 0) * 100) / 100,
-        age_minutes:        p?.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null,
+        lower_bin:          lp?.tickLower ?? p?.lowerBinId ?? null,
+        upper_bin:          lp?.tickUpper ?? p?.upperBinId ?? null,
+        active_bin:         Array.isArray(lp?.range) ? (lp.range[2] ?? null) : (p?.poolActiveBinId ?? null),
+        in_range:           lp?.inRange ?? (p ? !p.isOutOfRange : null),
+        unclaimed_fees_usd: Math.round((lp ? parseFloat(lp.unCollectedFee ?? lp.uncollectedFee ?? 0) : (p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0)) * 100) / 100,
+        total_value_usd:    Math.round((lp ? parseFloat(lp.currentValue ?? lp.value ?? 0) : (p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0)) * 100) / 100,
+        pnl_usd:            Math.round(((lp?.pnl?.value) ?? (p?.pnlUsd ?? 0)) * 100) / 100,
+        pnl_pct:            Math.round(((lp?.pnl?.percent) ?? (p?.pnlPctChange ?? 0)) * 100) / 100,
+        age_minutes:        lp?.createdAt ? Math.floor((Date.now() - new Date(lp.createdAt).getTime()) / 60000) : (p?.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null),
       };
     });
 
