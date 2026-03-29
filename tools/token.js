@@ -58,8 +58,8 @@ export async function getTokenInfo({ query }) {
     stats_24h_net_buyers: t.stats24h ? t.stats24h.numNetBuyers : null, // keep only net buyer direction
   }));
 
-  // Enrich first result with OKX smart money + risk data (only if key configured)
-  if (process.env.OKX_API_KEY && results[0]?.mint) {
+  // Enrich first result with OKX smart money + risk data (public endpoint, no key needed)
+  if (results[0]?.mint) {
     const { getAdvancedInfo, getClusterList } = await import("./okx.js");
     const [adv, clusters] = await Promise.all([
       getAdvancedInfo(results[0].mint).catch(() => null),
@@ -125,15 +125,11 @@ export async function getTokenHolders({ mint, limit = 20 }) {
   const top10Pct = realHolders.slice(0, 10).reduce((s, h) => s + (Number(h.pct) || 0), 0);
 
   // ─── Bundle / Cluster Analysis (OKX) ─────────────────────────
-  let advancedData = null;
-  let clusterList  = [];
-  if (process.env.OKX_API_KEY) {
-    const { getAdvancedInfo, getClusterList } = await import("./okx.js");
-    [advancedData, clusterList] = await Promise.all([
-      getAdvancedInfo(mint).catch(() => null),
-      getClusterList(mint).catch(() => []),
-    ]);
-  }
+  const { getAdvancedInfo, getClusterList } = await import("./okx.js");
+  const [advancedData, clusterList] = await Promise.all([
+    getAdvancedInfo(mint).catch(() => null),
+    getClusterList(mint).catch(() => []),
+  ]);
 
   // ─── Smart Wallet / KOL Cross-reference ──────────────────────
   // Use targeted holders endpoint — only returns matching wallets, no noise

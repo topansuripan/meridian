@@ -126,10 +126,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
     .slice(0, limit);
 
-  // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price
-  if (process.env.OKX_API_KEY && eligible.length > 0) {
-    const { getAdvancedInfo, getPriceInfo } = await import("./okx.js");
-    const { getClusterList } = await import("./okx.js");
+  // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
+  if (eligible.length > 0) {
+    const { getAdvancedInfo, getPriceInfo, getClusterList } = await import("./okx.js");
     const okxResults = await Promise.allSettled(
       eligible.map((p) => p.base?.mint
         ? Promise.all([getAdvancedInfo(p.base.mint), getPriceInfo(p.base.mint), getClusterList(p.base.mint)])
@@ -145,8 +144,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].bundle_pct      = adv.bundle_pct;
         eligible[i].sniper_pct      = adv.sniper_pct;
         eligible[i].suspicious_pct  = adv.suspicious_pct;
-        eligible[i].new_wallet_pct  = adv.new_wallet_pct;
-        eligible[i].smart_money_buy = adv.smart_money_buy;  // smartMoneyBuy tag
+        eligible[i].smart_money_buy = adv.smart_money_buy;
+        eligible[i].dev_sold_all    = adv.dev_sold_all;
+        eligible[i].dex_boost       = adv.dex_boost;
+        eligible[i].dex_screener_paid = adv.dex_screener_paid;
         if (adv.creator && !eligible[i].dev) eligible[i].dev = adv.creator;
       }
       if (price) {
@@ -199,7 +200,6 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
     eligible.splice(0, eligible.length, ...filtered);
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
-  }
 
   return {
     candidates: eligible,
