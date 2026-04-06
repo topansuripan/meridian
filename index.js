@@ -1584,10 +1584,14 @@ async function telegramHandler(text) {
     log("telegram", `Incoming: ${normalized}`);
     sendTyping().catch(() => {});
     captureOperatorPreference(normalized, "telegram");
-    const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(normalized);
-    const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(normalized);
-    const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
-    const model = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
+    const hasManagementIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b|\bclaim\b|\bhold\b|\bmanual review\b|\bTP\b|\bSL\b|\bstop loss\b|\btake profit\b|\binstruction\b|\bposition\b/i.test(normalized);
+    const isDeployRequest = !hasManagementIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b|\bpool\b/i.test(normalized);
+    const agentRole = isDeployRequest ? "SCREENER" : hasManagementIntent ? "MANAGER" : "GENERAL";
+    const model = agentRole === "SCREENER"
+      ? config.llm.screeningModel
+      : agentRole === "MANAGER"
+        ? config.llm.managementModel
+        : config.llm.generalModel;
     const { content } = await agentLoop(normalized, config.llm.maxSteps, sessionHistory, agentRole, model);
     appendHistory(normalized, content);
     await sendMessage(content);

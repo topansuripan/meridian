@@ -97,7 +97,7 @@ export const config = {
     maxSteps:    u.maxSteps    ?? 20,
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openai/gpt-oss-20b:free",
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openai/gpt-oss-20b:free",
   },
 
   // ─── Common Token Mints ────────────────

@@ -49,7 +49,7 @@
   "llmModel": "nvidia/nemotron-3-super-120b-a12b:free",
   "managementModel": "openai/gpt-oss-20b:free",
   "screeningModel": "minimax/minimax-m2.7",
-  "generalModel": "minimax/minimax-m2.7",
+  "generalModel": "openai/gpt-oss-20b:free",
   "dryRun": false,
   "telegramChatId": "",
   "_lastEvolved": "",
