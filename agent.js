@@ -27,6 +27,40 @@ const client = new OpenAI({
 });
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+const TOOL_REQUIRED_INTENTS = /\b(deploy|open position|open|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|config|setting|threshold|set |change|update )\b/i;
+
+function buildMessages(systemPrompt, sessionHistory, goal, providerMode = "system") {
+  if (providerMode === "user_embedded") {
+    return [
+      ...sessionHistory,
+      {
+        role: "user",
+        content: `[SYSTEM INSTRUCTIONS]\n${systemPrompt}\n\n[USER REQUEST]\n${goal}`,
+      },
+    ];
+  }
+
+  return [
+    { role: "system", content: systemPrompt },
+    ...sessionHistory,
+    { role: "user", content: goal },
+  ];
+}
+
+function isSystemRoleError(error) {
+  const message = String(error?.message || error?.error?.message || error || "");
+  return /invalid message role:\s*system/i.test(message);
+}
+
+function isToolChoiceRequiredError(error) {
+  const message = String(error?.message || error?.error?.message || error || "");
+  return /tool_choice/i.test(message) && /required/i.test(message);
+}
+
+function shouldRequireRealToolUse(goal, requireTool = false) {
+  if (requireTool) return true;
+  return TOOL_REQUIRED_INTENTS.test(goal);
+}
 
 /**
  * Core ReAct agent loop.
@@ -35,7 +69,8 @@ const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
  * @param {number} maxSteps - Safety limit on iterations (default 20)
  * @returns {string} - The agent's final text response
  */
-export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null) {
+export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
+  const { requireTool = false } = options;
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
@@ -43,11 +78,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const perfSummary = getPerformanceSummary();
   const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary);
 
-  const messages = [
-    { role: "system", content: systemPrompt },
-    ...sessionHistory,          // inject prior conversation turns
-    { role: "user", content: goal },
-  ];
+  let providerMode = "system";
+  const mustUseRealTool = shouldRequireRealToolUse(goal, requireTool);
+  let messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
+  let sawToolCall = false;
+  let noToolRetryCount = 0;
 
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
@@ -60,15 +95,34 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
       let response;
       let usedModel = activeModel;
+      const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
+      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
       for (let attempt = 0; attempt < 3; attempt++) {
-        response = await client.chat.completions.create({
-          model: usedModel,
-          messages,
-          tools: getToolsForRole(agentType),
-          tool_choice: "auto",
-          temperature: config.llm.temperature,
-          max_tokens: maxOutputTokens ?? config.llm.maxTokens,
-        });
+        try {
+          response = await client.chat.completions.create({
+            model: usedModel,
+            messages,
+            tools: getToolsForRole(agentType),
+            tool_choice: toolChoice,
+            temperature: config.llm.temperature,
+            max_tokens: maxOutputTokens ?? config.llm.maxTokens,
+          });
+        } catch (error) {
+          if (providerMode === "system" && isSystemRoleError(error)) {
+            providerMode = "user_embedded";
+            messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
+            log("agent", "Provider rejected system role — retrying with embedded system instructions");
+            attempt -= 1;
+            continue;
+          }
+          if (toolChoice === "required" && isToolChoiceRequiredError(error)) {
+            toolChoice = "auto";
+            log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
+            attempt -= 1;
+            continue;
+          }
+          throw error;
+        }
         if (response.choices?.length) break;
         const errCode = response.error?.code;
         if (errCode === 502 || errCode === 503 || errCode === 529) {
@@ -100,10 +154,29 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           log("agent", "Empty response, retrying...");
           continue;
         }
+        if (mustUseRealTool && !sawToolCall) {
+          noToolRetryCount += 1;
+          messages.pop();
+          log("agent", `Rejected no-tool final answer (${noToolRetryCount}/2) for tool-required request`);
+          if (noToolRetryCount >= 2) {
+            return {
+              content: "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
+              userMessage: goal,
+            };
+          }
+          messages.push({
+            role: providerMode === "system" ? "system" : "user",
+            content: providerMode === "system"
+              ? "You have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result."
+              : "[SYSTEM REMINDER]\nYou have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result.",
+          });
+          continue;
+        }
         log("agent", "Final answer reached");
         log("agent", msg.content);
         return { content: msg.content, userMessage: goal };
       }
+      sawToolCall = true;
 
       // Execute each tool call in parallel
       const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {

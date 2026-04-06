@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 import { getHolographicStrategyHint } from "../holographic-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 
@@ -115,6 +116,16 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     }
     if (occupiedMints.has(pool.base?.mint)) {
       rejected.push({ pool: pool.name, pool_address: pool.pool, stage: "ownership", reason: `Already hold base token ${pool.base?.symbol}` });
+      continue;
+    }
+    if (isPoolOnCooldown(pool.pool)) {
+      rejected.push({ pool: pool.name, pool_address: pool.pool, stage: "cooldown", reason: "Pool is on cooldown after repeated weak/OOR outcomes" });
+      log("screening", `SKIP ${pool.name}: pool cooldown active`);
+      continue;
+    }
+    if (isBaseMintOnCooldown(pool.base?.mint)) {
+      rejected.push({ pool: pool.name, pool_address: pool.pool, stage: "cooldown", reason: `Base token ${pool.base?.symbol} is on cooldown after repeated weak/OOR outcomes` });
+      log("screening", `SKIP ${pool.name}: base mint cooldown active`);
       continue;
     }
 

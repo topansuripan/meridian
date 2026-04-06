@@ -15,7 +15,7 @@ import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, g
 import { addMemory, listMemory, MemoryType } from "../memory.js";
 import { setPositionInstruction } from "../state.js";
 
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { getPoolMemory, addPoolNote, isPoolOnCooldown, isBaseMintOnCooldown } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
@@ -290,6 +290,10 @@ const WRITE_TOOLS = new Set([
   "close_position",
   "swap_token",
 ]);
+const PROTECTED_TOOLS = new Set([
+  ...WRITE_TOOLS,
+  "self_update",
+]);
 
 /**
  * Execute a tool call with safety checks and logging.
@@ -306,7 +310,7 @@ export async function executeTool(name, args) {
   }
 
   // ─── Pre-execution safety checks ──────────
-  if (WRITE_TOOLS.has(name)) {
+  if (PROTECTED_TOOLS.has(name)) {
     const safetyCheck = await runSafetyChecks(name, args);
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
@@ -431,8 +435,21 @@ async function runSafetyChecks(name, args) {
         };
       }
 
+      if (isPoolOnCooldown(args.pool_address)) {
+        return {
+          pass: false,
+          reason: `Pool ${args.pool_address} is on cooldown after repeated weak/OOR outcomes.`,
+        };
+      }
+
       // Block same base token across different pools
       if (args.base_mint) {
+        if (isBaseMintOnCooldown(args.base_mint)) {
+          return {
+            pass: false,
+            reason: `Base token ${args.base_mint} is on cooldown after repeated weak/OOR outcomes.`,
+          };
+        }
         const alreadyHasMint = positions.positions.some(
           (p) => p.base_mint === args.base_mint
         );
@@ -484,6 +501,22 @@ async function runSafetyChecks(name, args) {
     case "swap_token": {
       // Basic check — prevent swapping when DRY_RUN is true
       // (handled inside swapToken itself, but belt-and-suspenders)
+      return { pass: true };
+    }
+
+    case "self_update": {
+      if (process.env.ALLOW_SELF_UPDATE !== "true") {
+        return {
+          pass: false,
+          reason: "self_update is disabled by default. Set ALLOW_SELF_UPDATE=true locally if you really want to enable it.",
+        };
+      }
+      if (!process.stdin.isTTY) {
+        return {
+          pass: false,
+          reason: "self_update is only allowed from a local interactive TTY session, not from Telegram or background automation.",
+        };
+      }
       return { pass: true };
     }
 

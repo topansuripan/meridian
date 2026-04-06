@@ -392,6 +392,38 @@ function buildDisplayPair({ tracked, pnlEntry, poolMeta, poolAddress }) {
   return poolAddress.slice(0, 8);
 }
 
+function safeNum(value) {
+  const num = parseFloat(value ?? 0);
+  return Number.isFinite(num) ? num : 0;
+}
+
+function deriveOpenPnlPct(binData) {
+  if (!binData) return null;
+
+  const deposit = safeNum(binData.allTimeDeposits?.total?.usd);
+  if (deposit <= 0) return null;
+
+  const balances = safeNum(binData.unrealizedPnl?.balances);
+  const unclaimedFees =
+    safeNum(binData.unrealizedPnl?.unclaimedFeeTokenX?.usd) +
+    safeNum(binData.unrealizedPnl?.unclaimedFeeTokenY?.usd);
+  const withdrawals = safeNum(binData.allTimeWithdrawals?.total?.usd);
+  const fees = safeNum(binData.allTimeFees?.total?.usd);
+  const pnl = balances + unclaimedFees + withdrawals + fees - deposit;
+  return (pnl / deposit) * 100;
+}
+
+function deriveLpAgentPnlPct(lpData) {
+  if (!lpData) return null;
+  const deposit = safeNum(lpData.inputValue);
+  if (deposit <= 0) return null;
+
+  const currentValue = safeNum(lpData.currentValue ?? lpData.value);
+  const unclaimedFees = safeNum(lpData.unCollectedFee ?? lpData.uncollectedFee);
+  const pnl = currentValue + unclaimedFees - deposit;
+  return (pnl / deposit) * 100;
+}
+
 // ─── Get Position PnL (Meteora API) ─────────────────────────────
 export async function getPositionPnl({ pool_address, position_address }) {
   pool_address = normalizeMint(pool_address);
@@ -413,6 +445,9 @@ export async function getPositionPnl({ pool_address, position_address }) {
       : parseFloat(p?.unrealizedPnl?.balances || 0);
     const pnlUsd = lpagent?.pnl?.value ?? p?.pnlUsd ?? 0;
     const pnlPct = lpagent?.pnl?.percent ?? p?.pnlPctChange ?? 0;
+    const derivedPnlPct = lpagent ? deriveLpAgentPnlPct(lpagent) : deriveOpenPnlPct(p);
+    const pnlPctDiff = derivedPnlPct != null ? Math.abs(Number(pnlPct) - derivedPnlPct) : null;
+    const pnlPctSuspicious = pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5);
     const collectedFeesUsd = parseFloat(lpagent?.collectedFee ?? 0);
     const totalFeesUsd = lpagent
       ? collectedFeesUsd + unclaimedUsd
@@ -429,6 +464,9 @@ export async function getPositionPnl({ pool_address, position_address }) {
     return {
       pnl_usd:           Math.round(Number(pnlUsd) * 100) / 100,
       pnl_pct:           Math.round(Number(pnlPct) * 100) / 100,
+      pnl_pct_derived:   derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
+      pnl_pct_diff:      pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,
+      pnl_pct_suspicious: !!pnlPctSuspicious,
       current_value_usd: Math.round(currentValueUsd * 100) / 100,
       unclaimed_fee_usd: Math.round(unclaimedUsd * 100) / 100,
       all_time_fees_usd: Math.round(Number(totalFeesUsd) * 100) / 100,
@@ -523,7 +561,15 @@ export async function getMyPositions({ force = false } = {}) {
         ? parseFloat(lp.collectedFee ?? 0)
         : p ? parseFloat(p.allTimeFees?.total?.usd || 0) : 0;
       const pnlUsd = lp?.pnl?.value ?? p?.pnlUsd ?? 0;
-      const pnlPct = lp?.pnl?.percent ?? p?.pnlPctChange ?? 0;
+      const reportedPnlPct = lp?.pnl?.percent ?? p?.pnlPctChange ?? 0;
+      const derivedPnlPct = lp ? deriveLpAgentPnlPct(lp) : deriveOpenPnlPct(p);
+      const pnlPctDiff = derivedPnlPct != null
+        ? Math.abs(Number(reportedPnlPct) - derivedPnlPct)
+        : null;
+      const pnlPctSuspicious = pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5);
+      if (pnlPctSuspicious) {
+        log("positions_warn", `Suspicious pnl_pct for ${r.position.slice(0, 8)}: reported=${Number(reportedPnlPct).toFixed(2)} derived=${derivedPnlPct.toFixed(2)} diff=${pnlPctDiff.toFixed(2)}`);
+      }
 
       const tracked = getTrackedPosition(r.position);
       const ageFromLpAgent = lp?.createdAt
@@ -555,7 +601,10 @@ export async function getMyPositions({ force = false } = {}) {
         total_value_usd: Math.round(totalValue * 100) / 100,
         collected_fees_usd: Math.round(collectedFees * 100) / 100,
         pnl_usd: Math.round(pnlUsd * 100) / 100,
-        pnl_pct: Math.round(pnlPct * 100) / 100,
+        pnl_pct: Math.round(Number(reportedPnlPct) * 100) / 100,
+        pnl_pct_derived: derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
+        pnl_pct_diff: pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,
+        pnl_pct_suspicious: !!pnlPctSuspicious,
         age_minutes: ageMinutes,
         minutes_out_of_range: minutesOutOfRange(r.position),
       };
@@ -694,7 +743,7 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address }) {
+export async function closePosition({ position_address, reason = null }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -709,8 +758,11 @@ export async function closePosition({ position_address }) {
     const pool = await getPool(poolAddress);
 
     const positionPubKey = new PublicKey(position_address);
+    const cachedPosBeforeClose = _positionsCache?.positions?.find((p) => p.position === position_address) || null;
 
     const txHashes = [];
+    const claimTxHashes = [];
+    const closeTxHashes = [];
 
     // ─── Step 1: Claim Fees (to clear account state) ───────────
     try {
@@ -723,6 +775,7 @@ export async function closePosition({ position_address }) {
       if (claimTxs && claimTxs.length > 0) {
         for (const tx of claimTxs) {
           const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+          claimTxHashes.push(claimHash);
           txHashes.push(claimHash);
         }
         log("close", `Step 1 OK: ${txHashes.join(", ")}`);
@@ -744,12 +797,42 @@ export async function closePosition({ position_address }) {
 
     for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
       const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      closeTxHashes.push(txHash);
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
-    // Give RPC a moment to reflect withdrawn balances before follow-up balance checks/swaps.
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-    recordClose(position_address, "agent decision");
+
+    let closedConfirmed = false;
+    _positionsCacheAt = 0;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const refreshed = await getMyPositions({ force: true });
+        const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
+        if (!stillOpen) {
+          closedConfirmed = true;
+          break;
+        }
+        log("close_warn", `Position ${position_address} still appears open after close txs (attempt ${attempt + 1}/4)`);
+      } catch (e) {
+        log("close_warn", `Close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
+      }
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+
+    if (!closedConfirmed) {
+      return {
+        success: false,
+        error: "Close transactions sent but position still appears open after verification window",
+        position: position_address,
+        pool: poolAddress,
+        claim_txs: claimTxHashes,
+        close_txs: closeTxHashes,
+        txs: txHashes,
+      };
+    }
+
+    const closeReason = reason || "agent decision";
+    recordClose(position_address, closeReason);
 
     // Record performance for learning
     const tracked = getTrackedPosition(position_address);
@@ -762,21 +845,50 @@ export async function closePosition({ position_address }) {
         minutesOOR = Math.floor((Date.now() - new Date(tracked.out_of_range_since).getTime()) / 60000);
       }
 
-      // Snapshot PnL from cache BEFORE invalidating — this was the last known state before close
       let pnlUsd = 0;
       let pnlPct = 0;
       let finalValueUsd = 0;
+      let initialUsd = tracked.initial_value_usd || 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
-      const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
-      if (cachedPos) {
-        pnlUsd        = cachedPos.pnl_usd   ?? 0;
-        pnlPct        = cachedPos.pnl_pct   ?? 0;
-        finalValueUsd = cachedPos.total_value_usd ?? 0;
-        feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+      const cachedPos = cachedPosBeforeClose;
+
+      try {
+        const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
+        const res = await fetch(closedUrl);
+        if (res.ok) {
+          const data = await res.json();
+          const posEntry = (data.positions || []).find((p) => p.positionAddress === position_address);
+          if (posEntry) {
+            pnlUsd = parseFloat(posEntry.pnlUsd || 0);
+            pnlPct = parseFloat(posEntry.pnlPctChange || 0);
+            finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
+            initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || initialUsd || 0);
+            feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+            log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} USD (${pnlPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)}, deposited=${initialUsd.toFixed(2)}`);
+          } else {
+            log("close_warn", `Position not found in status=closed response — may still be settling`);
+          }
+        }
+      } catch (e) {
+        log("close_warn", `Closed PnL fetch failed: ${e.message}`);
       }
 
-      _positionsCacheAt = 0; // invalidate cache after snapshotting PnL
-      const initialUsd = tracked.initial_value_usd || 0;
+      if (finalValueUsd === 0 && cachedPos) {
+        pnlUsd = cachedPos.pnl_true_usd ?? cachedPos.pnl_usd ?? 0;
+        pnlPct = cachedPos.pnl_pct ?? 0;
+        feesUsd = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+        initialUsd = tracked.initial_value_usd || initialUsd || 0;
+        if (initialUsd > 0) {
+          finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
+          pnlPct = (pnlUsd / initialUsd) * 100;
+        } else {
+          finalValueUsd = cachedPos.total_value_usd ?? 0;
+          initialUsd = Math.max(0, finalValueUsd + feesUsd - pnlUsd);
+        }
+        log("close_warn", "Using cached pnl fallback because closed API has not settled yet");
+      }
+
+      _positionsCacheAt = 0;
 
       await recordPerformance({
         position: position_address,
@@ -789,18 +901,40 @@ export async function closePosition({ position_address }) {
         fee_tvl_ratio: tracked.fee_tvl_ratio || null,
         organic_score: tracked.organic_score || null,
         amount_sol: tracked.amount_sol,
+        base_mint: pool.lbPair.tokenXMint.toString(),
+        deployed_at: tracked.deployed_at,
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
-        close_reason: "agent decision",
+        close_reason: closeReason,
       });
 
-      return { success: true, position: position_address, pool: poolAddress, pool_name: tracked.pool_name || null, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct, base_mint: pool.lbPair.tokenXMint.toString() };
+      return {
+        success: true,
+        position: position_address,
+        pool: poolAddress,
+        pool_name: tracked.pool_name || null,
+        claim_txs: claimTxHashes,
+        close_txs: closeTxHashes,
+        txs: txHashes,
+        pnl_usd: pnlUsd,
+        pnl_pct: pnlPct,
+        base_mint: pool.lbPair.tokenXMint.toString(),
+      };
     }
 
-    return { success: true, position: position_address, pool: poolAddress, pool_name: null, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return {
+      success: true,
+      position: position_address,
+      pool: poolAddress,
+      pool_name: null,
+      claim_txs: claimTxHashes,
+      close_txs: closeTxHashes,
+      txs: txHashes,
+      base_mint: pool.lbPair.tokenXMint.toString(),
+    };
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };

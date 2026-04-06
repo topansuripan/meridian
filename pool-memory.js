@@ -7,8 +7,33 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
+
+function isOorCloseReason(reason) {
+  const text = String(reason || "").trim().toLowerCase();
+  return text === "oor" || text.includes("out of range") || text.includes("oor");
+}
+
+function setPoolCooldown(entry, hours, reason) {
+  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  entry.cooldown_until = cooldownUntil;
+  entry.cooldown_reason = reason;
+  return cooldownUntil;
+}
+
+function setBaseMintCooldown(db, baseMint, hours, reason) {
+  if (!baseMint) return null;
+  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  for (const entry of Object.values(db)) {
+    if (entry?.base_mint === baseMint) {
+      entry.base_mint_cooldown_until = cooldownUntil;
+      entry.base_mint_cooldown_reason = reason;
+    }
+  }
+  return cooldownUntil;
+}
 
 function load() {
   if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
@@ -96,8 +121,49 @@ export function recordPoolDeploy(poolAddress, deployData) {
     entry.base_mint = deployData.base_mint;
   }
 
+  if (deploy.close_reason === "low yield") {
+    const cooldownUntil = setPoolCooldown(entry, 4, "low yield");
+    log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
+  }
+
+  const oorTriggerCount = config.management.oorCooldownTriggerCount ?? 3;
+  const oorCooldownHours = config.management.oorCooldownHours ?? 12;
+  const recentDeploys = entry.deploys.slice(-oorTriggerCount);
+  const repeatedOorCloses =
+    recentDeploys.length >= oorTriggerCount &&
+    recentDeploys.every((d) => isOorCloseReason(d.close_reason));
+
+  if (repeatedOorCloses) {
+    const reason = `repeated OOR closes (${oorTriggerCount}x)`;
+    const poolCooldownUntil = setPoolCooldown(entry, oorCooldownHours, reason);
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, oorCooldownHours, reason);
+    log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+    if (entry.base_mint && mintCooldownUntil) {
+      log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+    }
+  }
+
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
+}
+
+export function isPoolOnCooldown(poolAddress) {
+  if (!poolAddress) return false;
+  const db = load();
+  const entry = db[poolAddress];
+  if (!entry?.cooldown_until) return false;
+  return new Date(entry.cooldown_until) > new Date();
+}
+
+export function isBaseMintOnCooldown(baseMint) {
+  if (!baseMint) return false;
+  const db = load();
+  const now = new Date();
+  return Object.values(db).some((entry) =>
+    entry?.base_mint === baseMint &&
+    entry?.base_mint_cooldown_until &&
+    new Date(entry.base_mint_cooldown_until) > now
+  );
 }
 
 // ─── Read ──────────────────────────────────────────────────────
@@ -130,6 +196,10 @@ export function getPoolMemory({ pool_address }) {
     win_rate: entry.win_rate,
     last_deployed_at: entry.last_deployed_at,
     last_outcome: entry.last_outcome,
+    cooldown_until: entry.cooldown_until || null,
+    cooldown_reason: entry.cooldown_reason || null,
+    base_mint_cooldown_until: entry.base_mint_cooldown_until || null,
+    base_mint_cooldown_reason: entry.base_mint_cooldown_reason || null,
     notes: entry.notes,
     history: entry.deploys.slice(-10), // last 10 deploys
   };
@@ -195,6 +265,14 @@ export function recallForPool(poolAddress) {
   // Deploy history summary
   if (entry.total_deploys > 0) {
     lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${entry.win_rate}%, last outcome: ${entry.last_outcome}`);
+  }
+
+  if (entry.cooldown_until && new Date(entry.cooldown_until) > new Date()) {
+    lines.push(`POOL COOLDOWN: active until ${entry.cooldown_until}${entry.cooldown_reason ? ` (${entry.cooldown_reason})` : ""}`);
+  }
+
+  if (entry.base_mint_cooldown_until && new Date(entry.base_mint_cooldown_until) > new Date()) {
+    lines.push(`TOKEN COOLDOWN: active until ${entry.base_mint_cooldown_until}${entry.base_mint_cooldown_reason ? ` (${entry.base_mint_cooldown_reason})` : ""}`);
   }
 
   // Recent snapshot trend (last 6 = ~30min)
