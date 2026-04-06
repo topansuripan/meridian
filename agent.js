@@ -54,7 +54,13 @@ function isSystemRoleError(error) {
 
 function isToolChoiceRequiredError(error) {
   const message = String(error?.message || error?.error?.message || error || "");
-  return /tool_choice/i.test(message) && /required/i.test(message);
+  return /tool_choice/i.test(message) && (
+    /required/i.test(message) ||
+    /unsupported/i.test(message) ||
+    /not support/i.test(message) ||
+    /no endpoints found/i.test(message) ||
+    /provided ['"]?tool_choice['"]? value/i.test(message)
+  );
 }
 
 function shouldRequireRealToolUse(goal, requireTool = false) {
@@ -99,14 +105,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          response = await client.chat.completions.create({
+          const request = {
             model: usedModel,
             messages,
             tools: getToolsForRole(agentType),
-            tool_choice: toolChoice,
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
-          });
+          };
+          if (toolChoice) request.tool_choice = toolChoice;
+          response = await client.chat.completions.create(request);
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
@@ -118,6 +125,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           if (toolChoice === "required" && isToolChoiceRequiredError(error)) {
             toolChoice = "auto";
             log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
+            attempt -= 1;
+            continue;
+          }
+          if (toolChoice === "auto" && isToolChoiceRequiredError(error)) {
+            toolChoice = null;
+            log("agent", "Provider rejected tool_choice=auto — retrying without tool_choice");
             attempt -= 1;
             continue;
           }
