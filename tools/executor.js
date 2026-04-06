@@ -9,7 +9,7 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
+import { getWalletBalances, getWalletTokenBalance, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { addMemory, listMemory, MemoryType } from "../memory.js";
@@ -29,7 +29,7 @@ import { execSync, spawn } from "child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifySwap, notifySwapBack } from "../telegram.js";
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
@@ -37,31 +37,73 @@ export function registerCronRestarter(fn) { _cronRestarter = fn; }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function autoSwapToSol(baseMint, { label = "token", retries = 3, minUsd = 0.10 } = {}) {
+async function autoSwapToSol(baseMint, { label = "token", pair = null, retries = 8, minUsd = 0.10 } = {}) {
   if (!baseMint) return { attempted: false, reason: "missing_base_mint" };
+  if (baseMint === config.tokens.SOL || baseMint === "SOL") {
+    return { attempted: false, reason: "already_sol" };
+  }
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const balances = await getWalletBalances({});
-      const token = balances.tokens?.find((entry) => entry.mint === baseMint);
+      const [rpcToken, balances] = await Promise.all([
+        getWalletTokenBalance(baseMint).catch(() => null),
+        getWalletBalances({}).catch(() => null),
+      ]);
+      const heliusToken = balances?.tokens?.find((entry) => entry.mint === baseMint);
+      const balance = Number(rpcToken?.balance || heliusToken?.balance || 0);
+      const usdValue = heliusToken?.usd;
+      const symbol = heliusToken?.symbol || rpcToken?.symbol || baseMint.slice(0, 8);
 
-      if (token && token.usd >= minUsd) {
-        log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-        const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
-        return { attempted: true, success: true, swapResult };
+      if (balance > 0 && (usdValue == null || usdValue >= minUsd || attempt === retries)) {
+        log("executor", `Auto-swapping ${label} ${symbol} (${balance}) back to SOL`);
+        const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: balance });
+        if (swapResult?.success !== false && !swapResult?.error) {
+          await notifySwapBack({
+            pair,
+            status: "success",
+            inputSymbol: symbol,
+            amountIn: swapResult.amount_in ?? balance,
+            amountOut: swapResult.amount_out,
+            tx: swapResult.tx,
+          }).catch(() => {});
+          return { attempted: true, success: true, swapResult, symbol, balance };
+        }
+        const failureReason = swapResult?.error || "swap_failed";
+        if (attempt >= retries) {
+          await notifySwapBack({
+            pair,
+            status: "failed",
+            inputSymbol: symbol,
+            amountIn: balance,
+            reason: failureReason,
+          }).catch(() => {});
+          return { attempted: true, success: false, reason: failureReason, symbol, balance };
+        }
       }
 
       if (attempt < retries) {
-        await sleep(1500 * attempt);
+        await sleep(2000 * attempt);
       }
     } catch (e) {
       if (attempt >= retries) {
+        await notifySwapBack({
+          pair,
+          status: "failed",
+          inputSymbol: baseMint.slice(0, 8),
+          reason: e.message,
+        }).catch(() => {});
         throw e;
       }
-      await sleep(1500 * attempt);
+      await sleep(2000 * attempt);
     }
   }
 
+  await notifySwapBack({
+    pair,
+    status: "pending",
+    inputSymbol: baseMint.slice(0, 8),
+    reason: "token balance not visible yet after close",
+  }).catch(() => {});
   return { attempted: false, reason: "token_not_found_or_too_small" };
 }
 
@@ -364,9 +406,14 @@ export async function executeTool(name, args) {
         // Auto-swap base token back to SOL unless user said to hold
         if (!args.skip_swap && result.base_mint) {
           try {
-            const swapOutcome = await autoSwapToSol(result.base_mint, { label: "closed position" });
+            const swapOutcome = await autoSwapToSol(result.base_mint, {
+              label: "closed position",
+              pair: result.pool_name || args.position_address?.slice(0, 8),
+            });
             if (!swapOutcome.attempted) {
               log("executor", `Auto-swap after close skipped: ${swapOutcome.reason}`);
+            } else if (swapOutcome.success === false) {
+              log("executor_warn", `Auto-swap after close failed: ${swapOutcome.reason}`);
             }
           } catch (e) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);

@@ -25,6 +25,45 @@ function getWallet() {
   return _wallet;
 }
 
+export async function getWalletTokenBalance(mint) {
+  const normalizedMint = normalizeMint(mint);
+  const wallet = getWallet();
+
+  if (normalizedMint === SOL_MINT) {
+    const lamports = await getConnection().getBalance(wallet.publicKey, "confirmed");
+    return {
+      mint: normalizedMint,
+      symbol: "SOL",
+      balance: lamports / LAMPORTS_PER_SOL,
+      decimals: 9,
+      accounts: 1,
+    };
+  }
+
+  const response = await getConnection().getParsedTokenAccountsByOwner(
+    wallet.publicKey,
+    { mint: new PublicKey(normalizedMint) },
+    "confirmed"
+  );
+
+  const accounts = response.value || [];
+  let balance = 0;
+  let decimals = null;
+  for (const account of accounts) {
+    const tokenAmount = account.account?.data?.parsed?.info?.tokenAmount;
+    balance += Number(tokenAmount?.uiAmount || 0);
+    if (decimals == null && tokenAmount?.decimals != null) decimals = tokenAmount.decimals;
+  }
+
+  return {
+    mint: normalizedMint,
+    symbol: normalizedMint.slice(0, 8),
+    balance,
+    decimals: decimals ?? 0,
+    accounts: accounts.length,
+  };
+}
+
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
 const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";

@@ -406,6 +406,24 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
   );
 }
 
+export async function notifySwapBack({ pair, status, reason = null, inputSymbol = null, amountIn = null, amountOut = null, tx = null }) {
+  const txLink = solscanTxLink(tx);
+  const title = status === "success"
+    ? `✅ <b>Swap Back to SOL Complete</b>`
+    : status === "pending"
+      ? `⏳ <b>Swap Back to SOL Pending</b>`
+      : `⚠️ <b>Swap Back to SOL Failed</b>`;
+  await sendHTML([
+    title,
+    pair ? `🏷️ <b>Pair:</b> ${escapeHtml(pair)}` : null,
+    inputSymbol ? `🪙 <b>Token:</b> ${escapeHtml(inputSymbol)}` : null,
+    amountIn != null ? `📥 <b>Input:</b> ${amountIn}` : null,
+    amountOut != null ? `📤 <b>Output:</b> ${amountOut}` : null,
+    reason ? `📝 <b>Reason:</b> ${escapeHtml(reason)}` : null,
+    txLink ? `🔗 <a href="${txLink}">View Tx</a>` : null,
+  ].filter(Boolean).join("\n"));
+}
+
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   await sendHTML(
     `⚠️ <b>${pair} Out of Range</b>\n` +
