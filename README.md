@@ -104,9 +104,9 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `minSolToOpen` | `0.07` | Minimum wallet SOL balance before opening a new position |
 | `managementIntervalMin` | `10` | How often the management agent runs (minutes) |
 | `screeningIntervalMin` | `30` | How often the screening agent runs (minutes) |
-| `managementModel` | `openai/gpt-oss-20b:free` | LLM model for position management |
-| `screeningModel` | `openrouter/hunter-alpha` | LLM model for pool screening |
-| `generalModel` | `openrouter/healer-alpha` | LLM model for REPL chat and `/learn` |
+| `managementModel` | `minimax/minimax-m2.7` | LLM model for position management |
+| `screeningModel` | `minimax/minimax-m2.7` | LLM model for pool screening |
+| `generalModel` | `minimax/minimax-m2.7` | LLM model for REPL chat and `/learn` |
 | `minFeeActiveTvlRatio` | `0.05` | Minimum fee/active-TVL ratio (5%) |
 | `minTvl` | `10000` | Minimum pool TVL in USD |
 | `maxTvl` | `150000` | Maximum pool TVL in USD |

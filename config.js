@@ -95,9 +95,9 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openai/gpt-oss-20b:free",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openai/gpt-oss-20b:free",
+    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "minimax/minimax-m2.7",
+    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "minimax/minimax-m2.7",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "minimax/minimax-m2.7",
   },
 
   // ─── Common Token Mints ────────────────
