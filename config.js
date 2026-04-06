@@ -8,7 +8,6 @@ const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
-const inferredRiskMode = u.riskMode ?? (["degen", "moderate", "safe"].includes(u.preset) ? u.preset : "moderate");
 
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
@@ -79,7 +78,7 @@ export const config = {
   },
 
   profile: {
-    riskMode: inferredRiskMode,
+    freedomMode: u.freedomMode ?? true,
     autoLearnTopLps: u.autoLearnTopLps ?? true,
     topLpStudyTtlHours: u.topLpStudyTtlHours ?? 24,
     topLpAutoLearnLimit: u.topLpAutoLearnLimit ?? 2,
@@ -150,6 +149,6 @@ export function reloadScreeningThresholds() {
     if (fresh.maxPriceChangePct != null) s.maxPriceChangePct = fresh.maxPriceChangePct;
     if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
     if (fresh.category       != null) s.category       = fresh.category;
-    if (fresh.riskMode       != null) config.profile.riskMode = fresh.riskMode;
+    if (fresh.freedomMode    != null) config.profile.freedomMode = fresh.freedomMode;
   } catch { /* ignore */ }
 }

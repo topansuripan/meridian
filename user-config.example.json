@@ -30,7 +30,7 @@
   "minVolumeToRebalance": 1000,
   "managementMode": "manual",
   "screeningMode": "manual",
-  "riskMode": "moderate",
+  "freedomMode": true,
   "autoLearnTopLps": true,
   "topLpStudyTtlHours": 24,
   "topLpAutoLearnLimit": 2,

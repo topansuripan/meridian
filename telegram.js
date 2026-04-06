@@ -33,9 +33,9 @@ export const TELEGRAM_LABELS = {
   SCREEN_247: "Screen 24/7",
   SCREEN_30M: "Screen 30m",
   SCREEN_60M: "Screen 60m",
-  DEPLOY_05: "Deploy 0.5",
-  DEPLOY_10: "Deploy 1.0",
-  DEPLOY_20: "Deploy 2.0",
+  DEPLOY_05: "Deploy 3.0",
+  DEPLOY_10: "Deploy 3.5",
+  DEPLOY_20: "Deploy 4.0",
   TP_3: "TP 3%",
   TP_5: "TP 5%",
   TP_8: "TP 8%",
@@ -45,9 +45,6 @@ export const TELEGRAM_LABELS = {
   MAXPOS_1: "MaxPos 1",
   MAXPOS_3: "MaxPos 3",
   MAXPOS_5: "MaxPos 5",
-  RISK_SAFE: "Mode Safe",
-  RISK_MODERATE: "Mode Moderate",
-  RISK_DEGEN: "Mode Degen",
   POSITIONS_BACK: "Back to Positions",
   BACK: "Back to Menu",
 };
@@ -105,24 +102,8 @@ export function getTradeSettingsMenuMarkup() {
 }
 
 export function getRiskSettingsMenuMarkup() {
-  const currentMode = (() => {
-    try {
-      if (!fs.existsSync(USER_CONFIG_PATH)) return "moderate";
-      const cfg = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
-      return cfg.riskMode || (["safe", "moderate", "degen"].includes(cfg.preset) ? cfg.preset : "moderate");
-    } catch {
-      return "moderate";
-    }
-  })();
-
-  const riskButton = (mode, label, emoji) => currentMode === mode ? `✅ ${emoji} ${label}` : `${emoji} ${label}`;
   return keyboard([
     [TELEGRAM_LABELS.MAXPOS_1, TELEGRAM_LABELS.MAXPOS_3, TELEGRAM_LABELS.MAXPOS_5],
-    [
-      riskButton("safe", TELEGRAM_LABELS.RISK_SAFE, "🛡️"),
-      riskButton("moderate", TELEGRAM_LABELS.RISK_MODERATE, "⚖️"),
-      riskButton("degen", TELEGRAM_LABELS.RISK_DEGEN, "🔥"),
-    ],
     [TELEGRAM_LABELS.SETTINGS, TELEGRAM_LABELS.BACK],
   ]);
 }
@@ -372,20 +353,28 @@ function shortCode(value, head = 8, tail = 4) {
   return `${text.slice(0, head)}...${text.slice(-tail)}`;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 function formatPrice(value) {
   if (value == null) return "?";
   return value < 0.0001 ? value.toExponential(3) : value.toFixed(6);
 }
 
-export async function notifyDeploy({ pair, amountSol, position, tx, poolAddress, priceRange, binStep, baseFee }) {
+export async function notifyDeploy({ pair, amountSol, position, tx, poolAddress, priceRange, binStep, baseFee, thesis }) {
   const txLink = solscanTxLink(tx);
   const poolLink = meteoraPoolLink(poolAddress);
   await sendHTML([
-    `✅ <b>Deployed ${pair}</b>`,
+    `✅ <b>Deployed ${escapeHtml(pair)}</b>`,
     `━━━━━━━━━━━━━━`,
     `💰 <b>Amount:</b> ${amountSol} SOL`,
     priceRange ? `🎯 <b>Range:</b> ${formatPrice(priceRange.min)} - ${formatPrice(priceRange.max)}` : null,
     (binStep || baseFee != null) ? `⚙️ <b>Setup:</b> Bin ${binStep ?? "?"} | Fee ${baseFee != null ? `${baseFee}%` : "?"}` : null,
+    thesis ? `🧠 <b>Thesis:</b> ${escapeHtml(thesis)}` : null,
     txLink || poolLink ? "" : null,
     txLink ? `🔗 <a href="${txLink}">View Tx</a>` : null,
     poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
@@ -398,7 +387,7 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, tx, poolAddress }) {
   const sign = pnlUsd >= 0 ? "+" : "";
   const pnlLink = metlexPnlLink(tx);
   await sendHTML([
-    `🔒 <b>Closed ${pair}</b>`,
+    `🔒 <b>Closed ${escapeHtml(pair)}</b>`,
     `━━━━━━━━━━━━━━`,
     `📊 <b>PnL:</b> ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`,
     pnlLink ? `📈 <a href="${pnlLink}">Open PnL Card</a>` : null,

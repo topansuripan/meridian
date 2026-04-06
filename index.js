@@ -4,12 +4,12 @@ import fs from "fs";
 import readline from "readline";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, getPositionPnl, closePosition } from "./tools/dlmm.js";
+import { getMyPositions, getPositionPnl } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, listLessons } from "./lessons.js";
-import { registerCronRestarter } from "./tools/executor.js";
+import { registerCronRestarter, executeTool } from "./tools/executor.js";
 import {
   startPolling,
   stopPolling,
@@ -339,12 +339,7 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
 
       // Load active strategy
       const activeStrategy = getActiveStrategy();
-      const riskMode = config.profile?.riskMode || "moderate";
-      const riskModeBlock = riskMode === "degen"
-        ? `RISK MODE: DEGEN — be more aggressive only when top-LP playbook confidence is strong, momentum is real, and organic/smart-wallet evidence confirms the move.`
-        : riskMode === "safe"
-          ? `RISK MODE: SAFE — prefer durable, lower-volatility setups and avoid overextended momentum.`
-          : `RISK MODE: MODERATE — balance safety and upside; demand both fees and believable narrative.`;
+      const freedomModeBlock = `AGENT FREEDOM MODE: Use live metrics, memory, top-LP playbooks, and past outcomes together. Do not follow any rigid preset personality.`;
       const strategyBlock = activeStrategy
         ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
         : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
@@ -400,12 +395,10 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
           const holographicRecall = getHolographicRecall({
             pool_address: pool.pool,
             base_mint: mint,
-            risk_mode: riskMode,
           });
           const strategyHint = getHolographicStrategyHint({
             pool_address: pool.pool,
             base_mint: mint,
-            risk_mode: riskMode,
           });
 
           // Hard filter: skip blocked launchpads before even showing to LLM
@@ -462,7 +455,7 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
       const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-${riskModeBlock}
+${freedomModeBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 ${candidateContext}
 DECISION RULES:
@@ -473,11 +466,11 @@ ${config.screening.blockedLaunchpads.length ? `- HARD SKIP if launchpad is any o
 - Bots 5–25% are normal, not a skip reason on their own
 - Smart wallets present → strong confidence boost
 - If a candidate includes strategy_hint / holographic recall, prefer that deploy style unless live metrics clearly contradict it
-- In degen mode, only lean aggressive when LP playbook confidence is high and the pool still passes safety filters
+- Use top-LP playbooks as input, not rigid law; live metrics can override them when they conflict
 
 STEPS:
 1. Pick the best candidate. If none pass, report why and stop.
-2. Call deploy_position with ${deployAmount} SOL. Set bins_below = round(35 + (volatility/5)*34) clamped to [35,69].
+2. Call deploy_position with ${deployAmount} SOL. Include thesis as 1 concise human line explaining the edge, timing, and why this pool deserves capital. Set bins_below = round(35 + (volatility/5)*34) clamped to [35,69].
 3. Report result.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048);
       screenReport = content;
@@ -659,18 +652,12 @@ function managementAlertModeLabel() {
   return "silent + critical alerts";
 }
 
-function riskModeLabel() {
-  const mode = config.profile?.riskMode || "moderate";
-  if (mode === "degen") return "degen";
-  if (mode === "safe") return "safe";
-  return "moderate";
+function freedomModeLabel() {
+  return "active";
 }
 
-function riskModeBrief() {
-  const mode = config.profile?.riskMode || "moderate";
-  if (mode === "degen") return "aggressive, LP-backed momentum";
-  if (mode === "safe") return "defensive, capital-preserving";
-  return "balanced, selective rotation";
+function freedomModeBrief() {
+  return "agent decides from live data, memory, top LP, and outcome history";
 }
 
 function isLightweightTelegramCommand(text) {
@@ -707,14 +694,6 @@ function isLightweightTelegramCommand(text) {
   if (directMatches.has(normalized)) return true;
   if (/^\d+\.\s+/.test(normalized)) return true;
   if (/^(Close|Hold|TP5)\s+#\d+$/i.test(normalized)) return true;
-  return false;
-}
-
-function isRiskModeButton(text, mode) {
-  const normalized = String(text || "").trim();
-  if (mode === "safe") return /safe$/i.test(normalized);
-  if (mode === "moderate") return /moderate$/i.test(normalized);
-  if (mode === "degen") return /degen$/i.test(normalized);
   return false;
 }
 
@@ -757,6 +736,13 @@ function escapeHtml(value) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function summarizeThesis(value, max = 100) {
+  const text = stripMarkdown(value).replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1).trimEnd()}...`;
 }
 
 function shortHash(value, head = 10, tail = 6) {
@@ -937,7 +923,7 @@ async function sendTelegramStatusCard() {
     `<b>Automation</b>`,
     `🤖 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
     `🧭 Screening: ${_screeningPausedForCapacity ? "paused (max positions)" : formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
-    `🔥 Risk Mode: ${riskModeLabel()} (${riskModeBrief()})`,
+    `🧠 Agent Freedom: ${freedomModeLabel()} (${freedomModeBrief()})`,
     `🔕 Mgmt feed: ${managementAlertModeLabel()}`,
     `🚨 Screen feed: ${screeningAlertModeLabel()}`,
     ``,
@@ -956,6 +942,8 @@ async function sendTelegramPositionsCard() {
   }
   const lines = positions.map((p, i) => {
     const mood = positionMood(p);
+    const tracked = getTrackedPosition(p.position);
+    const thesis = summarizeThesis(tracked?.thesis, 88);
     const pnlLine = (p.pnl_usd || 0) >= 0
       ? `📈 PnL: +$${formatUsd(p.pnl_usd)}`
       : `📉 PnL: -$${formatUsd(Math.abs(p.pnl_usd || 0))}`;
@@ -964,6 +952,7 @@ async function sendTelegramPositionsCard() {
       `💼 Value: <b>$${formatUsd(p.total_value_usd)}</b>   💎 Fees: <b>$${formatUsd(p.unclaimed_fees_usd)}</b>`,
       `${pnlLine}   ⏳ Age: ${ageLabel(p.age_minutes)}`,
       `📍 Status: ${rangeLabel(p)}`,
+      thesis ? `🧠 Thesis: ${escapeHtml(thesis)}` : null,
     ].join("\n");
   });
   await sendHTML(`🗂️ <b>Open Positions</b> (${total_positions})\n\n${lines.join("\n\n")}\n\n<i>Tap tombol posisi di bawah untuk detail cepat.</i>`, {
@@ -995,7 +984,7 @@ async function sendTelegramConfigCard() {
     `<b>Cycle Modes</b>`,
     `Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
     `Screening: ${_screeningPausedForCapacity ? "paused (max positions)" : formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
-    `Risk mode: ${riskModeLabel()} (${riskModeBrief()})`,
+    `Agent freedom: ${freedomModeLabel()} (${freedomModeBrief()})`,
     `Mgmt feed: ${managementAlertModeLabel()}`,
     `Screen feed: ${screeningAlertModeLabel()}`,
     ``,
@@ -1030,20 +1019,15 @@ async function sendTelegramTradeSettingsCard() {
 
 async function sendTelegramRiskSettingsCard() {
   const r = config.risk;
-  const mode = riskModeLabel();
-  const safeBadge = mode === "safe" ? "✅ Safe active" : "Safe";
-  const moderateBadge = mode === "moderate" ? "✅ Moderate active" : "Moderate";
-  const degenBadge = mode === "degen" ? "✅ Degen active" : "Degen";
   await sendHTML([
     `🛡️ <b>Risk Settings</b>`,
     `────────────────`,
     `📚 Max positions: <b>${r.maxPositions}</b>`,
     `🏦 Max deploy amount: <b>${r.maxDeployAmount} SOL</b>`,
-    `🔥 Risk mode: <b>${mode}</b>`,
-    `🧠 Style: ${riskModeBrief()}`,
-    `🧭 Modes: ${safeBadge} | ${moderateBadge} | ${degenBadge}`,
+    `🧠 Agent freedom: <b>${freedomModeLabel()}</b>`,
+    `🎯 Logic: ${freedomModeBrief()}`,
     ``,
-    `Pilih batas maksimum posisi atau ganti mode risiko dari tombol di bawah.`,
+    `Pilih batas maksimum posisi. Agent tetap bebas memilih dari data live, memory, top LP, dan outcome history.`,
     `────────────────`,
   ].join("\n"), { reply_markup: getRiskSettingsMenuMarkup() });
 }
@@ -1074,6 +1058,7 @@ async function sendTelegramPositionDetail(index) {
   const pos = positions[idx];
   const tracked = getTrackedPosition(pos.position);
   const instruction = tracked?.instruction || pos.instruction || "none";
+  const thesis = tracked?.thesis || "not recorded";
   const pnlLine = (pos.pnl_usd || 0) >= 0
     ? `📈 PnL: +$${formatUsd(pos.pnl_usd)}`
     : `📉 PnL: -$${formatUsd(Math.abs(pos.pnl_usd || 0))}`;
@@ -1086,7 +1071,8 @@ async function sendTelegramPositionDetail(index) {
     `${pnlLine}`,
     `📍 Status: ${rangeLabel(pos)}`,
     `⏳ Age: ${ageLabel(pos.age_minutes)}`,
-    `🧠 Instruction: ${instruction}`,
+    `🧠 Entry Thesis: ${escapeHtml(thesis)}`,
+    `📝 Instruction: ${escapeHtml(instruction)}`,
     `🔗 Position ID: <code>${pos.position}</code>`,
     `────────────────`,
   ].join("\n"), { reply_markup: getPositionActionMenuMarkup(index) });
@@ -1134,69 +1120,6 @@ function persistUserConfig(changes) {
     }
   }
   fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify({ ...current, ...changes }, null, 2));
-}
-
-function getRiskModePreset(mode) {
-  if (mode === "degen") {
-    return {
-      riskMode: "degen",
-      timeframe: "30m",
-      maxVolatility: 12,
-      maxPriceChangePct: 900,
-      minOrganic: 60,
-      minHolders: 200,
-      takeProfitFeePct: 10,
-      outOfRangeWaitMinutes: 15,
-      managementIntervalMin: 5,
-      screeningIntervalMin: 15,
-    };
-  }
-  if (mode === "safe") {
-    return {
-      riskMode: "safe",
-      timeframe: "24h",
-      maxVolatility: 4,
-      maxPriceChangePct: 120,
-      minOrganic: 75,
-      minHolders: 1000,
-      takeProfitFeePct: 3,
-      outOfRangeWaitMinutes: 60,
-      managementIntervalMin: 15,
-      screeningIntervalMin: 60,
-    };
-  }
-  return {
-    riskMode: "moderate",
-    timeframe: "4h",
-    maxVolatility: 8,
-    maxPriceChangePct: 300,
-    minOrganic: 65,
-    minHolders: 500,
-    takeProfitFeePct: 5,
-    outOfRangeWaitMinutes: 30,
-    managementIntervalMin: 10,
-    screeningIntervalMin: 30,
-  };
-}
-
-async function applyRiskModePreset(mode) {
-  const preset = getRiskModePreset(mode);
-  config.profile.riskMode = preset.riskMode;
-  config.screening.timeframe = preset.timeframe;
-  config.screening.maxVolatility = preset.maxVolatility;
-  config.screening.maxPriceChangePct = preset.maxPriceChangePct;
-  config.screening.minOrganic = preset.minOrganic;
-  config.screening.minHolders = preset.minHolders;
-  config.management.takeProfitFeePct = preset.takeProfitFeePct;
-  config.management.outOfRangeWaitMinutes = preset.outOfRangeWaitMinutes;
-  config.schedule.managementIntervalMin = preset.managementIntervalMin;
-  config.schedule.screeningIntervalMin = preset.screeningIntervalMin;
-
-  persistUserConfig(preset);
-  if (cronStarted) startCronJobs();
-  addMemory(`Changed riskMode=${mode}, timeframe=${preset.timeframe}, maxVolatility=${preset.maxVolatility}, maxPriceChangePct=${preset.maxPriceChangePct} — Telegram risk mode preset`, MemoryType.SELF_TUNED);
-  await sendTelegramRiskSettingsCard();
-  await sendSettingsMenu(`Risk mode diubah ke ${mode}. Screening dan management preset ikut disesuaikan.`);
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
@@ -1373,17 +1296,23 @@ if (isTTY) {
       return;
     }
     if (normalized === TELEGRAM_LABELS.DEPLOY_05) {
-      applyConfigPreset({ deployAmountSol: 0.5 }, "Telegram trade preset");
+      applyConfigPreset({ deployAmountSol: 3.0 }, "Telegram trade preset");
+      config.management.minSolToOpen = 3.2;
+      persistUserConfig({ minSolToOpen: 3.2 });
       await sendTelegramTradeSettingsCard();
       return;
     }
     if (normalized === TELEGRAM_LABELS.DEPLOY_10) {
-      applyConfigPreset({ deployAmountSol: 1 }, "Telegram trade preset");
+      applyConfigPreset({ deployAmountSol: 3.5 }, "Telegram trade preset");
+      config.management.minSolToOpen = 3.7;
+      persistUserConfig({ minSolToOpen: 3.7 });
       await sendTelegramTradeSettingsCard();
       return;
     }
     if (normalized === TELEGRAM_LABELS.DEPLOY_20) {
-      applyConfigPreset({ deployAmountSol: 2 }, "Telegram trade preset");
+      applyConfigPreset({ deployAmountSol: 4.0 }, "Telegram trade preset");
+      config.management.minSolToOpen = 4.2;
+      persistUserConfig({ minSolToOpen: 4.2 });
       await sendTelegramTradeSettingsCard();
       return;
     }
@@ -1432,18 +1361,6 @@ if (isTTY) {
       await sendTelegramRiskSettingsCard();
       return;
     }
-    if (isRiskModeButton(normalized, "safe")) {
-      await applyRiskModePreset("safe");
-      return;
-    }
-    if (isRiskModeButton(normalized, "moderate")) {
-      await applyRiskModePreset("moderate");
-      return;
-    }
-    if (isRiskModeButton(normalized, "degen")) {
-      await applyRiskModePreset("degen");
-      return;
-    }
 
     const positionButtonMatch = normalized.match(/^(\d+)\.\s+/);
     if (positionButtonMatch) {
@@ -1459,7 +1376,7 @@ if (isTTY) {
         if (idx < 0 || idx >= positions.length) { await sendMessage("Posisi tidak ditemukan."); return; }
         const pos = positions[idx];
         await sendMessage(`Closing ${pos.pair}...`);
-        const result = await closePosition({ position_address: pos.position, pool_address: pos.pool });
+        const result = await executeTool("close_position", { position_address: pos.position, pool_address: pos.pool });
         if (result.success) {
           const tx = result.txs?.[0] || result.tx || null;
           const pnlLink = tx ? `https://www.metlex.io/pnl2/${tx}` : null;
@@ -1543,7 +1460,7 @@ if (isTTY) {
         if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
         const pos = positions[idx];
         await sendMessage(`Closing ${pos.pair}...`);
-        const result = await closePosition({ position_address: pos.position, pool_address: pos.pool });
+        const result = await executeTool("close_position", { position_address: pos.position, pool_address: pos.pool });
         if (result.success) {
           const tx = result.txs?.[0] || result.tx || null;
           const pnlLink = tx ? `https://www.metlex.io/pnl2/${tx}` : null;
@@ -1664,7 +1581,7 @@ Commands:
         const pool = startupCandidates[pick - 1];
         console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
         const { content: reply } = await agentLoop(
-          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first, then deploy_position, and include thesis as 1 concise line explaining the edge and why now. Report result.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -1680,7 +1597,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
+          `get_top_candidates, pick the best one, get_active_bin, then deploy_position with ${DEPLOY} SOL and include thesis as 1 concise line explaining the edge and timing. Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"

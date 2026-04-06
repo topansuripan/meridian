@@ -255,7 +255,7 @@ rl.close();
 // ─── Save ──────────────────────────────────────────────────────────────────────
 const userConfig = {
   preset: presetChoice.key,
-  riskMode: presetChoice.key === "custom" ? e("riskMode", "moderate") : presetChoice.key,
+  freedomMode: true,
   rpcUrl,
   ...(walletKey && !walletKey.startsWith("***") ? { walletKey } : {}),
   deployAmountSol,

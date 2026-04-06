@@ -96,6 +96,7 @@ export async function deployPosition({
   amount_sol, // legacy: will be used as amount_y if amount_y is not provided
   amount_x,
   amount_y,
+  thesis,
   strategy,
   bins_below,
   bins_above,
@@ -169,6 +170,16 @@ export async function deployPosition({
   const totalBins = activeBinsBelow + activeBinsAbove;
   const isWideRange = totalBins > 69;
   const newPosition = Keypair.generate();
+  const deployThesis = String(
+    thesis ||
+    [
+      pool_name ? `${pool_name}` : null,
+      fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
+      organic_score != null ? `organic ${organic_score}` : null,
+      volatility != null ? `vol ${volatility}` : null,
+      `strategy ${activeStrategy}`,
+    ].filter(Boolean).join(" | ")
+  ).trim() || null;
 
   log("deploy", `Pool: ${pool_address}`);
   log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
@@ -236,6 +247,7 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
+      thesis: deployThesis,
       strategy: activeStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step,
@@ -267,6 +279,7 @@ export async function deployPosition({
       bin_step: actualBinStep,
       base_fee: actualBaseFee,
       strategy: activeStrategy,
+      thesis: deployThesis,
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,

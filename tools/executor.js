@@ -35,6 +35,36 @@ import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 let _cronRestarter = null;
 export function registerCronRestarter(fn) { _cronRestarter = fn; }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function autoSwapToSol(baseMint, { label = "token", retries = 3, minUsd = 0.10 } = {}) {
+  if (!baseMint) return { attempted: false, reason: "missing_base_mint" };
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const balances = await getWalletBalances({});
+      const token = balances.tokens?.find((entry) => entry.mint === baseMint);
+
+      if (token && token.usd >= minUsd) {
+        log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
+        const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
+        return { attempted: true, success: true, swapResult };
+      }
+
+      if (attempt < retries) {
+        await sleep(1500 * attempt);
+      }
+    } catch (e) {
+      if (attempt >= retries) {
+        throw e;
+      }
+      await sleep(1500 * attempt);
+    }
+  }
+
+  return { attempted: false, reason: "token_not_found_or_too_small" };
+}
+
 // Map tool names to implementations
 const toolMap = {
   discover_pools: discoverPools,
@@ -173,7 +203,7 @@ const toolMap = {
       healthCheckEnabled: ["schedule", "healthCheckEnabled"],
       healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
       // profile
-      riskMode: ["profile", "riskMode"],
+      freedomMode: ["profile", "freedomMode"],
       autoLearnTopLps: ["profile", "autoLearnTopLps"],
       topLpStudyTtlHours: ["profile", "topLpStudyTtlHours"],
       topLpAutoLearnLimit: ["profile", "topLpAutoLearnLimit"],
@@ -314,6 +344,7 @@ export async function executeTool(name, args) {
           priceRange: result.price_range,
           binStep: result.bin_step,
           baseFee: result.base_fee,
+          thesis: result.thesis || args.thesis || null,
         }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({
@@ -326,11 +357,9 @@ export async function executeTool(name, args) {
         // Auto-swap base token back to SOL unless user said to hold
         if (!args.skip_swap && result.base_mint) {
           try {
-            const balances = await getWalletBalances({});
-            const token = balances.tokens?.find(t => t.mint === result.base_mint);
-            if (token && token.usd >= 0.10) {
-              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+            const swapOutcome = await autoSwapToSol(result.base_mint, { label: "closed position" });
+            if (!swapOutcome.attempted) {
+              log("executor", `Auto-swap after close skipped: ${swapOutcome.reason}`);
             }
           } catch (e) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
@@ -338,11 +367,9 @@ export async function executeTool(name, args) {
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         try {
-          const balances = await getWalletBalances({});
-          const token = balances.tokens?.find(t => t.mint === result.base_mint);
-          if (token && token.usd >= 0.10) {
-            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+          const swapOutcome = await autoSwapToSol(result.base_mint, { label: "claimed fees" });
+          if (!swapOutcome.attempted) {
+            log("executor", `Auto-swap after claim skipped: ${swapOutcome.reason}`);
           }
         } catch (e) {
           log("executor_warn", `Auto-swap after claim failed: ${e.message}`);

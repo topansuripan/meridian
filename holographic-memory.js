@@ -265,7 +265,7 @@ export function isTopLPStudyStale({ pool_address, base_mint, ttlHours = 24 }) {
   return Date.now() - new Date(updatedAt).getTime() > ttlHours * 60 * 60 * 1000;
 }
 
-export function getHolographicRecall({ pool_address, base_mint, risk_mode = "moderate" }) {
+export function getHolographicRecall({ pool_address, base_mint }) {
   const db = load();
   const entry = pool_address ? db.pools[pool_address] : null;
   const lines = [];
@@ -283,9 +283,7 @@ export function getHolographicRecall({ pool_address, base_mint, risk_mode = "mod
     lines.push(
       `TOP LP PLAYBOOK: ${playbook.playbook_summary}. Preferred strategy ${playbook.preferred_strategy}, bins ${playbook.bins_below_hint}/${playbook.bins_above_hint}, confidence ${playbook.confidence}%`
     );
-    if (risk_mode === "degen") {
-      lines.push(`DEGEN READ: ${playbook.degen_note}`);
-    }
+    lines.push(`TACTICAL READ: ${playbook.degen_note}`);
   }
 
   const cluster = aggregateSimilarOutcomes(db, base_mint, pool_address);
@@ -298,31 +296,21 @@ export function getHolographicRecall({ pool_address, base_mint, risk_mode = "mod
   return lines.length ? lines.join("\n") : null;
 }
 
-export function getHolographicStrategyHint({ pool_address, base_mint, risk_mode = "moderate" }) {
+export function getHolographicStrategyHint({ pool_address, base_mint }) {
   const playbook = getTopLPPlaybook({ pool_address, base_mint });
   if (!playbook) return null;
 
-  const strategy = risk_mode === "degen" && playbook.degen_fit >= 65
-    ? playbook.preferred_strategy
-    : playbook.preferred_strategy === "spot" && playbook.confidence < 60
-      ? "bid_ask"
-      : playbook.preferred_strategy;
+  const strategy = playbook.preferred_strategy === "spot" && playbook.confidence < 60
+    ? "bid_ask"
+    : playbook.preferred_strategy;
 
-  const binsBelow = risk_mode === "degen"
-    ? Math.max(35, Math.round(playbook.bins_below_hint * 0.9))
-    : risk_mode === "safe"
-      ? Math.round(playbook.bins_below_hint * 1.15)
-      : playbook.bins_below_hint;
+  const binsBelow = playbook.bins_below_hint;
 
   const binsAbove = strategy === "spot"
     ? Math.max(8, playbook.bins_above_hint || 12)
     : 0;
 
-  const scoreBoost = risk_mode === "degen"
-    ? Math.round(playbook.degen_fit / 12)
-    : risk_mode === "safe"
-      ? Math.round(playbook.confidence / 20)
-      : Math.round(playbook.confidence / 16);
+  const scoreBoost = Math.round(((playbook.confidence || 0) * 0.5 + (playbook.degen_fit || 0) * 0.3) / 12);
 
   return {
     strategy,
@@ -330,6 +318,6 @@ export function getHolographicStrategyHint({ pool_address, base_mint, risk_mode 
     bins_above: binsAbove,
     confidence: playbook.confidence,
     score_boost: scoreBoost,
-    summary: `${strategy} | ${playbook.dominant_style} | bins ${binsBelow}/${binsAbove} | confidence ${playbook.confidence}% | degen fit ${playbook.degen_fit}%`,
+    summary: `${strategy} | ${playbook.dominant_style} | bins ${binsBelow}/${binsAbove} | confidence ${playbook.confidence}% | edge ${playbook.degen_fit}%`,
   };
 }
