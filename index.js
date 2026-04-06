@@ -135,6 +135,19 @@ function stopCronJobs() {
   _cronTasks = [];
 }
 
+function resolveEffectivePnlPct(position) {
+  if (position?.pnl_pct_suspicious && position?.pnl_pct_derived != null) {
+    return position.pnl_pct_derived;
+  }
+  return position?.pnl_pct ?? null;
+}
+
+function truncateReason(reason, max = 90) {
+  const text = String(reason || "").trim();
+  if (!text) return "unknown";
+  return text.length <= max ? text : `${text.slice(0, max - 3).trimEnd()}...`;
+}
+
 export async function runManagementCycle({ delivery = "full" } = {}) {
   log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
   let mgmtReport = null;
@@ -186,75 +199,163 @@ export async function runManagementCycle({ delivery = "full" } = {}) {
         recordPositionSnapshot(p.pool, p);
         const pnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch(() => null);
         const recall = recallForPool(p.pool);
-        return { ...p, pnl, recall };
+        const tracked = getTrackedPosition(p.position);
+        const merged = {
+          ...p,
+          ...(pnl && !pnl.error ? pnl : {}),
+          recall,
+          instruction: tracked?.instruction || null,
+          thesis: tracked?.thesis || null,
+        };
+        merged.effective_pnl_pct = resolveEffectivePnlPct(merged);
+        return merged;
       }));
 
-      // Build pre-loaded position blocks for the LLM
-      const positionBlocks = positionData.map((p) => {
-        const pnl = p.pnl;
-        const lines = [
+      const stopLossPct = config.management.stopLossPct ?? config.management.emergencyPriceDropPct;
+      const maxHoldMinutes = Number(config.management.maxHoldMinutes);
+      const minYieldAge = config.management.minAgeBeforeYieldCheck ?? 60;
+      const actionMap = new Map();
+      const actionNotes = new Map();
+      const actionSummary = [];
+
+      for (const p of positionData) {
+        const effectivePnlPct = p.effective_pnl_pct;
+
+        if (effectivePnlPct != null && effectivePnlPct <= stopLossPct) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 1, reason: `stop loss hit (${effectivePnlPct}%)`, closeReason: "stop loss" });
+          continue;
+        }
+        if (effectivePnlPct != null && effectivePnlPct >= config.management.takeProfitFeePct) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 2, reason: `take profit hit (${effectivePnlPct}%)`, closeReason: "take profit" });
+          continue;
+        }
+        if (Number.isFinite(maxHoldMinutes) && maxHoldMinutes > 0 && (p.age_minutes ?? 0) >= maxHoldMinutes) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 3, reason: `max hold ${maxHoldMinutes}m reached`, closeReason: "max hold" });
+          continue;
+        }
+        if (p.active_bin != null && p.upper_bin != null && p.active_bin > p.upper_bin + config.management.outOfRangeBinsToClose) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 4, reason: "pumped far above range", closeReason: "pumped above range" });
+          continue;
+        }
+        if (p.active_bin != null && p.upper_bin != null && p.active_bin > p.upper_bin && (p.minutes_out_of_range ?? 0) >= config.management.outOfRangeWaitMinutes) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 5, reason: `out of range ${p.minutes_out_of_range ?? 0}m`, closeReason: "oor" });
+          continue;
+        }
+        if (p.fee_per_tvl_24h != null && p.fee_per_tvl_24h < config.management.minFeePerTvl24h && (p.age_minutes ?? 0) >= minYieldAge) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 6, reason: `low yield ${p.fee_per_tvl_24h}%`, closeReason: "low yield" });
+          continue;
+        }
+        if (p.instruction) {
+          actionMap.set(p.position, { action: "INSTRUCTION", reason: p.instruction });
+          continue;
+        }
+        if ((p.unclaimed_fee_usd ?? 0) >= config.management.minClaimAmount) {
+          actionMap.set(p.position, { action: "CLAIM", reason: `claim threshold met ($${formatUsd(p.unclaimed_fee_usd)})` });
+          continue;
+        }
+        actionMap.set(p.position, { action: "STAY" });
+      }
+
+      for (const p of positionData) {
+        const act = actionMap.get(p.position);
+        if (act?.action !== "CLOSE" && act?.action !== "CLAIM") continue;
+
+        try {
+          if (act.action === "CLOSE") {
+            const result = await executeTool("close_position", {
+              position_address: p.position,
+              pool_address: p.pool,
+              reason: act.closeReason || "manual",
+            });
+            const ok = result?.success !== false && !result?.error;
+            const note = ok
+              ? `Rule ${act.rule}: ${act.reason} — close executed`
+              : `Rule ${act.rule}: ${act.reason} — close failed: ${truncateReason(result?.error || "unknown error")}`;
+            actionNotes.set(p.position, note);
+            actionSummary.push(ok ? `closed ${p.pair} (${act.closeReason})` : `close failed ${p.pair}`);
+          } else if (act.action === "CLAIM") {
+            const result = await executeTool("claim_fees", { position_address: p.position });
+            const ok = result?.success !== false && !result?.error;
+            const note = ok
+              ? `Rule Claim: ${act.reason} — fees claimed`
+              : `Rule Claim: ${act.reason} — claim failed: ${truncateReason(result?.error || "unknown error")}`;
+            actionNotes.set(p.position, note);
+            actionSummary.push(ok ? `claimed ${p.pair}` : `claim failed ${p.pair}`);
+          }
+        } catch (error) {
+          const prefix = act.action === "CLOSE"
+            ? `Rule ${act.rule}: ${act.reason}`
+            : `Rule Claim: ${act.reason}`;
+          actionNotes.set(p.position, `${prefix} — failed: ${truncateReason(error.message)}`);
+          actionSummary.push(`${act.action.toLowerCase()} failed ${p.pair}`);
+        }
+      }
+
+      const instructionPositions = positionData.filter((p) => actionMap.get(p.position)?.action === "INSTRUCTION");
+      let instructionReport = "";
+      if (instructionPositions.length > 0) {
+        const instructionBlocks = instructionPositions.map((p) => [
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
           `  age: ${p.age_minutes ?? "?"}m | in_range: ${p.in_range} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-          pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd} | fee_per_tvl_24h: ${pnl.fee_per_tvl_24h ?? "?"}%` : `  pnl: fetch failed`,
-          p.pnl_pct_suspicious ? `  pnl_flag: suspicious_open_tick (reported ${p.pnl_pct}% vs derived ${p.pnl_pct_derived ?? "?"}%, diff ${p.pnl_pct_diff ?? "?"}%)` : null,
-          pnl ? `  bins: lower=${pnl.lower_bin} upper=${pnl.upper_bin} active=${pnl.active_bin}` : null,
-          p.instruction ? `  instruction: "${p.instruction}"` : null,
+          `  pnl_pct_effective: ${p.effective_pnl_pct ?? "?"}% | pnl_pct_reported: ${p.pnl_pct ?? "?"}% | value: $${formatUsd(p.current_value_usd)} | unclaimed_fees: $${formatUsd(p.unclaimed_fee_usd)}`,
+          `  bins: lower=${p.lower_bin ?? "?"} upper=${p.upper_bin ?? "?"} active=${p.active_bin ?? "?"}`,
+          `  instruction: "${p.instruction}"`,
           p.recall ? `  memory_untrusted: ${sanitizeUntrustedPromptText(p.recall, 500)}` : null,
+        ].filter(Boolean).join("\n")).join("\n\n");
+
+        const { content } = await agentLoop(`
+MANAGEMENT INSTRUCTION CHECK — ${instructionPositions.length} position(s)
+
+${instructionBlocks}
+
+RULES:
+- Hard stop-loss, take-profit, max-hold, OOR, and low-yield closes were already checked in code before this prompt.
+- Evaluate ONLY the saved instruction for each position.
+- If the instruction condition is met now, call close_position with a short reason derived from the instruction.
+- If the condition is not met, HOLD and say so in one short line.
+- Do not re-fetch positions or PnL.
+        `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048);
+        instructionReport = content || "";
+        if (instructionReport) actionSummary.push("instruction review completed");
+      }
+
+      const totalValue = positionData.reduce((sum, p) => sum + Number(p.current_value_usd || p.total_value_usd || 0), 0);
+      const totalUnclaimed = positionData.reduce((sum, p) => sum + Number(p.unclaimed_fee_usd || p.unclaimed_fees_usd || 0), 0);
+      const reportLines = positionData.map((p) => {
+        const act = actionMap.get(p.position) || { action: "STAY" };
+        const effectivePnlPct = p.effective_pnl_pct;
+        const status = act.action === "CLOSE" ? "CLOSE" : "STAY";
+        const pnlText = effectivePnlPct != null ? `${effectivePnlPct}%` : "?";
+        const rangeText = `lower=${p.lower_bin ?? "?"} upper=${p.upper_bin ?? "?"} active=${p.active_bin ?? "?"} | ${p.in_range ? "in range" : `oor ${p.minutes_out_of_range ?? 0}m`}`;
+        const ruleLine = actionNotes.get(p.position)
+          || (act.action === "INSTRUCTION" ? `Rule Instruction: saved rule pending evaluation — ${truncateReason(p.instruction, 80)}` : null);
+        const lines = [
+          `**[${p.pair}]** | Age: ${ageLabel(p.age_minutes)} | Unclaimed: $${formatUsd(p.unclaimed_fee_usd ?? p.unclaimed_fees_usd)} | PnL: ${pnlText} | ${status}`,
+          `Range: ${rangeText}`,
+          ruleLine,
         ].filter(Boolean);
         return lines.join("\n");
-      }).join("\n\n");
+      });
 
-      // Hive mind pattern consensus (if enabled)
-      let hivePatterns = "";
-      try {
-        const hiveMind = await import("./hive-mind.js");
-        if (hiveMind.isEnabled()) {
-          const patterns = await hiveMind.queryPatternConsensus();
-          const significant = (patterns || []).filter(p => p.count >= 10);
-          if (significant.length > 0) {
-            hivePatterns = `\nHIVE MIND PATTERNS (supplementary):\n${significant.slice(0, 3).map(p => `[HIVE] ${p.strategy}: ${p.win_rate}% win, ${p.avg_pnl}% avg PnL (${p.count} deploys)`).join("\n")}\n`;
-          }
-        }
-      } catch { /* hive is best-effort */ }
+      mgmtReport = [
+        reportLines.join("\n\n"),
+        `💼 ${positions.length} positions | $${formatUsd(totalValue)} | fees today: $${formatUsd(totalUnclaimed)} | ${actionSummary.length ? actionSummary.join(", ") : "no action taken"}`,
+        instructionReport ? `Instruction Review\n${instructionReport}` : null,
+      ].filter(Boolean).join("\n\n");
 
-      const { content } = await agentLoop(`
-MANAGEMENT CYCLE — ${positions.length} position(s)
-
-PRE-LOADED POSITION DATA (no fetching needed):
-${positionBlocks}${hivePatterns}
-
-HARD CLOSE RULES — apply in order, first match wins:
-1. instruction set AND condition met → CLOSE (highest priority)
-2. instruction set AND condition NOT met → HOLD, skip remaining rules
-3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
-4. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-5. active_bin > upper_bin + ${config.management.outOfRangeBinsToClose} → CLOSE (pumped far above range)
-6. active_bin > upper_bin AND oor_minutes >= ${config.management.outOfRangeWaitMinutes} → CLOSE (stale above range)
-7. fee_per_tvl_24h < ${config.management.minFeePerTvl24h} AND age_minutes >= 60 → CLOSE (fee yield too low)
-
-When closing: call close_position only. It already claims fees internally, so do NOT call claim_fees first.
-When closing, always include reason as a short machine-friendly phrase like "take profit", "oor", "pumped above range", "low yield", or "manual".
-
-If pnl_flag says suspicious_open_tick, do NOT close solely because of pnl_pct on that cycle. Wait for the next confirmation unless there is independent non-PnL evidence like OOR, pumped above range, low fee yield, or a user instruction.
-
-CLAIM RULE: If unclaimed_fee_usd >= ${config.management.minClaimAmount}, call claim_fees. Do not use any other threshold.
-
-INSTRUCTIONS:
-All data is pre-loaded above — do NOT call get_my_positions or get_position_pnl.
-Apply the rules to each position and write your report immediately.
-Only call tools if a position needs to be CLOSED, FLIPPED, or fees need to be CLAIMED.
-If all positions STAY and no fees to claim, just write the report with no tool calls.
-
-REPORT FORMAT (one per position):
-**[PAIR]** | Age: [X]m | Unclaimed: $[X] | PnL: [X]% | [STAY/CLOSE]
-Range: [████████░░░░░░░░░░░░] (20 chars: █ = bins up to active, ░ = bins above active)
-Only add: **Rule [N]:** [reason] — if a close rule triggered. Omit rule line if STAY with no rule.
-
-After all positions, add one summary line:
-💼 [N] positions | $[total_value] | fees today: $[sum_unclaimed] | [any notable action taken]
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096);
-      mgmtReport = content;
+      const afterPositions = await getMyPositions({ force: true }).catch(() => null);
+      const afterCount = afterPositions?.positions?.length ?? positions.length;
+      _screeningPausedForCapacity = afterCount >= config.risk.maxPositions;
+      if (
+        (config.schedule.screeningMode === "interval" || config.schedule.screeningMode === "nonstop") &&
+        afterCount < config.risk.maxPositions &&
+        Date.now() - _screeningLastTriggered > screeningCooldownMs
+      ) {
+        _screeningLastTriggered = Date.now();
+        log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
+        runScreeningCycle({ delivery: "alerts" }).catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      }
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
@@ -816,6 +917,10 @@ function formatManagementTelegramReport(report) {
   }
 
   const summaryLine = lines.find((line) => line.startsWith("💼")) || null;
+  const instructionIndex = lines.findIndex((line) => /^Instruction Review$/i.test(stripMarkdown(line)));
+  const instructionLines = instructionIndex >= 0
+    ? lines.slice(instructionIndex + 1).map((line) => stripMarkdown(line)).filter(Boolean)
+    : [];
   if (blocks.length === 0) {
     return `🔄 <b>Management Cycle</b>\n────────────────\n${escapeHtml(stripMarkdown(text))}`;
   }
@@ -839,6 +944,7 @@ function formatManagementTelegramReport(report) {
     `────────────────`,
     ...formattedBlocks,
     summaryLine ? `💼 <b>Portfolio Summary</b>\n${escapeHtml(stripMarkdown(summaryLine.replace(/^💼\s*/, "")))}` : null,
+    instructionLines.length ? `📝 <b>Instruction Review</b>\n${instructionLines.map((line) => escapeHtml(line)).join("\n")}` : null,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -962,6 +1068,7 @@ async function sendTelegramStatusCard() {
     `🤖 Management: ${formatScheduleMode(config.schedule.managementMode, config.schedule.managementIntervalMin)}`,
     `🧭 Screening: ${_screeningPausedForCapacity ? "paused (max positions)" : formatScheduleMode(config.schedule.screeningMode, config.schedule.screeningIntervalMin)}`,
     `🧠 Agent Freedom: ${freedomModeLabel()} (${freedomModeBrief()})`,
+    `🛡️ Guards: TP ${config.management.takeProfitFeePct}% | SL ${config.management.stopLossPct}% | hold ${config.management.maxHoldMinutes ?? "off"}m`,
     `🔕 Mgmt feed: ${managementAlertModeLabel()}`,
     `🚨 Screen feed: ${screeningAlertModeLabel()}`,
     ``,
@@ -1032,8 +1139,8 @@ async function sendTelegramConfigCard() {
     `fee/TVL >= ${s.minFeeActiveTvlRatio} | token fees >= ${s.minTokenFeesSol} SOL`,
     ``,
     `<b>Management</b>`,
-    `deploy: ${m.deployAmountSol} SOL | TP: ${m.takeProfitFeePct}%`,
-    `claim >= $${m.minClaimAmount} | OOR wait: ${m.outOfRangeWaitMinutes}m`,
+    `deploy: ${m.deployAmountSol} SOL | TP: ${m.takeProfitFeePct}% | SL: ${m.stopLossPct}%`,
+    `claim >= $${m.minClaimAmount} | OOR wait: ${m.outOfRangeWaitMinutes}m | max hold: ${m.maxHoldMinutes ?? "off"}m`,
     ``,
     `<b>Risk</b>`,
     `max positions: ${r.maxPositions} | max deploy: ${r.maxDeployAmount} SOL`,
@@ -1048,6 +1155,8 @@ async function sendTelegramTradeSettingsCard() {
     `────────────────`,
     `🚀 Deploy amount: <b>${m.deployAmountSol} SOL</b>`,
     `🎯 Take profit: <b>${m.takeProfitFeePct}%</b>`,
+    `🛑 Stop loss: <b>${m.stopLossPct}%</b>`,
+    `⏱️ Max hold: <b>${m.maxHoldMinutes ?? "off"}m</b>`,
     `💎 Claim threshold: <b>$${m.minClaimAmount}</b>`,
     ``,
     `Pilih preset dari tombol di bawah.`,
@@ -1118,7 +1227,7 @@ async function sendTelegramPositionDetail(index) {
 
 function applyConfigPreset(changes, reason) {
   Object.entries(changes).forEach(([key, val]) => {
-    if (key === "deployAmountSol" || key === "takeProfitFeePct" || key === "minClaimAmount") {
+    if (key === "deployAmountSol" || key === "takeProfitFeePct" || key === "minClaimAmount" || key === "stopLossPct" || key === "maxHoldMinutes") {
       config.management[key] = val;
     } else if (key === "maxPositions") {
       config.risk[key] = val;
