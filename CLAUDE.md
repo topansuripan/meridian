@@ -90,7 +90,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | outOfRangeWaitMinutes | management | 30 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
-| managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
+| managementModel / screeningModel / generalModel | llm | management=`openai/gpt-oss-20b:free`, screening=`openrouter/hunter-alpha`, general=`openrouter/healer-alpha` |
 
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
 
@@ -177,8 +177,8 @@ const actualBaseFee = baseFactor > 0
 
 ## Model Configuration
 
-- Default model: `process.env.LLM_MODEL` or `openrouter/healer-alpha`
-- Fallback on 502/503/529: `stepfun/step-3.5-flash:free` (2nd attempt), then retry
+- Default per-role models: `management=openai/gpt-oss-20b:free`, `screening=openrouter/hunter-alpha`, `general=openrouter/healer-alpha` unless `process.env.LLM_MODEL` overrides them
+- Fallback on 502/503/529: `openai/gpt-oss-20b:free` (2nd attempt), then retry
 - Per-role models: `managementModel`, `screeningModel`, `generalModel` in user-config.json
 - LM Studio: set `LLM_BASE_URL=http://localhost:1234/v1` and `LLM_API_KEY=lm-studio`
 - `maxOutputTokens` minimum: 2048 (free models may have lower limits causing empty responses)

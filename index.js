@@ -352,9 +352,11 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
       const topCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
       const candidates = topCandidates?.candidates || topCandidates?.pools || [];
       rejected = topCandidates?.rejected || [];
+      const earlyFilteredExamples = topCandidates?.filtered_examples || [];
       const pipelineSummary = topCandidates?.pipeline_summary;
 
       const candidateBlocks = [];
+      const lateFilteredExamples = [];
       for (const [index, pool] of candidates.slice(0, 5).entries()) {
         const mint = pool.base?.mint;
         if (
@@ -409,6 +411,7 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
           if (launchpad && config.screening.blockedLaunchpads.length > 0) {
             if (config.screening.blockedLaunchpads.includes(launchpad)) {
               log("screening", `Skipping ${pool.name} — blocked launchpad: ${launchpad}`);
+              lateFilteredExamples.push({ name: pool.name, reason: `blocked launchpad (${launchpad})` });
               continue;
             }
           }
@@ -428,6 +431,17 @@ export async function runScreeningCycle({ delivery = "full" } = {}) {
           ].filter(Boolean);
 
           candidateBlocks.push(lines.join("\n"));
+      }
+
+      if (candidateBlocks.length === 0) {
+        const combinedExamples = [...lateFilteredExamples, ...earlyFilteredExamples]
+          .slice(0, 3)
+          .map((entry) => `- ${entry.name}: ${entry.reason}`)
+          .join("\n");
+        screenReport = combinedExamples
+          ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
+          : "No candidates available (all filtered by ownership, cooldown, or launchpad rules).";
+        return screenReport;
       }
 
       let candidateContext = candidateBlocks.length > 0

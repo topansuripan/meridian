@@ -45,7 +45,7 @@
   "maxSteps": 20,
   "temperature": 0.3,
   "llmModel": "nvidia/nemotron-3-super-120b-a12b:free",
-  "managementModel": "stepfun/step-3.5-flash:free",
+  "managementModel": "openai/gpt-oss-20b:free",
   "screeningModel": "minimax/minimax-m2.7",
   "generalModel": "minimax/minimax-m2.7",
   "dryRun": false,

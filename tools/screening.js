@@ -107,23 +107,28 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const s = config.screening;
   const candidates = [];
   const rejected = [];
+  const filteredOut = [];
 
   for (const pool of pools) {
     // Already have position here
     if (occupiedPools.has(pool.pool)) {
+      pushFilteredReason(filteredOut, pool, "already have an open position in this pool");
       rejected.push({ pool: pool.name, pool_address: pool.pool, stage: "ownership", reason: "Already have position in this pool" });
       continue;
     }
     if (occupiedMints.has(pool.base?.mint)) {
+      pushFilteredReason(filteredOut, pool, `already holding ${pool.base?.symbol || "this base token"} in another pool`);
       rejected.push({ pool: pool.name, pool_address: pool.pool, stage: "ownership", reason: `Already hold base token ${pool.base?.symbol}` });
       continue;
     }
     if (isPoolOnCooldown(pool.pool)) {
+      pushFilteredReason(filteredOut, pool, "pool cooldown active after repeated weak/OOR outcomes");
       rejected.push({ pool: pool.name, pool_address: pool.pool, stage: "cooldown", reason: "Pool is on cooldown after repeated weak/OOR outcomes" });
       log("screening", `SKIP ${pool.name}: pool cooldown active`);
       continue;
     }
     if (isBaseMintOnCooldown(pool.base?.mint)) {
+      pushFilteredReason(filteredOut, pool, `base token ${pool.base?.symbol || "unknown"} cooldown active`);
       rejected.push({ pool: pool.name, pool_address: pool.pool, stage: "cooldown", reason: `Base token ${pool.base?.symbol} is on cooldown after repeated weak/OOR outcomes` });
       log("screening", `SKIP ${pool.name}: base mint cooldown active`);
       continue;
@@ -177,6 +182,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   return {
     candidates: top,
     rejected: rejected.slice(0, 10), // trim for prompt size
+    filtered_examples: filteredOut.slice(0, 3),
     total_screened: pools.length,
     total_eligible: candidates.length,
     pipeline_summary: summarizePipeline(rejected, candidates),
@@ -287,6 +293,14 @@ function summarizePipeline(rejected, candidates) {
     shortlisted: shortlist,
     watchlist: candidates.filter((c) => c.screening_stage === "watchlist").length,
   };
+}
+
+function pushFilteredReason(bucket, pool, reason) {
+  if (!pool || !reason || bucket.length >= 8) return;
+  bucket.push({
+    name: pool.name || pool.base?.symbol || pool.pool,
+    reason,
+  });
 }
 
 /**
