@@ -797,13 +797,9 @@ function isLightweightTelegramCommand(text) {
     TELEGRAM_LABELS.HELP,
     TELEGRAM_LABELS.STATUS,
     TELEGRAM_LABELS.POSITIONS,
-      TELEGRAM_LABELS.BRIEFING,
+    TELEGRAM_LABELS.BRIEFING,
       TELEGRAM_LABELS.DAILY,
     TELEGRAM_LABELS.MEMORY,
-    TELEGRAM_LABELS.SETTINGS,
-    TELEGRAM_LABELS.SETTINGS_SCHEDULE,
-    TELEGRAM_LABELS.SETTINGS_TRADE,
-    TELEGRAM_LABELS.SETTINGS_RISK,
     TELEGRAM_LABELS.BACK,
     TELEGRAM_LABELS.POSITIONS_BACK,
     "/menu",
@@ -815,7 +811,6 @@ function isLightweightTelegramCommand(text) {
     "/briefing",
     "/daily",
     "/memory",
-    "/settings",
     "/config",
   ]);
 
@@ -1279,28 +1274,45 @@ async function telegramHandler(text) {
       `<code>/positions</code> daftar posisi aktif\n` +
       `<code>/briefing</code> tampilkan morning briefing\n` +
       `<code>/daily</code> tampilkan summary realized hari ini\n` +
-      `<code>/settings</code> ubah manual/interval/24-7\n\n` +
+      `<code>/memory</code> lihat memory agent\n` +
+      `<code>/config</code> lihat config aktif\n\n` +
+      `Pengaturan via Telegram dimatikan agar tidak salah pencet.\n` +
+      `Ubah manual lewat file <code>user-config.json</code>, lalu restart bot.\n\n` +
       `Klik tombol <b>Menu</b> di kiri bawah Telegram untuk melihat daftar command seperti contoh yang kamu mau.`
     );
     return;
   }
 
-  if ([TELEGRAM_LABELS.SETTINGS, "/settings"].includes(normalized)) {
-    await sendTelegramConfigCard();
-    await sendSettingsMenu();
-    return;
-  }
+  const disabledSettingsInputs = new Set([
+    TELEGRAM_LABELS.SETTINGS,
+    TELEGRAM_LABELS.SETTINGS_SCHEDULE,
+    TELEGRAM_LABELS.SETTINGS_TRADE,
+    TELEGRAM_LABELS.SETTINGS_RISK,
+    TELEGRAM_LABELS.MGMT_MANUAL,
+    TELEGRAM_LABELS.MGMT_247,
+    TELEGRAM_LABELS.MGMT_15M,
+    TELEGRAM_LABELS.MGMT_30M,
+    TELEGRAM_LABELS.SCREEN_MANUAL,
+    TELEGRAM_LABELS.SCREEN_247,
+    TELEGRAM_LABELS.SCREEN_30M,
+    TELEGRAM_LABELS.SCREEN_60M,
+    TELEGRAM_LABELS.DEPLOY_05,
+    TELEGRAM_LABELS.DEPLOY_10,
+    TELEGRAM_LABELS.DEPLOY_20,
+    TELEGRAM_LABELS.TP_3,
+    TELEGRAM_LABELS.TP_5,
+    TELEGRAM_LABELS.TP_8,
+    TELEGRAM_LABELS.CLAIM_5,
+    TELEGRAM_LABELS.CLAIM_10,
+    TELEGRAM_LABELS.CLAIM_20,
+    TELEGRAM_LABELS.MAXPOS_1,
+    TELEGRAM_LABELS.MAXPOS_3,
+    TELEGRAM_LABELS.MAXPOS_5,
+    "/settings",
+  ]);
 
-  if (normalized === TELEGRAM_LABELS.SETTINGS_SCHEDULE) {
-    await sendTelegramScheduleSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.SETTINGS_TRADE) {
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.SETTINGS_RISK) {
-    await sendTelegramRiskSettingsCard();
+  if (disabledSettingsInputs.has(normalized)) {
+    await sendMessage("Pengaturan Telegram dimatikan. Edit user-config.json langsung lalu restart bot.");
     return;
   }
 
@@ -1310,105 +1322,6 @@ async function telegramHandler(text) {
   }
   if (normalized === TELEGRAM_LABELS.POSITIONS_BACK) {
     await sendTelegramPositionsCard();
-    return;
-  }
-
-  if (normalized === TELEGRAM_LABELS.MGMT_MANUAL) {
-    await applySchedulePreset("management", "manual");
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.MGMT_247) {
-    await applySchedulePreset("management", "nonstop");
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.MGMT_15M) {
-    await applySchedulePreset("management", "interval", 15);
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.MGMT_30M) {
-    await applySchedulePreset("management", "interval", 30);
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.SCREEN_MANUAL) {
-    await applySchedulePreset("screening", "manual");
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.SCREEN_247) {
-    await applySchedulePreset("screening", "nonstop");
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.SCREEN_30M) {
-    await applySchedulePreset("screening", "interval", 30);
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.SCREEN_60M) {
-    await applySchedulePreset("screening", "interval", 60);
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.DEPLOY_05) {
-    applyConfigPreset({ deployAmountSol: 3.0 }, "Telegram trade preset");
-    config.management.minSolToOpen = 3.2;
-    persistUserConfig({ minSolToOpen: 3.2 });
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.DEPLOY_10) {
-    applyConfigPreset({ deployAmountSol: 3.5 }, "Telegram trade preset");
-    config.management.minSolToOpen = 3.7;
-    persistUserConfig({ minSolToOpen: 3.7 });
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.DEPLOY_20) {
-    applyConfigPreset({ deployAmountSol: 4.0 }, "Telegram trade preset");
-    config.management.minSolToOpen = 4.2;
-    persistUserConfig({ minSolToOpen: 4.2 });
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.TP_3) {
-    applyConfigPreset({ takeProfitFeePct: 3 }, "Telegram trade preset");
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.TP_5) {
-    applyConfigPreset({ takeProfitFeePct: 5 }, "Telegram trade preset");
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.TP_8) {
-    applyConfigPreset({ takeProfitFeePct: 8 }, "Telegram trade preset");
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.CLAIM_5) {
-    applyConfigPreset({ minClaimAmount: 5 }, "Telegram trade preset");
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.CLAIM_10) {
-    applyConfigPreset({ minClaimAmount: 10 }, "Telegram trade preset");
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.CLAIM_20) {
-    applyConfigPreset({ minClaimAmount: 20 }, "Telegram trade preset");
-    await sendTelegramTradeSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.MAXPOS_1) {
-    applyConfigPreset({ maxPositions: 1 }, "Telegram risk preset");
-    await sendTelegramRiskSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.MAXPOS_3) {
-    applyConfigPreset({ maxPositions: 3 }, "Telegram risk preset");
-    await sendTelegramRiskSettingsCard();
-    return;
-  }
-  if (normalized === TELEGRAM_LABELS.MAXPOS_5) {
-    applyConfigPreset({ maxPositions: 5 }, "Telegram risk preset");
-    await sendTelegramRiskSettingsCard();
     return;
   }
 

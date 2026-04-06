@@ -20,8 +20,8 @@ export const TELEGRAM_LABELS = {
   BRIEFING: "Briefing",
   DAILY: "Daily",
   MEMORY: "Memory",
-  SETTINGS: "Settings",
   HELP: "Help",
+  SETTINGS: "Settings",
   SETTINGS_SCHEDULE: "Schedule",
   SETTINGS_TRADE: "Trade",
   SETTINGS_RISK: "Risk",
@@ -56,7 +56,6 @@ const BOT_COMMANDS = [
   { command: "briefing", description: "show the morning briefing" },
   { command: "daily", description: "show today's realized summary" },
   { command: "memory", description: "show agent memory" },
-  { command: "settings", description: "open settings menu" },
   { command: "help", description: "show command help" },
 ];
 
@@ -72,8 +71,7 @@ export function getMainMenuMarkup() {
   return keyboard([
     [TELEGRAM_LABELS.STATUS, TELEGRAM_LABELS.POSITIONS],
     [TELEGRAM_LABELS.BRIEFING, TELEGRAM_LABELS.DAILY],
-    [TELEGRAM_LABELS.MEMORY, TELEGRAM_LABELS.SETTINGS],
-    [TELEGRAM_LABELS.HELP],
+    [TELEGRAM_LABELS.MEMORY, TELEGRAM_LABELS.HELP],
   ]);
 }
 
