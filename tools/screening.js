@@ -7,7 +7,6 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
-const DISCORD_SIGNAL_CANDIDATES_URL = "https://api.agentmeridian.xyz/api/signals/discord/candidates";
 const PVP_SHORTLIST_LIMIT = 2;
 const PVP_RIVAL_LIMIT = 2;
 const PVP_MIN_ACTIVE_TVL = 5_000;
@@ -27,7 +26,9 @@ function scoreCandidate(pool) {
 }
 
 async function fetchDiscordSignalCandidates() {
-  const res = await fetch(DISCORD_SIGNAL_CANDIDATES_URL);
+  const res = await fetch(`${config.api.url}/signals/discord/candidates`, {
+    headers: config.api.publicApiKey ? { "x-api-key": config.api.publicApiKey } : {},
+  });
   if (!res.ok) throw new Error(`discord signal candidates ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.candidates) ? data.candidates : [];
@@ -131,13 +132,24 @@ export async function discoverPools({
       : null,
   ].filter(Boolean).join("&&");
 
-  const url = `${POOL_DISCOVERY_BASE}/pools?` +
-    `page_size=${page_size}` +
-    `&filter_by=${encodeURIComponent(filters)}` +
-    `&timeframe=${s.timeframe}` +
-    `&category=${s.category}`;
+  const useServerDiscovery = !!config.api.publicApiKey;
+  const url = useServerDiscovery
+    ? `${config.api.url}/discovery/pools?` +
+      `page_size=${page_size}` +
+      `&filter_by=${encodeURIComponent(filters)}` +
+      `&timeframe=${s.timeframe}` +
+      `&category=${s.category}`
+    : `${POOL_DISCOVERY_BASE}/pools?` +
+      `page_size=${page_size}` +
+      `&filter_by=${encodeURIComponent(filters)}` +
+      `&timeframe=${s.timeframe}` +
+      `&category=${s.category}`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: useServerDiscovery && config.api.publicApiKey
+      ? { "x-api-key": config.api.publicApiKey }
+      : {},
+  });
 
   if (!res.ok) {
     throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
@@ -410,19 +422,26 @@ export async function getTopCandidates({ limit = 10 } = {}) {
  * Returns the full unfiltered API object (all fields, not condensed).
  */
 export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
-  const url = `${POOL_DISCOVERY_BASE}/pools?` +
-    `page_size=1` +
-    `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
-    `&timeframe=${timeframe}`;
+  const useServerDiscovery = !!config.api.publicApiKey;
+  const url = useServerDiscovery
+    ? `${config.api.url}/discovery/pools/${pool_address}?timeframe=${encodeURIComponent(timeframe)}`
+    : `${POOL_DISCOVERY_BASE}/pools?` +
+      `page_size=1` +
+      `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
+      `&timeframe=${timeframe}`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: useServerDiscovery && config.api.publicApiKey
+      ? { "x-api-key": config.api.publicApiKey }
+      : {},
+  });
 
   if (!res.ok) {
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
   }
 
   const data = await res.json();
-  const pool = (data.data || [])[0];
+  const pool = useServerDiscovery ? data : (data.data || [])[0];
 
   if (!pool) {
     throw new Error(`Pool ${pool_address} not found`);
