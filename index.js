@@ -3,7 +3,7 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -19,7 +19,7 @@ import { appendDecision } from "./decision-log.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
-log("startup", `Model: ${process.env.LLM_MODEL || config.llm.generalModel || "MiniMax-M2.7-highspeed"}`);
+log("startup", `Model: ${process.env.LLM_MODEL || config.llm.generalModel || "MiniMax-M2.7"}`);
 
 const TP_PCT = config.management.takeProfitPct;
 const DEPLOY = config.management.deployAmountSol;
@@ -81,6 +81,22 @@ function sanitizeUntrustedPromptText(text, maxLen = 500) {
     .trim()
     .slice(0, maxLen);
   return cleaned ? JSON.stringify(cleaned) : null;
+}
+
+function getLiquidSolEquivalent(balance) {
+  const sol = Number(balance?.sol || 0);
+  const usdc = Number(balance?.usdc || 0);
+  const solPrice = Number(balance?.sol_price || 0);
+  if (!(solPrice > 0)) return sol;
+  return sol + (usdc / solPrice);
+}
+
+function getTargetSolReserve(balance) {
+  const gasReserve = Number(config.management.gasReserve || 0);
+  const solUsdReserve = Number(config.management.solUsdReserve || 0);
+  const solPrice = Number(balance?.sol_price || 0);
+  const reserveFromUsd = solPrice > 0 ? solUsdReserve / solPrice : 0;
+  return Math.max(gasReserve, reserveFromUsd);
 }
 
 function shouldUsePnlRecheck() {
@@ -401,16 +417,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
-    const minRequired = config.management.deployAmountSol + config.management.gasReserve;
+    const liquidSol = getLiquidSolEquivalent(preBalance);
+    const tentativeDeploy = computeDeployAmount(liquidSol);
+    const reserveSol = getTargetSolReserve(preBalance);
+    const minRequired = tentativeDeploy + reserveSol;
     const isDryRun = process.env.DRY_RUN === "true";
-    if (!isDryRun && preBalance.sol < minRequired) {
-      log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
+    if (!isDryRun && liquidSol < minRequired) {
+      log("cron", `Screening skipped — insufficient liquid balance (${liquidSol.toFixed(3)} < ${minRequired.toFixed(3)} SOL equivalent needed)`);
+      screenReport = `Screening skipped — insufficient liquid balance (${liquidSol.toFixed(3)} < ${minRequired.toFixed(3)} SOL equivalent needed for deploy + reserve).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
+        reason: `Insufficient liquid balance (${liquidSol.toFixed(3)} < ${minRequired.toFixed(3)} SOL equivalent)`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -429,8 +448,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
-    const deployAmount = computeDeployAmount(currentBalance.sol);
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
+    const liquidSol = getLiquidSolEquivalent(currentBalance);
+    const deployAmount = computeDeployAmount(liquidSol);
+    log("cron", `Computed deploy amount: ${deployAmount} SOL (liquid: ${liquidSol.toFixed(3)} SOL eq | wallet SOL: ${currentBalance.sol} | USDC: ${currentBalance.usdc})`);
 
     const strategyBlock = `EXECUTION STRATEGY: ${config.strategy.strategy} | bins_above: 0 | deposit: SOL only (amount_y, amount_x=0). Do not invent alternate strategy presets.`;
 
@@ -558,7 +578,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | USDC: ${(currentBalance.usdc ?? 0).toFixed ? currentBalance.usdc.toFixed(2) : currentBalance.usdc} | Liquid: ${liquidSol.toFixed(3)} SOL eq | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
@@ -859,12 +879,17 @@ function describeLatestCandidates(limit = 5) {
 }
 
 function formatWalletStatus(wallet, positions) {
-  const deployAmount = computeDeployAmount(wallet.sol);
+  const liquidSol = getLiquidSolEquivalent(wallet);
+  const deployAmount = computeDeployAmount(liquidSol);
+  const reserveSol = getTargetSolReserve(wallet);
   return [
     `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
+    `USDC: ${wallet.usdc ?? 0}`,
     `SOL price: $${wallet.sol_price}`,
     `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
+    `Liquid buying power: ${liquidSol.toFixed(3)} SOL eq`,
     `Next deploy amount: ${deployAmount} SOL`,
+    `SOL reserve target: ${reserveSol.toFixed(4)} SOL`,
     `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
   ].join("\n");
 }
@@ -1083,11 +1108,15 @@ async function telegramHandler(msg) {
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage(`Closing ${pos.pair}...`);
-      const result = await closePosition({ position_address: pos.position });
+      const result = await executeTool("close_position", {
+        position_address: pos.position,
+        reason: "manual close via telegram",
+      });
       if (result.success) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const parkNote = result.parked_to_usdc ? "\nTreasury: excess SOL parked to USDC." : "";
+        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}${parkNote}`);
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
@@ -1103,8 +1132,12 @@ async function telegramHandler(msg) {
       const results = [];
       for (const pos of positions) {
         try {
-          const result = await closePosition({ position_address: pos.position });
-          results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
+          const result = await executeTool("close_position", {
+            position_address: pos.position,
+            reason: "manual close all via telegram",
+          });
+          const suffix = result.parked_to_usdc ? " + parked to USDC" : "";
+          results.push(`${pos.pair}: ${result.success ? `closed${suffix}` : `failed (${result.error || "unknown"})`}`);
         } catch (error) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }

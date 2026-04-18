@@ -90,7 +90,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | outOfRangeWaitMinutes | management | 30 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
-| managementModel / screeningModel / generalModel | llm | management=`MiniMax-M2.7-highspeed`, screening=`MiniMax-M2.7-highspeed`, general=`MiniMax-M2.7-highspeed` |
+| managementModel / screeningModel / generalModel | llm | management=`MiniMax-M2.7`, screening=`MiniMax-M2.7`, general=`MiniMax-M2.7` |
 
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
 
@@ -177,9 +177,9 @@ const actualBaseFee = baseFactor > 0
 
 ## Model Configuration
 
-- Default per-role models: `management=MiniMax-M2.7-highspeed`, `screening=MiniMax-M2.7-highspeed`, `general=MiniMax-M2.7-highspeed` unless `process.env.LLM_MODEL` overrides them
+- Default per-role models: `management=MiniMax-M2.7`, `screening=MiniMax-M2.7`, `general=MiniMax-M2.7` unless `process.env.LLM_MODEL` overrides them
 - Fallback on transient provider errors: retry the same MiniMax model unless `LLM_FALLBACK_MODEL` is explicitly set
-- Per-role models: `managementModel`, `screeningModel`, `generalModel` in user-config.json
+- Legacy per-role overrides still exist in `user-config.json`, but the preferred runtime default is `LLM_MODEL` in `.env`
 - LM Studio: set `LLM_BASE_URL=http://localhost:1234/v1` and `LLM_API_KEY=lm-studio`
 - `maxOutputTokens` minimum: 2048 (free models may have lower limits causing empty responses)
 

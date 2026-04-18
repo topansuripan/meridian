@@ -31,7 +31,7 @@ if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
 
 const indicatorUserConfig = u.chartIndicators ?? {};
-const DEFAULT_MINIMAX_MODEL = process.env.LLM_MODEL || "MiniMax-M2.7-highspeed";
+const DEFAULT_MINIMAX_MODEL = process.env.LLM_MODEL || "MiniMax-M2.7";
 
 function nonEmptyString(...values) {
   for (const value of values) {
@@ -84,6 +84,9 @@ export const config = {
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    autoParkUsdcAfterClose: u.autoParkUsdcAfterClose ?? true,
+    autoFundSolFromUsdc:    u.autoFundSolFromUsdc    ?? true,
+    solUsdReserve:          u.solUsdReserve          ?? 8,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,

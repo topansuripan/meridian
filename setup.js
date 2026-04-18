@@ -304,7 +304,7 @@ const LLM_PROVIDERS = [
     key:     "minimax",
     baseUrl: "https://api.minimax.io/v1",
     keyHint: "your MiniMax API key",
-    modelDefault: "MiniMax-M2.7-highspeed",
+    modelDefault: "MiniMax-M2.7",
   },
   {
     label:   "OpenAI       (api.openai.com)",
@@ -334,16 +334,16 @@ const provider = LLM_PROVIDERS.find((p) => p.key === providerChoice.key);
 
 let llmBaseUrl = provider.baseUrl;
 if (provider.key === "local" || provider.key === "custom") {
-  llmBaseUrl = await ask("Base URL", e("llmBaseUrl", provider.baseUrl || "http://localhost:1234/v1"));
+  llmBaseUrl = await ask("Base URL", ev("LLM_BASE_URL", provider.baseUrl || "http://localhost:1234/v1"));
 }
 
-const llmApiKeyExisting = e("llmApiKey", existingEnv.LLM_API_KEY || existingEnv.OPENAI_API_KEY || existingEnv.MINIMAX_API_KEY || existingEnv.OPENROUTER_API_KEY || "");
+const llmApiKeyExisting = existingEnv.LLM_API_KEY || existingEnv.OPENAI_API_KEY || existingEnv.MINIMAX_API_KEY || existingEnv.OPENROUTER_API_KEY || "";
 const llmApiKeyRaw = await ask("API Key", llmApiKeyExisting ? "*** (already set)" : (provider.keyHint || ""));
 const llmApiKey   = llmApiKeyRaw.startsWith("***") ? llmApiKeyExisting : llmApiKeyRaw;
 
 const llmModel = await ask(
   "Model name",
-  e("llmModel", process.env.LLM_MODEL || provider.modelDefault)
+  ev("LLM_MODEL", process.env.LLM_MODEL || provider.modelDefault)
 );
 
 rl.close();
@@ -356,6 +356,9 @@ const envMap = {
   ...(isKept(openrouterKey) ? {} : { LLM_API_KEY: openrouterKey }),
   ...(isKept(walletKey)     ? {} : { WALLET_PRIVATE_KEY: walletKey }),
   ...(rpcUrl                ? { RPC_URL: rpcUrl } : {}),
+  ...(llmBaseUrl            ? { LLM_BASE_URL: llmBaseUrl } : {}),
+  ...(llmModel              ? { LLM_MODEL: llmModel } : {}),
+  ...(isKept(llmApiKey)     ? {} : { LLM_API_KEY: llmApiKey }),
   ...(isKept(heliusKey)     ? {} : { HELIUS_API_KEY: heliusKey }),
   ...(isKept(telegramToken) ? {} : { TELEGRAM_BOT_TOKEN: telegramToken }),
   ...(telegramChatId        ? { TELEGRAM_CHAT_ID: telegramChatId } : {}),
@@ -366,8 +369,6 @@ fs.writeFileSync(ENV_PATH, buildEnv(envMap));
 // ─── Write user-config.json ────────────────────────────────────────────────────
 const userConfig = {
   ...existingConfig,
-  preset: presetChoice.key,
-  rpcUrl,
   deployAmountSol,
   maxPositions,
   minSolToOpen,
@@ -380,16 +381,25 @@ const userConfig = {
   outOfRangeWaitMinutes,
   managementIntervalMin,
   screeningIntervalMin,
-  llmProvider: provider.key,
-  llmBaseUrl,
-  llmModel,
-  ...(llmApiKey ? { llmApiKey } : {}),
-  telegramChatId: telegramChatId || "",
-  dryRun,
 };
 
-// Remove legacy key if present
-delete userConfig.emergencyPriceDropPct;
+// Remove legacy keys if present
+for (const legacyKey of [
+  "emergencyPriceDropPct",
+  "preset",
+  "rpcUrl",
+  "llmProvider",
+  "llmBaseUrl",
+  "llmApiKey",
+  "llmModel",
+  "dryRun",
+  "telegramChatId",
+  "managementModel",
+  "screeningModel",
+  "generalModel",
+]) {
+  delete userConfig[legacyKey];
+}
 
 fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
@@ -421,5 +431,5 @@ console.log(`
   Config:       ${CONFIG_PATH}
 
 Run "npm start" to launch the agent.
-${dryRun ? '\n  ⚠ DRY RUN is ON — set dryRun: false in user-config.json when ready for live trading.\n' : ""}
+${dryRun ? '\n  ⚠ DRY RUN is ON — set DRY_RUN=false in .env when ready for live trading.\n' : ""}
 `);

@@ -283,7 +283,7 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
           },
           skip_swap: {
             type: "boolean",
-            description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-swaps base token back to SOL)."
+            description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-zaps back to SOL, then parks excess SOL into USDC while keeping a small SOL reserve)."
           },
           reason: {
             type: "string",

@@ -1,11 +1,4 @@
 {
-  "preset": "custom",
-  "rpcUrl": "https://pump.helius-rpc.com",
-  "llmBaseUrl": "https://api.minimax.io/v1",
-  "llmApiKey": "",
-  "llmModel": "MiniMax-M2.7-highspeed",
-  "dryRun": true,
-
   "deployAmountSol": 0.5,
   "maxPositions": 3,
   "minSolToOpen": 0.55,
@@ -46,6 +39,9 @@
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,
+  "autoParkUsdcAfterClose": true,
+  "autoFundSolFromUsdc": true,
+  "solUsdReserve": 8,
   "outOfRangeBinsToClose": 10,
   "outOfRangeWaitMinutes": 30,
   "oorCooldownTriggerCount": 3,
@@ -64,14 +60,6 @@
 
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
-  "healthCheckIntervalMin": 60,
-
-  "temperature": 0.373,
-  "maxTokens": 4096,
-  "maxSteps": 20,
-  "managementModel": "MiniMax-M2.7-highspeed",
-  "screeningModel": "MiniMax-M2.7-highspeed",
-  "generalModel": "MiniMax-M2.7-highspeed",
 
   "darwinEnabled": true,
   "darwinWindowDays": 60,
@@ -97,7 +85,6 @@
     "rsiOverbought": 80,
     "requireAllIntervals": false
   },
-  "telegramChatId": "",
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
   "hiveMindPullMode": "auto"

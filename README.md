@@ -75,7 +75,7 @@ WALLET_PRIVATE_KEY=your_base58_private_key
 RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 LLM_BASE_URL=https://api.minimax.io/v1
 LLM_API_KEY=your_minimax_api_key
-LLM_MODEL=MiniMax-M2.7-highspeed
+LLM_MODEL=MiniMax-M2.7
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
 TELEGRAM_CHAT_ID=                       # set explicitly
@@ -412,6 +412,9 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
 | `stopLossPct` | `-15` | Close position if price drops by this % |
+| `autoParkUsdcAfterClose` | `true` | After close, park excess SOL into USDC automatically |
+| `autoFundSolFromUsdc` | `true` | Before deploy, top up SOL from USDC automatically if needed |
+| `solUsdReserve` | `8` | Approximate SOL buffer in USD to keep for gas and safety |
 
 ### Schedule
 
@@ -422,13 +425,13 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 ### Models
 
+Role defaults resolve from `LLM_MODEL` in `.env`. Current default:
+
 | Field | Default | Description |
 |---|---|---|
-| `managementModel` | `MiniMax-M2.7-highspeed` | LLM for management cycles |
-| `screeningModel` | `MiniMax-M2.7-highspeed` | LLM for screening cycles |
-| `generalModel` | `MiniMax-M2.7-highspeed` | LLM for REPL / chat |
+| `LLM_MODEL` | `MiniMax-M2.7` | Shared default for management, screening, and general chat |
 
-> Override model at runtime: edit `user-config.json` and restart the bot if needed.
+> Override the model by editing `.env` and restarting the bot.
 
 ---
 
