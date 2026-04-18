@@ -53,7 +53,7 @@ Agents are powered via **MiniMax** by default through its OpenAI-compatible API 
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/yunus-0x/meridian
+git clone https://github.com/0xprune/meridian
 cd meridian
 npm install
 ```
@@ -64,7 +64,7 @@ npm install
 npm run setup
 ```
 
-The wizard walks you through creating `.env` (API keys, wallet, RPC, Telegram) and `user-config.json` (risk preset, deploy size, thresholds, models). Takes about 2 minutes.
+The wizard walks you through creating `.env` (API keys, wallet, RPC, Telegram) and `user-config.json` (deploy size, thresholds, schedules, models). Takes about 2 minutes.
 
 **Or set up manually:**
 
@@ -78,7 +78,8 @@ LLM_API_KEY=your_minimax_api_key
 LLM_MODEL=MiniMax-M2.7-highspeed
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
-TELEGRAM_CHAT_ID=                       # auto-filled on first message
+TELEGRAM_CHAT_ID=                       # set explicitly
+TELEGRAM_ALLOWED_USER_IDS=              # set explicitly for command/control
 DRY_RUN=true                            # set false for live trading
 ```
 
@@ -127,7 +128,7 @@ REPL commands:
 | `/learn` | Study top LPers across all current candidate pools |
 | `/learn <pool_address>` | Study top LPers for a specific pool |
 | `/thresholds` | Current screening thresholds and performance stats |
-| `/evolve` | Trigger threshold evolution from performance data (needs 5+ closed positions) |
+| `/evolve` | Manually trigger threshold evolution from performance data (needs 5+ closed positions) |
 | `/stop` | Graceful shutdown |
 | `<anything>` | Free-form chat — ask the agent anything, request actions, analyze pools |
 
@@ -350,13 +351,15 @@ Add known rug/farm deployer wallet addresses to `deployer-blacklist.json`:
 
 1. Create a bot via [@BotFather](https://t.me/BotFather) and copy the token
 2. Add `TELEGRAM_BOT_TOKEN=<token>` to your `.env`
-3. Start the agent, then send any message to your bot — it auto-registers your chat ID
+3. Set `TELEGRAM_CHAT_ID` and `TELEGRAM_ALLOWED_USER_IDS` explicitly in `.env`
 
 ### Notifications
 
 Meridian sends notifications automatically for:
-- Management cycle reports (reasoning + decisions)
-- Screening cycle reports (what it found, whether it deployed)
+- Critical management alerts such as meaningful OOR events
+- Screening alerts when a good candidate is found but deployment is blocked
+- Deploy notifications
+- Close notifications with PnL context
 - OOR alerts when a position leaves range past `outOfRangeWaitMinutes`
 - Deploy: pair, amount, position address, tx hash
 - Close: pair and PnL
@@ -451,11 +454,12 @@ Security notes:
 - Notifications still go to the configured chat, but command/control is limited to the allowed user IDs.
 
 **Notifications sent:**
-- After every management cycle: full agent report (reasoning + decisions)
-- After every screening cycle: full agent report (what it found, whether it deployed)
-- When a position goes out of range past `outOfRangeWaitMinutes`
+- Critical management alerts such as meaningful out-of-range events
+- Screening alerts when a good candidate is found but deployment is blocked
 - On deploy: pair, amount, position address, tx hash
-- On close: pair and PnL
+- On close: pair, PnL, and PnL card link
+
+Full management and screening reports are intended to be opened on demand from Telegram or the terminal, rather than spammed every cycle.
 
 You can also chat with the agent via Telegram using the same free-form interface as the REPL: `"check wallet 7tB8..."`, `"who are the top LPers in pool ABC..."`, `"close all positions"`, etc. Only explicitly allowed Telegram user IDs can issue commands.
 
@@ -465,7 +469,7 @@ You can also chat with the agent via Telegram using the same free-form interface
 
 ### Lessons
 
-After every closed position the agent runs `studyTopLPers` on candidate pools, analyzes on-chain behavior of top performers (hold duration, entry/exit timing, win rates), and saves concrete lessons. Lessons are injected into subsequent agent cycles as part of the system context.
+After every closed position the agent records local performance and derives local lessons. Those lessons are injected back into subsequent cycles as part of the system context.
 
 Add a lesson manually:
 ```bash
@@ -479,29 +483,7 @@ After 5+ positions have been closed, run:
 node cli.js evolve
 ```
 
-This analyzes closed position performance (win rate, avg PnL, fee yields) and automatically adjusts screening thresholds in `user-config.json`. Changes take effect immediately.
-
----
-
-## HiveMind
-
-HiveMind sync uses Agent Meridian by default. Shared lessons, presets, and performance summaries are routed through the configured Agent Meridian API.
-
-**What you get:** shared lessons, strategy presets, and crowd performance context from other Meridian agents.
-
-**What you share:** lessons and closed-position performance. Wallet private keys and balances are never sent.
-
-### Setup
-
-No manual HiveMind registration is required for the shared Agent Meridian setup. `hiveMindUrl`, `hiveMindApiKey`, and `publicApiKey` have built-in Agent Meridian defaults.
-
-### Disable
-
-HiveMind disable behavior needs an explicit config flag before empty strings can be used as a disable mechanism. Empty strings currently fall back to Agent Meridian defaults.
-
-### Self-hosting
-
-See [meridian-hive](https://github.com/fciaf420/meridian-hive) for the server source.
+This analyzes closed position performance (win rate, avg PnL, fee yields) and suggests threshold changes in `user-config.json`. Use it deliberately after enough samples rather than letting the bot drift on tiny datasets.
 
 ---
 
@@ -525,11 +507,10 @@ agent.js            ReAct loop: LLM → tool call → repeat
 config.js           Runtime config from user-config.json + .env
 prompt.js           System prompt builder (SCREENER / MANAGER / GENERAL roles)
 state.js            Position registry (state.json)
-lessons.js          Learning engine: records performance, derives lessons, evolves thresholds
+lessons.js          Local learning engine: records performance, derives lessons, supports manual threshold evolution
 pool-memory.js      Per-pool deploy history + snapshots
 strategy-library.js Saved LP strategies
 telegram.js         Telegram bot: polling + notifications
-hivemind.js         Agent Meridian HiveMind sync
 smart-wallets.js    KOL/alpha wallet tracker
 token-blacklist.js  Permanent token blacklist
 cli.js              Direct CLI — every tool as a subcommand with JSON output
