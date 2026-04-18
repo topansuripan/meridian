@@ -17,7 +17,7 @@ pool-memory.js      Per-pool deploy history + snapshots (pool-memory.json)
 strategy-library.js Saved LP strategies (strategy-library.json)
 briefing.js         Daily Telegram briefing (HTML)
 telegram.js         Telegram bot: polling, notifications (deploy/close/swap/OOR)
-hive-mind.js        Optional collective intelligence server sync
+hivemind.js         Agent Meridian HiveMind sync
 smart-wallets.js    KOL/alpha wallet tracker (smart-wallets.json)
 token-blacklist.js  Permanent token blacklist (token-blacklist.json)
 logger.js           Daily-rotating log files + action audit trail
@@ -90,7 +90,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | outOfRangeWaitMinutes | management | 30 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
-| managementModel / screeningModel / generalModel | llm | management=`minimax/minimax-m2.7`, screening=`minimax/minimax-m2.7`, general=`minimax/minimax-m2.7` |
+| managementModel / screeningModel / generalModel | llm | management=`MiniMax-M2.7-highspeed`, screening=`MiniMax-M2.7-highspeed`, general=`MiniMax-M2.7-highspeed` |
 
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
 
@@ -177,8 +177,8 @@ const actualBaseFee = baseFactor > 0
 
 ## Model Configuration
 
-- Default per-role models: `management=minimax/minimax-m2.7`, `screening=minimax/minimax-m2.7`, `general=minimax/minimax-m2.7` unless `process.env.LLM_MODEL` overrides them
-- Fallback on 502/503/529: `minimax/minimax-m2.7` (2nd attempt), then retry
+- Default per-role models: `management=MiniMax-M2.7-highspeed`, `screening=MiniMax-M2.7-highspeed`, `general=MiniMax-M2.7-highspeed` unless `process.env.LLM_MODEL` overrides them
+- Fallback on transient provider errors: retry the same MiniMax model unless `LLM_FALLBACK_MODEL` is explicitly set
 - Per-role models: `managementModel`, `screeningModel`, `generalModel` in user-config.json
 - LM Studio: set `LLM_BASE_URL=http://localhost:1234/v1` and `LLM_API_KEY=lm-studio`
 - `maxOutputTokens` minimum: 2048 (free models may have lower limits causing empty responses)
@@ -195,11 +195,9 @@ const actualBaseFee = baseFactor > 0
 
 ---
 
-## Hive Mind (hive-mind.js)
+## HiveMind
 
-Optional feature. Enabled by setting `HIVE_MIND_URL` and `HIVE_MIND_API_KEY` in `.env`.
-Syncs lessons/deploys to a shared server, queries consensus patterns.
-Not required for normal operation.
+Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent Meridian defaults unless overridden by config or env.
 
 ---
 
@@ -209,7 +207,7 @@ Not required for normal operation.
 |-----|----------|---------|
 | `WALLET_PRIVATE_KEY` | Yes | Base58 or JSON array private key |
 | `RPC_URL` | Yes | Solana RPC endpoint |
-| `OPENROUTER_API_KEY` | Yes | LLM API key |
+| `LLM_API_KEY` | Yes | MiniMax or other OpenAI-compatible LLM API key |
 | `TELEGRAM_BOT_TOKEN` | No | Telegram notifications |
 | `TELEGRAM_CHAT_ID` | No | Telegram chat target |
 | `LLM_BASE_URL` | No | Override for local LLM (e.g. LM Studio) |

@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -17,6 +18,18 @@ const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 const LESSONS_FILE = "./lessons.json";
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
+const MAX_MANUAL_LESSON_LENGTH = 400;
+
+function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
+  if (text == null) return null;
+  const cleaned = String(text)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[<>`]/g, "")
+    .trim()
+    .slice(0, maxLen);
+  return cleaned || null;
+}
 
 function load() {
   if (!fs.existsSync(LESSONS_FILE)) {
@@ -60,6 +73,22 @@ function save(data) {
 export async function recordPerformance(perf) {
   const data = load();
 
+  // Guard against unit-mixed records where a SOL-sized final value is
+  // accidentally written into a USD field (e.g. final_value_usd = 2 for a 2 SOL close).
+  const suspiciousUnitMix =
+    Number.isFinite(perf.initial_value_usd) &&
+    Number.isFinite(perf.final_value_usd) &&
+    Number.isFinite(perf.amount_sol) &&
+    perf.initial_value_usd >= 20 &&
+    perf.amount_sol >= 0.25 &&
+    perf.final_value_usd > 0 &&
+    perf.final_value_usd <= perf.amount_sol * 2;
+
+  if (suspiciousUnitMix) {
+    log("lessons_warn", `Skipped suspicious performance record for ${perf.pool_name || perf.pool}: initial=${perf.initial_value_usd}, final=${perf.final_value_usd}, amount_sol=${perf.amount_sol}`);
+    return;
+  }
+
   const pnl_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
   const pnl_pct = perf.initial_value_usd > 0
     ? (pnl_usd / perf.initial_value_usd) * 100
@@ -67,6 +96,18 @@ export async function recordPerformance(perf) {
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
+
+  const closeReasonText = String(perf.close_reason || "").toLowerCase();
+  const suspiciousAbsurdClosedPnl =
+    Number.isFinite(pnl_pct) &&
+    perf.initial_value_usd >= 20 &&
+    pnl_pct <= -90 &&
+    !closeReasonText.includes("stop loss");
+
+  if (suspiciousAbsurdClosedPnl) {
+    log("lessons_warn", `Skipped absurd closed PnL record for ${perf.pool_name || perf.pool}: pnl_pct=${pnl_pct.toFixed(2)} reason=${perf.close_reason}`);
+    return;
+  }
 
   const entry = {
     ...perf,
@@ -86,6 +127,9 @@ export async function recordPerformance(perf) {
   }
 
   save(data);
+  if (lesson) {
+    void pushHiveLesson(lesson);
+  }
 
   // Update pool-level memory
   if (perf.pool) {
@@ -126,10 +170,24 @@ export async function recordPerformance(perf) {
       reloadScreeningThresholds();
       log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
     }
+
+    // Darwinian signal weight recalculation
+    if (config.darwin?.enabled) {
+      const { recalculateWeights } = await import("./signal-weights.js");
+      const wResult = recalculateWeights(data.performance, config);
+      if (wResult.changes.length > 0) {
+        log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
+      }
+    }
   }
 
-  // Fire-and-forget sync to hive mind (if enabled)
-  import("./hive-mind.js").then(m => m.syncToHive()).catch(() => {});
+  void pushHivePerformanceEvent({
+    ...entry,
+    base_mint: perf.base_mint || null,
+    fees_earned_sol: perf.fees_earned_sol || 0,
+    eventId: `close:${perf.position}:${entry.recorded_at}`,
+  });
+
 }
 
 /**
@@ -138,9 +196,13 @@ export async function recordPerformance(perf) {
  */
 function derivLesson(perf) {
   const tags = [];
+  const feeYieldPct = perf.initial_value_usd > 0
+    ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100
+    : 0;
 
   // Categorize outcome
   const outcome = perf.pnl_pct >= 5 ? "good"
+    : (perf.pnl_pct >= 0 && feeYieldPct >= 2) ? "good"
     : perf.pnl_pct >= 0 ? "neutral"
     : perf.pnl_pct >= -5 ? "poor"
     : "bad";
@@ -181,14 +243,41 @@ function derivLesson(perf) {
 
   if (!rule) return null;
 
+  const closeReasonText = String(perf.close_reason || "").toLowerCase();
+  const positiveEvidence =
+    feeYieldPct >= 1 ||
+    (perf.fees_earned_usd || 0) >= 3 ||
+    perf.pnl_pct >= 3;
+  const negativeEvidence =
+    perf.pnl_pct <= -5 ||
+    perf.range_efficiency <= 30 ||
+    closeReasonText.includes("out of range") ||
+    closeReasonText.includes("oor") ||
+    closeReasonText.includes("low yield") ||
+    closeReasonText.includes("volume");
+
+  let confidence = 0.35;
+  if (outcome === "good") {
+    confidence = positiveEvidence ? 0.82 : 0.22;
+  } else if (outcome === "bad") {
+    confidence = negativeEvidence ? 0.88 : 0.45;
+  } else if (outcome === "poor") {
+    confidence = negativeEvidence ? 0.68 : 0.32;
+  }
+
   return {
     id: Date.now(),
     rule,
     tags,
     outcome,
+    sourceType: "performance",
+    confidence: Math.round(confidence * 100) / 100,
     context,
     pnl_pct: perf.pnl_pct,
+    fees_earned_usd: perf.fees_earned_usd,
+    initial_value_usd: perf.initial_value_usd,
     range_efficiency: perf.range_efficiency,
+    close_reason: perf.close_reason,
     pool: perf.pool,
     created_at: new Date().toISOString(),
   };
@@ -393,18 +482,23 @@ function nudge(current, target, maxChange) {
  * @param {string}   opts.role   - "SCREENER" | "MANAGER" | "GENERAL" | null (all roles)
  */
 export function addLesson(rule, tags = [], { pinned = false, role = null } = {}) {
+  const safeRule = sanitizeLessonText(rule);
+  if (!safeRule) return;
   const data = load();
-  data.lessons.push({
+  const lesson = {
     id: Date.now(),
-    rule,
+    rule: safeRule,
     tags,
     outcome: "manual",
+    sourceType: tags.includes("self_tune") || tags.includes("config_change") ? "config_change" : "manual",
     pinned: !!pinned,
     role: role || null,
     created_at: new Date().toISOString(),
-  });
+  };
+  data.lessons.push(lesson);
   save(data);
-  log("lessons", `Manual lesson added${pinned ? " [PINNED]" : ""}${role ? ` [${role}]` : ""}: ${rule}`);
+  log("lessons", `Manual lesson added${pinned ? " [PINNED]" : ""}${role ? ` [${role}]` : ""}: ${safeRule}`);
+  void pushHiveLesson(lesson);
 }
 
 /**
@@ -455,17 +549,6 @@ export function listLessons({ role = null, pinned = null, tag = null, limit = 30
       created_at: l.created_at?.slice(0, 10),
     })),
   };
-}
-
-/**
- * Remove a lesson by ID.
- */
-export function removeLesson(id) {
-  const data = load();
-  const before = data.lessons.length;
-  data.lessons = data.lessons.filter((l) => l.id !== id);
-  save(data);
-  return before - data.lessons.length;
 }
 
 /**
@@ -575,12 +658,17 @@ export function getLessonsForPrompt(opts = {}) {
     : [];
 
   const selected = [...pinned, ...roleMatched, ...recent];
-  if (selected.length === 0) return null;
+  const shared = getSharedLessonsForPrompt({
+    agentType,
+    maxLessons: isAutoCycle ? 4 : 6,
+  });
+  if (selected.length === 0 && !shared) return null;
 
   const sections = [];
   if (pinned.length)      sections.push(`── PINNED (${pinned.length}) ──\n` + fmt(pinned));
   if (roleMatched.length) sections.push(`── ${agentType} (${roleMatched.length}) ──\n` + fmt(roleMatched));
   if (recent.length)      sections.push(`── RECENT (${recent.length}) ──\n` + fmt(recent));
+  if (shared)             sections.push(`── HIVEMIND ──\n${shared}`);
 
   return sections.join("\n\n");
 }

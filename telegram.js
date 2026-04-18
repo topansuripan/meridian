@@ -8,126 +8,19 @@ const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
+const ALLOWED_USER_IDS = new Set(
+  String(process.env.TELEGRAM_ALLOWED_USER_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
 let chatId   = process.env.TELEGRAM_CHAT_ID || null;
 let _offset  = 0;
 let _polling = false;
-
-export const TELEGRAM_LABELS = {
-  MENU: "Menu",
-  STATUS: "Status",
-  POSITIONS: "Positions",
-  BRIEFING: "Briefing",
-  DAILY: "Daily",
-  MEMORY: "Memory",
-  HELP: "Help",
-  SETTINGS: "Settings",
-  SETTINGS_SCHEDULE: "Schedule",
-  SETTINGS_TRADE: "Trade",
-  SETTINGS_RISK: "Risk",
-  MGMT_MANUAL: "Mgmt Manual",
-  MGMT_247: "Mgmt 24/7",
-  MGMT_15M: "Mgmt 15m",
-  MGMT_30M: "Mgmt 30m",
-  SCREEN_MANUAL: "Screen Manual",
-  SCREEN_247: "Screen 24/7",
-  SCREEN_30M: "Screen 30m",
-  SCREEN_60M: "Screen 60m",
-  DEPLOY_05: "Deploy 3.0",
-  DEPLOY_10: "Deploy 3.5",
-  DEPLOY_20: "Deploy 4.0",
-  TP_3: "TP 3%",
-  TP_5: "TP 5%",
-  TP_8: "TP 8%",
-  CLAIM_5: "Claim $5",
-  CLAIM_10: "Claim $10",
-  CLAIM_20: "Claim $20",
-  MAXPOS_1: "MaxPos 1",
-  MAXPOS_3: "MaxPos 3",
-  MAXPOS_5: "MaxPos 5",
-  POSITIONS_BACK: "Back to Positions",
-  BACK: "Back to Menu",
-};
-
-const BOT_COMMANDS = [
-  { command: "home", description: "open the main control menu" },
-  { command: "status", description: "show wallet and cycle status" },
-  { command: "positions", description: "show open positions" },
-  { command: "briefing", description: "show the morning briefing" },
-  { command: "daily", description: "show today's realized summary" },
-  { command: "memory", description: "show agent memory" },
-  { command: "help", description: "show command help" },
-];
-
-function keyboard(rows) {
-  return {
-    keyboard: rows.map((row) => row.map((text) => ({ text }))),
-    resize_keyboard: true,
-    input_field_placeholder: "Choose a menu or type a request",
-  };
-}
-
-export function getMainMenuMarkup() {
-  return keyboard([
-    [TELEGRAM_LABELS.STATUS, TELEGRAM_LABELS.POSITIONS],
-    [TELEGRAM_LABELS.BRIEFING, TELEGRAM_LABELS.DAILY],
-    [TELEGRAM_LABELS.MEMORY, TELEGRAM_LABELS.HELP],
-  ]);
-}
-
-export function getSettingsMenuMarkup() {
-  return keyboard([
-    [TELEGRAM_LABELS.SETTINGS_SCHEDULE, TELEGRAM_LABELS.SETTINGS_TRADE, TELEGRAM_LABELS.SETTINGS_RISK],
-    [TELEGRAM_LABELS.BACK],
-  ]);
-}
-
-export function getScheduleMenuMarkup() {
-  return keyboard([
-    [TELEGRAM_LABELS.MGMT_MANUAL, TELEGRAM_LABELS.MGMT_247, TELEGRAM_LABELS.MGMT_15M, TELEGRAM_LABELS.MGMT_30M],
-    [TELEGRAM_LABELS.SCREEN_MANUAL, TELEGRAM_LABELS.SCREEN_247, TELEGRAM_LABELS.SCREEN_30M, TELEGRAM_LABELS.SCREEN_60M],
-    [TELEGRAM_LABELS.SETTINGS, TELEGRAM_LABELS.BACK],
-  ]);
-}
-
-export function getTradeSettingsMenuMarkup() {
-  return keyboard([
-    [TELEGRAM_LABELS.DEPLOY_05, TELEGRAM_LABELS.DEPLOY_10, TELEGRAM_LABELS.DEPLOY_20],
-    [TELEGRAM_LABELS.TP_3, TELEGRAM_LABELS.TP_5, TELEGRAM_LABELS.TP_8],
-    [TELEGRAM_LABELS.CLAIM_5, TELEGRAM_LABELS.CLAIM_10, TELEGRAM_LABELS.CLAIM_20],
-    [TELEGRAM_LABELS.SETTINGS, TELEGRAM_LABELS.BACK],
-  ]);
-}
-
-export function getRiskSettingsMenuMarkup() {
-  return keyboard([
-    [TELEGRAM_LABELS.MAXPOS_1, TELEGRAM_LABELS.MAXPOS_3, TELEGRAM_LABELS.MAXPOS_5],
-    [TELEGRAM_LABELS.SETTINGS, TELEGRAM_LABELS.BACK],
-  ]);
-}
-
-export function getPositionsMenuMarkup(positions = []) {
-  const rows = [];
-  for (let i = 0; i < positions.length; i += 2) {
-    rows.push(
-      positions.slice(i, i + 2).map((p, offset) => {
-        const idx = i + offset + 1;
-        const label = `${idx}. ${(p.pair || "Position").slice(0, 18)}`;
-        return label;
-      })
-    );
-  }
-  rows.push([TELEGRAM_LABELS.POSITIONS_BACK, TELEGRAM_LABELS.BACK]);
-  return keyboard(rows);
-}
-
-export function getPositionActionMenuMarkup(index) {
-  return keyboard([
-    [`Close #${index}`, `Hold #${index}`],
-    [`TP5 #${index}`, TELEGRAM_LABELS.POSITIONS_BACK],
-    [TELEGRAM_LABELS.BACK],
-  ]);
-}
+let _liveMessageDepth = 0;
+let _warnedMissingChatId = false;
+let _warnedMissingAllowedUsers = false;
 
 // ─── chatId persistence ──────────────────────────────────────────
 function loadChatId() {
@@ -136,7 +29,9 @@ function loadChatId() {
       const cfg = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
       if (cfg.telegramChatId) chatId = cfg.telegramChatId;
     }
-  } catch { /**/ }
+  } catch (error) {
+    log("telegram_warn", `Invalid user-config.json; chatId not loaded: ${error.message}`);
+  }
 }
 
 function saveChatId(id) {
@@ -153,130 +48,254 @@ function saveChatId(id) {
 
 loadChatId();
 
+function isAuthorizedIncomingMessage(msg) {
+  const incomingChatId = String(msg.chat?.id || "");
+  const senderUserId = msg.from?.id != null ? String(msg.from.id) : null;
+  const chatType = msg.chat?.type || "unknown";
+
+  if (!chatId) {
+    if (!_warnedMissingChatId) {
+      log("telegram_warn", "Ignoring inbound Telegram messages because TELEGRAM_CHAT_ID / user-config.telegramChatId is not configured. Auto-registration is disabled for safety.");
+      _warnedMissingChatId = true;
+    }
+    return false;
+  }
+
+  if (incomingChatId !== chatId) return false;
+
+  if (chatType !== "private" && ALLOWED_USER_IDS.size === 0) {
+    if (!_warnedMissingAllowedUsers) {
+      log("telegram_warn", "Ignoring group Telegram messages because TELEGRAM_ALLOWED_USER_IDS is not configured. Set explicit allowed user IDs for command/control.");
+      _warnedMissingAllowedUsers = true;
+    }
+    return false;
+  }
+
+  if (ALLOWED_USER_IDS.size > 0) {
+    if (!senderUserId || !ALLOWED_USER_IDS.has(senderUserId)) return false;
+  }
+
+  return true;
+}
+
 // ─── Core send ───────────────────────────────────────────────────
 export function isEnabled() {
   return !!TOKEN;
 }
 
-export function removeKeyboardMarkup() {
-  return { remove_keyboard: true };
-}
-
-export async function sendMessage(text, options = {}) {
-  if (!TOKEN || !chatId) return;
+async function postTelegram(method, body) {
+  if (!TOKEN || !chatId) return null;
   try {
-    const res = await fetch(`${BASE}/sendMessage`, {
+    const res = await fetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: String(text).slice(0, 4096),
-        reply_markup: options.reply_markup,
-        parse_mode: options.parse_mode,
-      }),
+      body: JSON.stringify({ chat_id: chatId, ...body }),
     });
     if (!res.ok) {
       const err = await res.text();
-      log("telegram_error", `sendMessage ${res.status}: ${err.slice(0, 100)}`);
+      log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
+      return null;
     }
+    return await res.json();
   } catch (e) {
-    log("telegram_error", `sendMessage failed: ${e.message}`);
+    log("telegram_error", `${method} failed: ${e.message}`);
+    return null;
   }
 }
 
-/** Send a "typing" chat action to show the bot is processing. */
-export async function sendTyping() {
+export async function sendMessage(text) {
   if (!TOKEN || !chatId) return;
-  try {
-    await fetch(`${BASE}/sendChatAction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, action: "typing" }),
-    });
-  } catch { /* non-critical */ }
+  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
 }
 
-export async function sendHTML(html, options = {}) {
+export async function sendHTML(html) {
   if (!TOKEN || !chatId) return;
-  const CHUNK = 4096;
-  const text = html;
-  // Split into chunks at newline boundaries to avoid breaking HTML tags mid-chunk
-  const chunks = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= CHUNK) {
-      chunks.push(remaining);
-      break;
+  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+}
+
+async function editMessage(text, messageId) {
+  if (!TOKEN || !chatId || !messageId) return null;
+  return postTelegram("editMessageText", {
+    message_id: messageId,
+    text: String(text).slice(0, 4096),
+  });
+}
+
+function hasActiveLiveMessage() {
+  return _liveMessageDepth > 0;
+}
+
+function createTypingIndicator() {
+  if (!TOKEN || !chatId) {
+    return { stop() {} };
+  }
+
+  let stopped = false;
+  let timer = null;
+
+  async function tick() {
+    if (stopped) return;
+    await postTelegram("sendChatAction", { action: "typing" });
+    timer = setTimeout(() => {
+      tick().catch(() => null);
+    }, 4000);
+  }
+
+  tick().catch(() => null);
+
+  return {
+    stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+    },
+  };
+}
+
+function toolLabel(name) {
+  const labels = {
+    get_token_info: "get token info",
+    get_token_narrative: "get token narrative",
+    get_token_holders: "get token holders",
+    get_top_candidates: "get top candidates",
+    get_pool_detail: "get pool detail",
+    get_active_bin: "get active bin",
+    deploy_position: "deploy position",
+    close_position: "close position",
+    claim_fees: "claim fees",
+    swap_token: "swap token",
+    update_config: "update config",
+    get_my_positions: "get positions",
+    get_wallet_balance: "get wallet balance",
+    check_smart_wallets_on_pool: "check smart wallets",
+    study_top_lpers: "study top LPers",
+    get_top_lpers: "get top LPers",
+    search_pools: "search pools",
+    discover_pools: "discover pools",
+  };
+  return labels[name] || name.replace(/_/g, " ");
+}
+
+function summarizeToolResult(name, result) {
+  if (!result) return "";
+  if (result.error) return result.error;
+  if (result.reason && result.blocked) return result.reason;
+  switch (name) {
+    case "deploy_position":
+      return result.position ? `position ${String(result.position).slice(0, 8)}...` : "submitted";
+    case "close_position":
+      return result.success ? "closed" : (result.reason || "failed");
+    case "claim_fees":
+      return result.claimed_amount != null ? `claimed ${result.claimed_amount}` : "done";
+    case "update_config":
+      return Object.keys(result.applied || {}).join(", ") || "updated";
+    case "get_top_candidates":
+      return `${result.candidates?.length ?? 0} candidates`;
+    case "get_my_positions":
+      return `${result.total_positions ?? result.positions?.length ?? 0} positions`;
+    case "get_wallet_balance":
+      return `${result.sol ?? "?"} SOL`;
+    case "study_top_lpers":
+    case "get_top_lpers":
+      return `${result.lpers?.length ?? 0} LPers`;
+    default:
+      return result.success === false ? "failed" : "done";
+  }
+}
+
+export async function createLiveMessage(title, intro = "Starting...") {
+  if (!TOKEN || !chatId) return null;
+  const typing = createTypingIndicator();
+
+  const state = {
+    title,
+    intro,
+    toolLines: [],
+    footer: "",
+    messageId: null,
+    flushTimer: null,
+    flushPromise: null,
+    flushRequested: false,
+  };
+
+  function render() {
+    const sections = [state.title];
+    if (state.intro) sections.push(state.intro);
+    if (state.toolLines.length > 0) sections.push(state.toolLines.join("\n"));
+    if (state.footer) sections.push(state.footer);
+    return sections.join("\n\n").slice(0, 4096);
+  }
+
+  async function flushNow() {
+    state.flushTimer = null;
+    state.flushRequested = false;
+    const text = render();
+    if (!state.messageId) {
+      const sent = await sendMessage(text);
+      state.messageId = sent?.result?.message_id ?? null;
+      return;
     }
-    // Find last newline before the chunk limit
-    const cut = remaining.lastIndexOf("\n", CHUNK);
-    const splitAt = cut > 0 ? cut : CHUNK;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
+    await editMessage(text, state.messageId);
   }
 
-  for (const chunk of chunks) {
-    try {
-      const res = await fetch(`${BASE}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: chunk,
-          parse_mode: "HTML",
-          reply_markup: options.reply_markup,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.text();
-        log("telegram_error", `sendHTML ${res.status}: ${err.slice(0, 100)}`);
+  function scheduleFlush(delay = 300) {
+    if (state.flushTimer) {
+      state.flushRequested = true;
+      return;
+    }
+    state.flushTimer = setTimeout(() => {
+      state.flushPromise = flushNow().catch(() => null);
+    }, delay);
+  }
+
+  async function upsertToolLine(name, icon, suffix = "") {
+    const label = toolLabel(name);
+    const line = `${icon} ${label}${suffix ? ` ${suffix}` : ""}`;
+    const idx = state.toolLines.findIndex((entry) => entry.includes(` ${label}`));
+    if (idx >= 0) state.toolLines[idx] = line;
+    else state.toolLines.push(line);
+    scheduleFlush();
+  }
+
+  _liveMessageDepth += 1;
+  await flushNow();
+
+  return {
+    async toolStart(name) {
+      await upsertToolLine(name, "ℹ️", "...");
+    },
+    async toolFinish(name, result, success) {
+      const icon = success ? "✅" : "❌";
+      const summary = summarizeToolResult(name, result);
+      await upsertToolLine(name, icon, summary ? `— ${summary}` : "");
+    },
+    async note(text) {
+      state.intro = text;
+      scheduleFlush();
+    },
+    async finalize(finalText) {
+      if (state.flushTimer) {
+        clearTimeout(state.flushTimer);
+        state.flushTimer = null;
       }
-    } catch (e) {
-      log("telegram_error", `sendHTML failed: ${e.message}`);
-    }
-  }
-}
-
-/** Notify about an agent self-tuning event. */
-export async function notifyConfigChange(key, oldVal, newVal, reason = "") {
-  await sendHTML(
-    `🔧 <b>Self-Tuned</b>\n` +
-    `<code>${key}</code>: ${oldVal} → ${newVal}\n` +
-    (reason ? `Reason: ${reason}` : "")
-  );
-}
-
-export async function sendMainMenu(text = "Menu siap. Pilih aksi di bawah atau ketik pesan bebas.") {
-  await sendMessage(text, { reply_markup: removeKeyboardMarkup() });
-}
-
-export async function sendSettingsMenu(text = "Atur jadwal agent dari tombol di bawah. Mode manual artinya hanya jalan saat kamu tekan menu.") {
-  await sendMessage(text, { reply_markup: getSettingsMenuMarkup() });
-}
-
-export async function syncTelegramCommands() {
-  if (!TOKEN) return;
-
-  try {
-    await fetch(`${BASE}/setMyCommands`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ commands: BOT_COMMANDS }),
-    });
-
-    if (chatId) {
-      await fetch(`${BASE}/setChatMenuButton`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          menu_button: { type: "commands" },
-        }),
-      });
-    }
-  } catch (e) {
-    log("telegram_error", `syncTelegramCommands failed: ${e.message}`);
-  }
+      if (state.flushPromise) await state.flushPromise;
+      state.footer = finalText;
+      await flushNow();
+      _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
+      typing.stop();
+    },
+    async fail(errorText) {
+      if (state.flushTimer) {
+        clearTimeout(state.flushTimer);
+        state.flushTimer = null;
+      }
+      if (state.flushPromise) await state.flushPromise;
+      state.footer = `❌ ${errorText}`;
+      await flushNow();
+      _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
+      typing.stop();
+    },
+  };
 }
 
 
@@ -294,22 +313,8 @@ async function poll(onMessage) {
         _offset = update.update_id + 1;
         const msg = update.message;
         if (!msg?.text) continue;
-
-        const incomingChatId = String(msg.chat.id);
-
-        // Auto-register first sender as the owner
-        if (!chatId) {
-          chatId = incomingChatId;
-          saveChatId(chatId);
-          log("telegram", `Registered chat ID: ${chatId}`);
-          await syncTelegramCommands();
-          await sendMessage("Connected! I'm your LP agent. Ask me anything or use commands like /status.");
-        }
-
-        // Only accept messages from the registered chat
-        if (incomingChatId !== chatId) continue;
-
-        await onMessage(msg.text, msg);
+        if (!isAuthorizedIncomingMessage(msg)) continue;
+        await onMessage(msg);
       }
     } catch (e) {
       if (!e.message?.includes("aborted")) {
@@ -332,104 +337,97 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
-function solscanTxLink(tx) {
-  return tx ? `https://solscan.io/tx/${tx}` : null;
-}
-
-function meteoraPoolLink(poolAddress) {
-  return poolAddress ? `https://app.meteora.ag/dlmm/${poolAddress}` : null;
-}
-
-function metlexPnlLink(tx) {
-  return tx ? `https://www.metlex.io/pnl2/${tx}` : null;
-}
-
-function shortCode(value, head = 8, tail = 4) {
-  const text = String(value || "");
-  if (!text) return "-";
-  if (text.length <= head + tail + 3) return text;
-  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
+  if (hasActiveLiveMessage()) return;
+  const priceStr = priceRange
+    ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
+    : "";
+  const coverageStr = rangeCoverage
+    ? `Range cover: ${fmtPct(rangeCoverage.downside_pct)} downside | ${fmtPct(rangeCoverage.upside_pct)} upside | ${fmtPct(rangeCoverage.width_pct)} total\n`
+    : "";
+  const poolStr = (binStep || baseFee)
+    ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
+    : "";
+  await sendHTML(
+    `✅ <b>Deployed</b> ${pair}\n` +
+    `Amount: ${amountSol} SOL\n` +
+    priceStr +
+    coverageStr +
+    poolStr +
+    `Position: <code>${position?.slice(0, 8)}...</code>\n` +
+    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+  );
 }
 
 function escapeHtml(value) {
   return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-function formatPrice(value) {
-  if (value == null) return "?";
-  return value < 0.0001 ? value.toExponential(3) : value.toFixed(6);
+function shortHash(value, prefix = 8, suffix = 6) {
+  const text = String(value || "");
+  if (!text) return "";
+  if (text.length <= prefix + suffix + 3) return text;
+  return `${text.slice(0, prefix)}...${text.slice(-suffix)}`;
 }
 
-export async function notifyDeploy({ pair, amountSol, position, tx, poolAddress, priceRange, binStep, baseFee, thesis }) {
-  const txLink = solscanTxLink(tx);
-  const poolLink = meteoraPoolLink(poolAddress);
-  await sendHTML([
-    `✅ <b>Deployed ${escapeHtml(pair)}</b>`,
-    `━━━━━━━━━━━━━━`,
-    `💰 <b>Amount:</b> ${amountSol} SOL`,
-    priceRange ? `🎯 <b>Range:</b> ${formatPrice(priceRange.min)} - ${formatPrice(priceRange.max)}` : null,
-    (binStep || baseFee != null) ? `⚙️ <b>Setup:</b> Bin ${binStep ?? "?"} | Fee ${baseFee != null ? `${baseFee}%` : "?"}` : null,
-    thesis ? `🧠 <b>Thesis:</b> ${escapeHtml(thesis)}` : null,
-    txLink || poolLink ? "" : null,
-    txLink ? `🔗 <a href="${txLink}">View Tx</a>` : null,
-    poolLink ? `🌊 <a href="${poolLink}">Open Pool</a>` : null,
-    `🧾 <b>Position ID:</b> <code>${shortCode(position)}</code>`,
-    tx ? `🔹 <b>Tx ID:</b> <code>${shortCode(tx, 10, 6)}</code>` : null,
-  ].filter(Boolean).join("\n"));
-}
-
-export async function notifyClose({ pair, pnlUsd, pnlPct, tx, poolAddress }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, tx }) {
+  if (hasActiveLiveMessage()) return;
   const sign = pnlUsd >= 0 ? "+" : "";
-  const pnlLink = metlexPnlLink(tx);
-  await sendHTML([
-    `🔒 <b>Closed ${escapeHtml(pair)}</b>`,
-    `━━━━━━━━━━━━━━`,
-    `📊 <b>PnL:</b> ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`,
-    pnlLink ? `📈 <a href="${pnlLink}">Open PnL Card</a>` : null,
-  ].filter(Boolean).join("\n"));
-}
-
-export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
-  const txLink = solscanTxLink(tx);
+  const lines = [
+    `🔒 <b>Closed</b> ${escapeHtml(pair)}`,
+    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`,
+  ];
+  if (tx) {
+    lines.push(`📈 <a href="https://www.metlex.io/pnl2/${tx}">Open PnL Card</a>`);
+    lines.push(`🔹 Tx ID: <code>${shortHash(tx)}</code>`);
+  }
   await sendHTML(
-    [
-      `🔄 <b>Swap Executed</b>`,
-      `💱 <b>${inputSymbol}</b> → <b>${outputSymbol}</b>`,
-      `📥 In: ${amountIn ?? "?"} | 📤 Out: ${amountOut ?? "?"}`,
-      txLink ? `🔗 <a href="${txLink}">View Tx</a>` : null,
-    ].filter(Boolean).join("\n")
+    lines.join("\n")
   );
 }
 
-export async function notifySwapBack({ pair, status, reason = null, inputSymbol = null, amountIn = null, amountOut = null, tx = null }) {
-  const txLink = solscanTxLink(tx);
-  const title = status === "success"
-    ? `✅ <b>Swap Back to SOL Complete</b>`
-    : status === "pending"
-      ? `⏳ <b>Swap Back to SOL Pending</b>`
-      : `⚠️ <b>Swap Back to SOL Failed</b>`;
-  await sendHTML([
-    title,
-    pair ? `🏷️ <b>Pair:</b> ${escapeHtml(pair)}` : null,
-    inputSymbol ? `🪙 <b>Token:</b> ${escapeHtml(inputSymbol)}` : null,
-    amountIn != null ? `📥 <b>Input:</b> ${amountIn}` : null,
-    amountOut != null ? `📤 <b>Output:</b> ${amountOut}` : null,
-    reason ? `📝 <b>Reason:</b> ${escapeHtml(reason)}` : null,
-    txLink ? `🔗 <a href="${txLink}">View Tx</a>` : null,
-  ].filter(Boolean).join("\n"));
+export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
+  if (hasActiveLiveMessage()) return;
+  await sendHTML(
+    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
+    `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
+    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+  );
+}
+
+export async function notifySwapBack({ symbol, amount, tx, status = "success", error = "" }) {
+  if (hasActiveLiveMessage()) return;
+  if (status === "success") {
+    await sendHTML(
+      `♻️ <b>Swap Back to SOL Complete</b>\n` +
+      `Token: ${escapeHtml(symbol || "token")} | Amount: ${amount ?? "?"}\n` +
+      (tx ? `Tx: <code>${shortHash(tx)}</code>` : "")
+    );
+    return;
+  }
+  await sendHTML(
+    `⚠️ <b>Swap Back to SOL Failed</b>\n` +
+    `Token: ${escapeHtml(symbol || "token")}\n` +
+    `${escapeHtml(error || "Unknown error")}`
+  );
 }
 
 export async function notifyOutOfRange({ pair, minutesOOR }) {
+  if (hasActiveLiveMessage()) return;
   await sendHTML(
-    `⚠️ <b>${pair} Out of Range</b>\n` +
-    `🕒 Been out of range for <b>${minutesOOR}m</b>\n` +
-    `👀 Marked for management attention`
+    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `Been OOR for ${minutesOOR} minutes`
   );
 }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function fmtPct(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
 }

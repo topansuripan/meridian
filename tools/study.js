@@ -1,147 +1,152 @@
-/**
- * Study top LPers for a pool and extract behavioural patterns.
- * Used by the /learn command — not called on every cycle.
- */
+import { agentMeridianJson, getAgentMeridianHeaders } from "./agent-meridian.js";
 
-import { recordTopLPStudy } from "../holographic-memory.js";
-import { addMemory, MemoryType } from "../memory.js";
+export async function studyTopLPers({ pool_address, limit = 4 }) {
+  const [poolRes, signalRes] = await Promise.all([
+    fetchTopLp(pool_address),
+    fetchStudyTopLp(pool_address),
+  ]);
 
-const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
-const LPAGENT_KEY = process.env.LPAGENT_API_KEY;
+  const poolData = poolRes;
+  const signalData = signalRes;
+  const topLpers = Array.isArray(poolData.topLpers) ? poolData.topLpers : [];
+  const historicalOwners = Array.isArray(poolData.historicalOwners) ? poolData.historicalOwners : [];
+  const ranked = topLpers.slice(0, Math.max(1, limit));
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Fetch top LPers for a pool, filter to credible performers,
- * and return condensed behaviour patterns for LLM consumption.
- */
-export async function studyTopLPers({ pool_address, limit = 4, pool_name = null, base_mint = null }) {
-  if (!LPAGENT_KEY) {
-    return { pool: pool_address, message: "LPAGENT_API_KEY not set in .env — study_top_lpers is disabled.", patterns: [], lpers: [] };
-  }
-
-  // ── 1. Top LPers for this pool ──────────────────────────────
-  const topRes = await fetch(
-    `${LPAGENT_API}/pools/${pool_address}/top-lpers?sort_order=desc&page=1&limit=20`,
-    { headers: { "x-api-key": LPAGENT_KEY } }
-  );
-
-  if (!topRes.ok) {
-    if (topRes.status === 429) {
-      throw new Error(`Rate limit exceeded. Please wait 60 seconds before studying this pool again.`);
-    }
-    throw new Error(`top-lpers API error: ${topRes.status}`);
-  }
-
-  const topData = await topRes.json();
-  const all = topData.data || [];
-
-  // Filter to LPers with enough data to be meaningful
-  const credible = all.filter(
-    (l) => l.total_lp >= 3 && l.win_rate >= 0.6 && l.total_inflow > 1000
-  );
-
-  // Sort by ROI descending, take top N
-  const top = credible
-    .sort((a, b) => b.roi - a.roi)
-    .slice(0, limit);
-
-  if (top.length === 0) {
+  if (!ranked.length) {
     return {
       pool: pool_address,
-      message: "No credible LPers found (need ≥3 positions, ≥60% win rate, ≥$1k inflow).",
-      patterns: [],
-      historical_samples: [],
+      message: "No LPAgent top LPer data found for this pool yet.",
+      patterns: {},
+      lpers: [],
     };
   }
 
-  // ── 2. Historical positions for each top LPer ───────────────
-  const historicalSamples = [];
+  const historicalMap = new Map(historicalOwners.map((owner) => [owner.owner, owner]));
 
-  for (const lper of top) {
-    try {
-      // Small buffer to avoid race conditions on the 5-req limit
-      await sleep(1000); 
-
-      const histRes = await fetch(
-        `${LPAGENT_API}/lp-positions/historical?owner=${lper.owner}&page=1&limit=50`,
-        { headers: { "x-api-key": LPAGENT_KEY } }
-      );
-
-      if (!histRes.ok) continue;
-
-      const histData = await histRes.json();
-      const positions = histData.data || [];
-
-      historicalSamples.push({
-        owner: lper.owner.slice(0, 8) + "...",
-        summary: {
-          total_positions: lper.total_lp,
-          win_rate: Math.round(lper.win_rate * 100) + "%",
-          avg_hold_hours: Number(lper.avg_age_hour?.toFixed(2)),
-          roi: (lper.roi * 100).toFixed(2) + "%",
-          fee_pct_of_capital: (lper.fee_percent * 100).toFixed(2) + "%",
-          total_pnl_usd: Math.round(lper.total_pnl),
-        },
-        positions: positions.map((p) => ({
-          pool: p.pool,
-          pair: p.pairName || `${p.tokenName0}-${p.tokenName1}`,
-          hold_hours: p.ageHour != null ? Number(p.ageHour?.toFixed(2)) : null,
-          pnl_usd: Math.round(p.pnl?.value || 0),
-          pnl_pct: ((p.pnl?.percent || 0) * 100).toFixed(1) + "%",
-          fee_usd: Math.round(p.collectedFee || 0),
-          in_range_pct: p.inRangePct != null ? Math.round(p.inRangePct * 100) + "%" : null,
-          strategy: p.strategy || null,
-          closed_reason: p.closeReason || null,
-        })),
-      });
-    } catch {
-      // skip failed fetches
-    }
-  }
-
-  // ── 3. Aggregate patterns ────────────────────────────────────
-  const patterns = {
-    top_lper_count: top.length,
-    avg_hold_hours: avg(top.map((l) => l.avg_age_hour).filter(isNum)),
-    avg_win_rate: avg(top.map((l) => l.win_rate).filter(isNum)),
-    avg_roi_pct: avg(top.map((l) => l.roi * 100).filter(isNum)),
-    avg_fee_pct_of_capital: avg(top.map((l) => l.fee_percent * 100).filter(isNum)),
-    best_roi: (Math.max(...top.map((l) => l.roi)) * 100).toFixed(2) + "%",
-    // Scalpers (hold < 1h) vs holders (> 4h)
-    scalper_count: top.filter((l) => l.avg_age_hour < 1).length,
-    holder_count: top.filter((l) => l.avg_age_hour >= 4).length,
-  };
-
-  const result = {
-    pool: pool_address,
-    patterns,
-    lpers: historicalSamples,
-  };
-
-  const playbook = recordTopLPStudy({
-    poolAddress: pool_address,
-    poolName: pool_name || historicalSamples[0]?.positions?.[0]?.pair || pool_address,
-    baseMint: base_mint || null,
-    study: result,
+  const lpers = ranked.map((owner) => {
+    const history = historicalMap.get(owner.owner);
+    return {
+      owner: owner.owner,
+      owner_short: owner.ownerShort || `${owner.owner.slice(0, 8)}...`,
+      signal_tags: [
+        history?.preferredStrategy ? `strategy:${history.preferredStrategy}` : null,
+        history?.preferredRangeStyle ? `range:${history.preferredRangeStyle}` : null,
+      ].filter(Boolean),
+      summary: {
+        total_positions: owner.totalLp || history?.topPositions?.length || 0,
+        avg_hold_hours: round(owner.avgAgeHours ?? history?.avgHoldHours ?? 0, 2),
+        avg_open_pnl_pct: round(owner.pnlPerInflowPct ?? history?.avgPnlPct ?? 0, 2),
+        avg_fee_per_tvl_24h_pct: round(owner.feePercent ?? history?.avgFeePercent ?? 0, 2),
+        total_pnl_usd: round(owner.totalPnlUsd ?? 0, 2),
+        total_balance_usd: round(owner.totalInflowUsd ?? 0, 2),
+        avg_range_width_pct: null,
+        avg_distance_to_active_pct: null,
+        win_rate: round((owner.winRatePct ?? 0) / 100, 2),
+        roi: round((owner.roiPct ?? 0) / 100, 4),
+        fee_pct_of_capital: round(owner.feePercent ?? 0, 2),
+        preferred_strategy: history?.preferredStrategy || "unknown",
+        preferred_range_style: history?.preferredRangeStyle || "unknown",
+      },
+      positions: Array.isArray(history?.topPositions)
+        ? history.topPositions.map((position) => ({
+            pool: pool_address,
+            pair: poolData.overview?.name || "Unknown pool",
+            hold_hours: round(position.ageHours ?? 0, 2),
+            pnl_usd: round(position.pnlUsd ?? 0, 2),
+            pnl_pct: fmtPct(position.pnlPct),
+            fee_usd: round(position.feeUsd ?? 0, 2),
+            in_range_pct: position.inRange == null ? null : position.inRange ? 100 : 0,
+            strategy: position.strategy || null,
+            closed_reason: position.rangeStyle || null,
+            balance_usd: round(position.inputValue ?? 0, 2),
+            fee_per_tvl_24h_pct: round(position.feePercent ?? 0, 2),
+            range_width_pct: position.widthBins ?? null,
+            distance_to_active_pct: null,
+            lower_bin_id: position.lowerBinId ?? null,
+            upper_bin_id: position.upperBinId ?? null,
+          }))
+        : [],
+    };
   });
 
-  if (playbook) {
-    addMemory(
-      `Holographic LP recall refreshed for ${pool_address.slice(0, 8)}: ${playbook.playbook_summary}`,
-      MemoryType.HOLOGRAPHIC,
-      { role: "SCREENER" }
-    );
+  const patterns = buildPatterns(ranked, historicalOwners, signalData, poolData.overview || {});
+
+  return {
+    pool: pool_address,
+    pool_name:
+      poolData.overview?.name ||
+      `${poolData.overview?.tokenXSymbol || "TOKEN"}-${poolData.overview?.tokenYSymbol || "SOL"}`,
+    message:
+      "LPAgent-backed top LP study from Agent Meridian 30m cached owner aggregates plus owner historical positions.",
+    patterns,
+    lpers,
+  };
+}
+
+function fetchTopLp(poolAddress) {
+  return agentMeridianJson(`/top-lp/${poolAddress}`, {
+    headers: getAgentMeridianHeaders(),
+  });
+}
+
+function fetchStudyTopLp(poolAddress) {
+  return agentMeridianJson(`/study-top-lp/${poolAddress}`, {
+    headers: getAgentMeridianHeaders(),
+  });
+}
+
+function buildPatterns(ranked, historicalOwners, signalData, overview) {
+  const avgHold = avg(ranked.map((o) => o.avgAgeHours).filter(isNum));
+  const avgOpenPnlPct = avg(ranked.map((o) => o.pnlPerInflowPct).filter(isNum));
+  const avgFeePct = avg(ranked.map((o) => o.feePercent).filter(isNum));
+  const avgRoiPct = avg(ranked.map((o) => o.roiPct).filter(isNum));
+  const preferredStrategies = countValues(historicalOwners.map((o) => o.preferredStrategy).filter(Boolean));
+  const preferredRanges = countValues(historicalOwners.map((o) => o.preferredRangeStyle).filter(Boolean));
+
+  return {
+    top_lper_count: ranked.length,
+    study_mode: "lpagent_top_lpers",
+    pool_name:
+      overview.name || `${overview.tokenXSymbol || "TOKEN"}-${overview.tokenYSymbol || "SOL"}`,
+    active_position_count: signalData.activePositionCount ?? ranked.length,
+    owner_count: signalData.ownerCount ?? ranked.length,
+    avg_hold_hours: round(avgHold, 2),
+    avg_open_pnl_pct: round(avgOpenPnlPct, 2),
+    avg_fee_percent: round(avgFeePct, 2),
+    avg_roi_pct: round(avgRoiPct, 2),
+    best_open_pnl_pct: ranked[0] ? `${round(ranked[0].pnlPerInflowPct || 0, 2)}%` : null,
+    scalper_count: ranked.filter((o) => (o.avgAgeHours || 0) < 1).length,
+    holder_count: ranked.filter((o) => (o.avgAgeHours || 0) >= 4).length,
+    preferred_strategies: preferredStrategies,
+    preferred_range_styles: preferredRanges,
+    top_historical_owners: (signalData.topHistoricalOwners || []).slice(0, 3),
+    suggested_style: signalData.suggestedStyle || null,
+  };
+}
+
+function countValues(values) {
+  const map = new Map();
+  for (const value of values) {
+    map.set(value, (map.get(value) || 0) + 1);
   }
-
-  return result;
+  return Object.fromEntries([...map.entries()].sort((a, b) => b[1] - a[1]));
 }
 
-function avg(arr) {
-  if (!arr.length) return null;
-  return Math.round((arr.reduce((s, x) => s + x, 0) / arr.length) * 100) / 100;
+function avg(values) {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 }
 
-function isNum(n) {
-  return typeof n === "number" && isFinite(n);
+function round(value, digits = 2) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Number(n.toFixed(digits));
+}
+
+function isNum(value) {
+  return Number.isFinite(Number(value));
+}
+
+function fmtPct(value) {
+  const n = Number(value || 0);
+  return `${n >= 0 ? "+" : ""}${round(n, 2)}%`;
 }

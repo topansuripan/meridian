@@ -1,4 +1,4 @@
-export const tools = [
+const toolDefinitions = [
   // ═══════════════════════════════════════════
   //  SCREENING TOOLS
   // ═══════════════════════════════════════════
@@ -106,7 +106,7 @@ This is an on-chain call via the SDK. Returns:
 - price: human-readable price (token X per token Y)
 - pricePerLamport: raw price in lamports
 
-Only call this if you need the current price to calculate a specific bin range. Do NOT call it before every deploy because deploy_position already fetches the active bin internally.`,
+Only call this if you need the current price to calculate a specific bin range (e.g. user requested a % range). Do NOT call before every deploy — deploy_position fetches the active bin internally.`,
       parameters: {
         type: "object",
         properties: {
@@ -133,6 +133,8 @@ PRIORITY ORDER for strategy and bins:
 HARD RULES:
 - Never use 'curve'.
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
+- For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
+  use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
 
 Guidelines (only when user hasn't specified):
 - Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
@@ -166,11 +168,19 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           bins_below: {
             type: "number",
-            description: "Number of bins below active bin. If the user specifies a value, use it exactly. If they specify a % range (e.g. '-60% range'), convert using: bins = ceil(log(1 - pct) / log(1 + bin_step/10000)). Example: -60% range at bin_step 100 → ceil(log(0.40)/log(1.01)) = 92 bins. Otherwise choose based on volatility: 35–69 standard, 100–350 for wide-range strategies. Max 1400 total."
+            description: "Number of bins below the current active bin. For single-side SOL deploys, this is the main range input: lower bin = active bin - bins_below, upper bin = active bin."
           },
           bins_above: {
             type: "number",
-            description: "Number of bins above active bin. MUST be 0 for bid_ask strategy — placing bins above active bin defeats the purpose of bid-ask. Only set > 0 for spot/dual-sided strategies."
+            description: "Number of bins above the current active bin. Keep this at 0 for single-side SOL deploys. Only use this for dual-sided or explicit upside-exposure deploys."
+          },
+          downside_pct: {
+            type: "number",
+            description: "Optional human-friendly downside range in percent below the current active price. Converted to bins internally via the Meteora SDK."
+          },
+          upside_pct: {
+            type: "number",
+            description: "Optional human-friendly upside range in percent above the current active price. Do not use this for single-side SOL deploys."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
@@ -179,8 +189,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           volatility: { type: "number", description: "Pool volatility at deploy time" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
-          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },
-          thesis: { type: "string", description: "Short human-readable reason for entry. Always include 1 concise line explaining the edge, timing, and why this pool deserves capital." }
+          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }
         },
         required: ["pool_address"]
       }
@@ -272,13 +281,13 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
             type: "string",
             description: "The position public key to close"
           },
-          reason: {
-            type: "string",
-            description: "Short close reason such as 'take profit', 'oor', 'pumped above range', 'low yield', or 'manual'."
-          },
           skip_swap: {
             type: "boolean",
             description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-swaps base token back to SOL)."
+          },
+          reason: {
+            type: "string",
+            description: "Why this position is being closed. Include the rule that triggered it, e.g. 'low yield', 'stop loss', 'trailing TP', 'OOR'. Used for pool memory."
           }
         },
         required: ["position_address"]
@@ -373,8 +382,8 @@ WARNING: This executes a real on-chain transaction.`,
 Changes persist to user-config.json and take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, stopLossPct, emergencyPriceDropPct, takeProfitFeePct, minFeePerTvl24h, minAgeBeforeYieldCheck, maxHoldMinutes, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, allowedLaunchpads, blockedLaunchpads
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
@@ -386,7 +395,7 @@ Reason is optional but helpful — logged as a lesson when provided.`,
         properties: {
           changes: {
             type: "object",
-            description: "Key-value pairs of settings to update. e.g. { \"takeProfitFeePct\": 8 }"
+            description: "Key-value pairs of settings to update. e.g. { \"takeProfitPct\": 8 }"
           },
           reason: {
             type: "string",
@@ -406,6 +415,29 @@ Reason is optional but helpful — logged as a lesson when provided.`,
 Use when the user says "update", "pull latest", "update yourself", etc.
 Responds with what changed before restarting in 3 seconds.`,
       parameters: { type: "object", properties: {} }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_recent_decisions",
+      description: `Get the recent structured decision log for deployments, closes, skips, and no-deploy outcomes.
+Use this when the user asks explanatory questions like:
+- why did you deploy that position?
+- why did you close that pool?
+- why didn't you deploy anything?
+
+This is the preferred tool for answering "why did you..." questions because it returns the agent's recorded reasoning without requiring unrelated live trading actions.`,
+      parameters: {
+        type: "object",
+        properties: {
+          limit: {
+            type: "number",
+            description: "How many recent decisions to return. Default 6."
+          }
+        }
+      }
     }
   },
 
@@ -579,12 +611,12 @@ Returns pool address, name, bin_step, fee %, TVL, volume, and token mints.`,
     type: "function",
     function: {
       name: "get_top_lpers",
-      description: `Get the top LPers for a pool by address — quick read-only lookup.
+      description: `Get the top open LPers for a pool by address — quick read-only lookup.
 Use this when the user asks "who are the top LPers in this pool?" or wants to
 know how others are performing in a specific pool without saving lessons.
 
-Returns: aggregate patterns (avg hold time, win rate, ROI) and per-LPer summaries.
-Requires LPAGENT_API_KEY to be set.`,
+Returns: aggregate LPAgent-backed top-LPer patterns from the Agent Meridian
+\`/top-lp/:pool\` endpoint. Data is cached server-side and refreshed on a 30m cadence.`,
       parameters: {
         type: "object",
         properties: {
@@ -606,13 +638,16 @@ Requires LPAGENT_API_KEY to be set.`,
     type: "function",
     function: {
       name: "study_top_lpers",
-      description: `Fetch and analyze top LPers for a pool to learn from their behaviour.
-Returns aggregate patterns (avg hold time, win rate, ROI) and historical samples.
+      description: `Fetch and analyze top open LPers for a pool to learn from their behaviour.
+Returns LPAgent-backed owner aggregates and historical style/range samples from
+the Agent Meridian \`/study-top-lp/:pool\` endpoint.
 
 Use this before deploying into a new pool to:
 - See if top performers are scalpers (< 1h holds) or long-term holders.
-- Match your strategy and range to what is actually working for others.
-- Avoid pools where even the best performers have low win rates.`,
+- Match your strategy and range to what is actually working for others right now.
+- Avoid pools where even the best open LPs are poorly placed or losing.
+
+Server note: study data is cached and refreshed every 30 minutes.`,
       parameters: {
         type: "object",
         properties: {
@@ -1032,72 +1067,55 @@ Blacklisted tokens are filtered BEFORE the LLM even sees pool candidates.`,
       }
     }
   },
-
-  // ─── Agent Memory ────────────────────────────────────────────────
-
   {
     type: "function",
     function: {
-      name: "add_memory",
-      description: `Save a persistent memory entry to your long-term agent memory.
-Use this to record things you've learned, decisions you've made, or patterns you've observed that go beyond a single lesson.
-
-Memory types:
-- SELF-TUNED:   Record when you change a config and WHY (e.g. "Changed minClaimAmount=10 — gas cost not worth it below this")
-- USER-TAUGHT:  Record explicit instructions or preferences from the operator
-- OBSERVED:     Record a market pattern or behaviour you observed
-- EVOLUTION:    Record when thresholds auto-evolved and what data drove it
-
-Memory is injected into every system prompt so you always have context about your own history.
-Use 'pinned: true' for critical memories that must always appear.
-
-Examples:
-- text: "Changed minClaimAmount=10 — User request: only claim fees when worthwhile to justify gas costs", type: "SELF-TUNED"
-- text: "User prefers holding positions longer even when OOR if volume is still healthy", type: "USER-TAUGHT", pinned: true
-- text: "BONK-SOL pools at bs=80 have had high range efficiency (>80%) consistently", type: "OBSERVED"`,
+      name: "block_deployer",
+      description: "Block a deployer wallet address. Any token deployed by this wallet will be hard-filtered from screening before the LLM ever sees it.",
       parameters: {
         type: "object",
         properties: {
-          text: {
-            type: "string",
-            description: "The memory text — be specific and actionable (max 500 chars)"
-          },
-          type: {
-            type: "string",
-            enum: ["SELF-TUNED", "USER-TAUGHT", "OBSERVED", "EVOLUTION"],
-            description: "Memory type — describes how this entry was created"
-          },
-          pinned: {
-            type: "boolean",
-            description: "Pin this memory so it always appears in the prompt regardless of cap"
-          },
-          role: {
-            type: "string",
-            enum: ["SCREENER", "MANAGER", "GENERAL"],
-            description: "Limit this memory to a specific agent role. Omit for all roles."
-          }
+          wallet:  { type: "string", description: "Deployer wallet address (base58)" },
+          label:   { type: "string", description: "Human-readable label (e.g. 'known rugger')" },
+          reason:  { type: "string", description: "Why this deployer is being blocked" },
         },
-        required: ["text", "type"]
+        required: ["wallet"]
       }
     }
   },
-
   {
     type: "function",
     function: {
-      name: "list_memory",
-      description: `Browse your persistent agent memory entries.
-Use when the user asks what you remember, or when you want to review your own history of decisions and self-tuning.
-Returns entries filtered by type, role, or pinned status.`,
+      name: "unblock_deployer",
+      description: "Remove a deployer wallet from the blocklist.",
       parameters: {
         type: "object",
         properties: {
-          type:   { type: "string", enum: ["SELF-TUNED", "USER-TAUGHT", "OBSERVED", "EVOLUTION"], description: "Filter by memory type" },
-          role:   { type: "string", enum: ["SCREENER", "MANAGER", "GENERAL"], description: "Filter by role" },
-          pinned: { type: "boolean", description: "Filter to only pinned (true) or unpinned (false) entries" },
-          limit:  { type: "number", description: "Max entries to return (default 30)" }
-        }
+          wallet: { type: "string", description: "Deployer wallet address to unblock" },
+        },
+        required: ["wallet"]
       }
     }
-  }
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_blocked_deployers",
+      description: "List all blocked deployer wallets.",
+      parameters: {
+        type: "object",
+        properties: {}
+      }
+    }
+  },
 ];
+
+export const tools = toolDefinitions.map((tool) => ({
+  ...tool,
+  function: {
+    ...tool.function,
+    parameters: tool.function.parameters?.type === "object"
+      ? { additionalProperties: false, ...tool.function.parameters }
+      : tool.function.parameters,
+  },
+}));

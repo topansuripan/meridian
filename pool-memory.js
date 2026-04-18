@@ -10,10 +10,43 @@ import { log } from "./logger.js";
 import { config } from "./config.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
+const MAX_NOTE_LENGTH = 280;
+
+function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
+  if (text == null) return null;
+  const cleaned = String(text)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[<>`]/g, "")
+    .trim()
+    .slice(0, maxLen);
+  return cleaned || null;
+}
+
+function load() {
+  if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(POOL_MEMORY_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function save(data) {
+  fs.writeFileSync(POOL_MEMORY_FILE, JSON.stringify(data, null, 2));
+}
 
 function isOorCloseReason(reason) {
   const text = String(reason || "").trim().toLowerCase();
   return text === "oor" || text.includes("out of range") || text.includes("oor");
+}
+
+function isAdjustedWinRateExcludedReason(reason) {
+  const text = String(reason || "").trim().toLowerCase();
+  return text.includes("out of range") ||
+    text.includes("pumped far above range") ||
+    text === "oor" ||
+    text.includes("oor");
 }
 
 function setPoolCooldown(entry, hours, reason) {
@@ -33,19 +66,6 @@ function setBaseMintCooldown(db, baseMint, hours, reason) {
     }
   }
   return cooldownUntil;
-}
-
-function load() {
-  if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(POOL_MEMORY_FILE, "utf8"));
-  } catch {
-    return {};
-  }
-}
-
-function save(data) {
-  fs.writeFileSync(POOL_MEMORY_FILE, JSON.stringify(data, null, 2));
 }
 
 // ─── Write ─────────────────────────────────────────────────────
@@ -81,6 +101,8 @@ export function recordPoolDeploy(poolAddress, deployData) {
       total_deploys: 0,
       avg_pnl_pct: 0,
       win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
       last_deployed_at: null,
       last_outcome: null,
       notes: [],
@@ -116,13 +138,20 @@ export function recordPoolDeploy(poolAddress, deployData) {
       (withPnl.filter((d) => d.pnl_pct >= 0).length / withPnl.length) * 100
     ) / 100;
   }
+  const adjusted = withPnl.filter((d) => !isAdjustedWinRateExcludedReason(d.close_reason));
+  entry.adjusted_win_rate_sample_count = adjusted.length;
+  entry.adjusted_win_rate = adjusted.length > 0
+    ? Math.round((adjusted.filter((d) => d.pnl_pct >= 0).length / adjusted.length) * 10000) / 100
+    : 0;
 
   if (deployData.base_mint && !entry.base_mint) {
     entry.base_mint = deployData.base_mint;
   }
 
+  // Set cooldown for low yield closes — pool wasn't profitable enough, don't redeploy soon
   if (deploy.close_reason === "low yield") {
-    const cooldownUntil = setPoolCooldown(entry, 4, "low yield");
+    const cooldownHours = 4;
+    const cooldownUntil = setPoolCooldown(entry, cooldownHours, "low yield");
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
   }
 
@@ -194,6 +223,8 @@ export function getPoolMemory({ pool_address }) {
     total_deploys: entry.total_deploys,
     avg_pnl_pct: entry.avg_pnl_pct,
     win_rate: entry.win_rate,
+    adjusted_win_rate: entry.adjusted_win_rate ?? 0,
+    adjusted_win_rate_sample_count: entry.adjusted_win_rate_sample_count ?? 0,
     last_deployed_at: entry.last_deployed_at,
     last_outcome: entry.last_outcome,
     cooldown_until: entry.cooldown_until || null,
@@ -222,6 +253,8 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
       total_deploys: 0,
       avg_pnl_pct: 0,
       win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
       last_deployed_at: null,
       last_outcome: null,
       notes: [],
@@ -290,7 +323,8 @@ export function recallForPool(poolAddress) {
   // Notes
   if (entry.notes?.length > 0) {
     const lastNote = entry.notes[entry.notes.length - 1];
-    lines.push(`NOTE: ${lastNote.note}`);
+    const safeNote = sanitizeStoredNote(lastNote.note);
+    if (safeNote) lines.push(`NOTE: ${safeNote}`);
   }
 
   return lines.length > 0 ? lines.join("\n") : null;
@@ -302,7 +336,8 @@ export function recallForPool(poolAddress) {
  */
 export function addPoolNote({ pool_address, note }) {
   if (!pool_address) return { error: "pool_address required" };
-  if (!note) return { error: "note required" };
+  const safeNote = sanitizeStoredNote(note);
+  if (!safeNote) return { error: "note required" };
 
   const db = load();
 
@@ -321,11 +356,11 @@ export function addPoolNote({ pool_address, note }) {
   }
 
   db[pool_address].notes.push({
-    note,
+    note: safeNote,
     added_at: new Date().toISOString(),
   });
 
   save(db);
-  log("pool-memory", `Note added to ${pool_address.slice(0, 8)}: ${note}`);
-  return { saved: true, pool_address, note };
+  log("pool-memory", `Note added to ${pool_address.slice(0, 8)}: ${safeNote}`);
+  return { saved: true, pool_address, note: safeNote };
 }

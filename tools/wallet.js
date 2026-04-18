@@ -64,10 +64,50 @@ export async function getWalletTokenBalance(mint) {
   };
 }
 
+export async function waitForWalletTokenBalance(mint, { attempts = 8, delayMs = 4000 } = {}) {
+  let lastBalance = null;
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      lastBalance = await getWalletTokenBalance(mint);
+      if ((lastBalance?.balance ?? 0) > 0) return lastBalance;
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  if (lastError) throw lastError;
+  return lastBalance;
+}
+
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
-const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
-const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";
-const JUPITER_API_KEY = "b15d42e9-e0e4-4f90-a424-ae41ceeaa382";
+const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
+const DEFAULT_JUPITER_API_KEY = "b15d42e9-e0e4-4f90-a424-ae41ceeaa382";
+
+function getJupiterApiKey() {
+  return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
+}
+
+function getJupiterReferralParams() {
+  const referralAccount = String(config.jupiter.referralAccount || "").trim();
+  const referralFee = Number(config.jupiter.referralFeeBps || 0);
+  if (!referralAccount || !Number.isFinite(referralFee) || referralFee <= 0) {
+    return null;
+  }
+  if (referralFee < 50 || referralFee > 255) {
+    log("swap_warn", `Ignoring Jupiter referral fee ${referralFee}; Ultra requires 50-255 bps`);
+    return null;
+  }
+  try {
+    new PublicKey(referralAccount);
+  } catch {
+    log("swap_warn", "Ignoring invalid Jupiter referral account");
+    return null;
+  }
+  return { referralAccount, referralFee: Math.round(referralFee) };
+}
 
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
@@ -140,7 +180,7 @@ export async function getWalletBalances() {
 }
 
 /**
- * Swap tokens via Jupiter Ultra API (order → sign → execute).
+ * Swap tokens via Jupiter Swap API V2 (order → sign → execute).
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -188,30 +228,32 @@ export async function swapToken({
     }
     const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
 
-    // ─── Get Ultra order (unsigned tx + requestId) ─────────────
-    const orderUrl =
-      `${JUPITER_ULTRA_API}/order` +
-      `?inputMint=${input_mint}` +
-      `&outputMint=${output_mint}` +
-      `&amount=${amountStr}` +
-      `&taker=${wallet.publicKey.toString()}`;
+    // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
+    const search = new URLSearchParams({
+      inputMint: input_mint,
+      outputMint: output_mint,
+      amount: amountStr,
+      taker: wallet.publicKey.toString(),
+    });
+    const referralParams = getJupiterReferralParams();
+    if (referralParams) {
+      search.set("referralAccount", referralParams.referralAccount);
+      search.set("referralFee", String(referralParams.referralFee));
+    }
+    const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
+    const jupiterApiKey = getJupiterApiKey();
 
     const orderRes = await fetch(orderUrl, {
-      headers: { "x-api-key": JUPITER_API_KEY },
+      headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {},
     });
     if (!orderRes.ok) {
       const body = await orderRes.text();
-      if (orderRes.status === 500) {
-        log("swap", `Ultra failed for ${input_mint}, falling back to regular swap API`);
-        return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr });
-      }
-      throw new Error(`Ultra order failed: ${orderRes.status} ${body}`);
+      throw new Error(`Swap V2 order failed: ${orderRes.status} ${body}`);
     }
 
     const order = await orderRes.json();
     if (order.errorCode || order.errorMessage) {
-      log("swap", `Ultra error for ${input_mint}, falling back to regular swap API`);
-      return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr });
+      throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
     }
 
     const { transaction: unsignedTx, requestId } = order;
@@ -222,16 +264,16 @@ export async function swapToken({
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
 
     // ─── Execute ───────────────────────────────────────────────
-    const execRes = await fetch(`${JUPITER_ULTRA_API}/execute`, {
+    const execRes = await fetch(`${JUPITER_SWAP_V2_API}/execute`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": JUPITER_API_KEY,
+        ...(jupiterApiKey ? { "x-api-key": jupiterApiKey } : {}),
       },
       body: JSON.stringify({ signedTransaction: signedTx, requestId }),
     });
     if (!execRes.ok) {
-      throw new Error(`Ultra execute failed: ${execRes.status} ${await execRes.text()}`);
+      throw new Error(`Swap V2 execute failed: ${execRes.status} ${await execRes.text()}`);
     }
 
     const result = await execRes.json();
@@ -240,6 +282,12 @@ export async function swapToken({
     }
 
     log("swap", `SUCCESS tx: ${result.signature}`);
+    if (referralParams && order.feeBps !== referralParams.referralFee) {
+      log(
+        "swap_warn",
+        `Jupiter referral fee requested ${referralParams.referralFee} bps but order applied ${order.feeBps ?? "unknown"} bps`,
+      );
+    }
 
     return {
       success: true,
@@ -248,42 +296,13 @@ export async function swapToken({
       output_mint,
       amount_in: result.inputAmountResult,
       amount_out: result.outputAmountResult,
+      referral_account: referralParams?.referralAccount || null,
+      referral_fee_bps_requested: referralParams?.referralFee || 0,
+      fee_bps_applied: order.feeBps ?? null,
+      fee_mint: order.feeMint ?? null,
     };
   } catch (error) {
     log("swap_error", error.message);
     return { success: false, error: error.message };
   }
-}
-
-async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr }) {
-  // ─── Get quote ─────────────────────────────────────────────
-  const quoteRes = await fetch(
-    `${JUPITER_QUOTE_API}/quote?inputMint=${input_mint}&outputMint=${output_mint}&amount=${amountStr}&slippageBps=300`,
-    { headers: { "x-api-key": JUPITER_API_KEY } }
-  );
-  if (!quoteRes.ok) throw new Error(`Quote failed: ${quoteRes.status} ${await quoteRes.text()}`);
-  const quote = await quoteRes.json();
-  if (quote.error) throw new Error(`Quote error: ${quote.error}`);
-
-  // ─── Get swap tx ───────────────────────────────────────────
-  const swapRes = await fetch(`${JUPITER_QUOTE_API}/swap`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": JUPITER_API_KEY },
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: wallet.publicKey.toString(),
-      wrapAndUnwrapSol: true,
-    }),
-  });
-  if (!swapRes.ok) throw new Error(`Swap tx failed: ${swapRes.status} ${await swapRes.text()}`);
-  const { swapTransaction } = await swapRes.json();
-
-  // ─── Sign and send ─────────────────────────────────────────
-  const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
-  tx.sign([wallet]);
-  const txHash = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-  await connection.confirmTransaction(txHash, "confirmed");
-
-  log("swap", `SUCCESS (fallback) tx: ${txHash}`);
-  return { success: true, tx: txHash, input_mint, output_mint };
 }
