@@ -1,4 +1,5 @@
 import { agentMeridianJson, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { recordTopLPStudy } from "../holographic-memory.js";
 
 export async function studyTopLPers({ pool_address, limit = 4 }) {
   const [poolRes, signalRes] = await Promise.all([
@@ -71,7 +72,7 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
 
   const patterns = buildPatterns(ranked, historicalOwners, signalData, poolData.overview || {});
 
-  return {
+  const result = {
     pool: pool_address,
     pool_name:
       poolData.overview?.name ||
@@ -81,6 +82,19 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
     patterns,
     lpers,
   };
+
+  recordTopLPStudy({
+    poolAddress: pool_address,
+    poolName: result.pool_name,
+    baseMint:
+      poolData.overview?.tokenXMint ||
+      poolData.overview?.baseMint ||
+      poolData.baseMint ||
+      null,
+    study: result,
+  });
+
+  return result;
 }
 
 function fetchTopLp(poolAddress) {

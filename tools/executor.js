@@ -252,10 +252,13 @@ function normalizeConfigValue(key, value) {
     "avoidPvpSymbols",
     "blockPvpSymbols",
     "autoSwapAfterClaim",
+    "autoParkUsdcAfterClose",
+    "autoFundSolFromUsdc",
     "trailingTakeProfit",
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "autoLearnTopLps",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
   const stringKeys = new Set([
@@ -406,6 +409,9 @@ const toolMap = {
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
+      autoParkUsdcAfterClose: ["management", "autoParkUsdcAfterClose"],
+      autoFundSolFromUsdc: ["management", "autoFundSolFromUsdc"],
+      solUsdReserve: ["management", "solUsdReserve"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
@@ -427,10 +433,20 @@ const toolMap = {
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
+      maxDailyLossUsd: ["risk", "maxDailyLossUsd"],
+      maxConsecutiveLosses: ["risk", "maxConsecutiveLosses"],
+      cooldownAfterLossMinutes: ["risk", "cooldownAfterLossMinutes"],
+      lossQuarantineTriggerCount: ["risk", "lossQuarantineTriggerCount"],
+      lossQuarantineHours: ["risk", "lossQuarantineHours"],
+      lossQuarantineMinPnlPct: ["risk", "lossQuarantineMinPnlPct"],
       // schedule
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
       healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
+      // learning
+      autoLearnTopLps: ["learning", "autoLearnTopLps"],
+      topLpStudyTtlHours: ["learning", "topLpStudyTtlHours"],
+      topLpAutoLearnLimit: ["learning", "topLpAutoLearnLimit"],
       // models
       managementModel: ["llm", "managementModel"],
       screeningModel: ["llm", "screeningModel"],

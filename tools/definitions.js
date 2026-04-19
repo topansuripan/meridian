@@ -705,6 +705,8 @@ Use this immediately whenever the user gives a specific instruction about a posi
 - "hold for at least 2 hours"
 
 The instruction is stored in state.json and injected into every management cycle prompt.
+Common patterns such as hold duration, TP %, SL %, claim-at-fees, and close-on-OOR
+are enforced deterministically in code before any LLM fallback.
 Pass null or empty string to clear an existing instruction.`,
       parameters: {
         type: "object",

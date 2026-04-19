@@ -1,6 +1,12 @@
 {
   "deployAmountSol": 0.5,
   "maxPositions": 3,
+  "maxDailyLossUsd": 80,
+  "maxConsecutiveLosses": 3,
+  "cooldownAfterLossMinutes": 180,
+  "lossQuarantineTriggerCount": 2,
+  "lossQuarantineHours": 24,
+  "lossQuarantineMinPnlPct": -8,
   "minSolToOpen": 0.55,
   "maxDeployAmount": 50,
   "gasReserve": 0.2,
@@ -60,6 +66,10 @@
 
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
+
+  "autoLearnTopLps": true,
+  "topLpStudyTtlHours": 12,
+  "topLpAutoLearnLimit": 3,
 
   "darwinEnabled": true,
   "darwinWindowDays": 60,

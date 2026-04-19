@@ -27,6 +27,22 @@ function scoreCandidate(pool) {
   return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
 }
 
+function buildRelaxedScreeningConfig(screening) {
+  return {
+    ...screening,
+    minTvl: Math.max(4_000, Math.round((screening.minTvl || 0) * 0.5)),
+    maxTvl: screening.maxTvl != null ? Math.round(screening.maxTvl * 1.75) : null,
+    minVolume: Math.max(250, Math.round((screening.minVolume || 0) * 0.45)),
+    minOrganic: Math.max(45, Math.round((screening.minOrganic || 0) - 12)),
+    minQuoteOrganic: Math.max(45, Math.round((screening.minQuoteOrganic || 0) - 12)),
+    minHolders: Math.max(250, Math.round((screening.minHolders || 0) * 0.5)),
+    minMcap: Math.max(75_000, Math.round((screening.minMcap || 0) * 0.5)),
+    minFeeActiveTvlRatio: Math.max(0.015, Number((screening.minFeeActiveTvlRatio || 0) * 0.5)),
+    maxBotHoldersPct: Math.min(45, (screening.maxBotHoldersPct || 30) + 10),
+    maxTop10Pct: Math.min(75, (screening.maxTop10Pct || 60) + 10),
+  };
+}
+
 async function fetchDiscordSignalCandidates() {
   const res = await fetch(`${getAgentMeridianBase()}/signals/discord/candidates`, {
     headers: getAgentMeridianHeaders(),
@@ -108,8 +124,9 @@ async function enrichPvpRisk(pools) {
  */
 export async function discoverPools({
   page_size = 50,
+  screeningOverrides = null,
 } = {}) {
-  const s = config.screening;
+  const s = { ...config.screening, ...(screeningOverrides || {}) };
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -262,9 +279,20 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true } = {}) {
   const { config } = await import("../config.js");
-  const { pools } = await discoverPools({ page_size: 50 });
+  let discoveryMode = "standard";
+  let relaxedThresholds = null;
+  let { pools } = await discoverPools({ page_size: 50 });
+  if (allowRelaxedFallback && pools.length === 0) {
+    relaxedThresholds = buildRelaxedScreeningConfig(config.screening);
+    const retry = await discoverPools({ page_size: 50, screeningOverrides: relaxedThresholds }).catch(() => ({ pools: [] }));
+    if (retry.pools.length > 0) {
+      pools = retry.pools;
+      discoveryMode = "relaxed";
+      log("screening", `Relaxed discovery fallback engaged — found ${pools.length} pools after widening thresholds`);
+    }
+  }
   const filteredOut = [];
 
   // Exclude pools where the wallet already has an open position
@@ -452,6 +480,19 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     candidates: eligible,
     total_screened: pools.length,
     filtered_examples: filteredOut.slice(0, 3),
+    screening_mode: discoveryMode,
+    relaxed_thresholds: relaxedThresholds
+      ? {
+          minTvl: relaxedThresholds.minTvl,
+          maxTvl: relaxedThresholds.maxTvl,
+          minVolume: relaxedThresholds.minVolume,
+          minOrganic: relaxedThresholds.minOrganic,
+          minQuoteOrganic: relaxedThresholds.minQuoteOrganic,
+          minHolders: relaxedThresholds.minHolders,
+          minMcap: relaxedThresholds.minMcap,
+          minFeeActiveTvlRatio: relaxedThresholds.minFeeActiveTvlRatio,
+        }
+      : null,
   };
 }
 

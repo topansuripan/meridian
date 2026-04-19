@@ -7,14 +7,16 @@ import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary, getLossCircuitBreakerStatus } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled, createLiveMessage } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { studyTopLPers } from "./tools/study.js";
 import { appendDecision } from "./decision-log.js";
 
 log("startup", "DLMM LP Agent starting...");
@@ -97,6 +99,129 @@ function getTargetSolReserve(balance) {
   const solPrice = Number(balance?.sol_price || 0);
   const reserveFromUsd = solPrice > 0 ? solUsdReserve / solPrice : 0;
   return Math.max(gasReserve, reserveFromUsd);
+}
+
+function scoreScreeningCandidate(pool, strategyHint = null) {
+  const feeTvl = Number(pool?.fee_active_tvl_ratio || pool?.fee_tvl_ratio || 0);
+  const organic = Number(pool?.organic_score || 0);
+  const volume = Number(pool?.volume_window || 0);
+  const holders = Number(pool?.holders || 0);
+  const memoryBoost = Number(strategyHint?.score_boost || 0);
+  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100 + memoryBoost * 120;
+}
+
+function parseInstructionDurationMinutes(text) {
+  const match = String(text || "").match(/(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\b/i);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = match[2].toLowerCase();
+  return unit.startsWith("h") ? Math.round(amount * 60) : Math.round(amount);
+}
+
+function extractInstructionPercent(text, patterns) {
+  const source = String(text || "");
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+    if (!match) continue;
+    const raw = Number(match[1]);
+    if (Number.isFinite(raw)) return raw;
+  }
+  return null;
+}
+
+function evaluateOperatorInstruction(position) {
+  const instruction = String(position?.instruction || "").trim();
+  if (!instruction) return null;
+
+  const text = instruction.toLowerCase();
+  const ageMinutes = Number(position?.age_minutes ?? 0);
+  const pnlPct = Number(position?.pnl_pct);
+  const feesUsd = Number(position?.unclaimed_fees_usd ?? 0);
+  const durationMinutes = parseInstructionDurationMinutes(instruction);
+
+  if (/(close|exit)\s+(after|at)\b/.test(text) && durationMinutes != null) {
+    if (ageMinutes >= durationMinutes) {
+      return { action: "CLOSE", reason: `instruction close after ${durationMinutes}m reached`, parsed: true };
+    }
+    return { action: "HOLD", reason: `instruction hold until ${durationMinutes}m`, parsed: true };
+  }
+
+  if (
+    durationMinutes != null &&
+    (
+      /(hold|stay).*(for|at least|minimum)/.test(text) ||
+      /(?:don't|do not)\s+close\s+(before|for|until)/.test(text) ||
+      /^hold\s+\d/.test(text)
+    )
+  ) {
+    if (ageMinutes < durationMinutes) {
+      return { action: "HOLD", reason: `instruction minimum hold ${durationMinutes}m`, parsed: true };
+    }
+    return { action: "ALLOW_DEFAULT", reason: `instruction minimum hold ${durationMinutes}m satisfied`, parsed: true };
+  }
+
+  const feeFloorMatch = instruction.match(/(?:don't|do not)\s+close.*fees?.*?\$?\s*(\d+(?:\.\d+)?)/i);
+  if (feeFloorMatch) {
+    const feeFloor = Number(feeFloorMatch[1]);
+    if (Number.isFinite(feeFloor) && feesUsd < feeFloor) {
+      return { action: "HOLD", reason: `instruction wait for fees $${feeFloor}`, parsed: true };
+    }
+    if (Number.isFinite(feeFloor)) {
+      return { action: "ALLOW_DEFAULT", reason: `instruction fee floor $${feeFloor} satisfied`, parsed: true };
+    }
+  }
+
+  const takeProfitTarget = extractInstructionPercent(instruction, [
+    /(?:tp|take profit|close at|close when|hold until).*?(-?\d+(?:\.\d+)?)\s*%/i,
+  ]);
+  if (takeProfitTarget != null && Number.isFinite(pnlPct)) {
+    if (pnlPct >= takeProfitTarget) {
+      return { action: "CLOSE", reason: `instruction take profit ${takeProfitTarget}% reached`, parsed: true };
+    }
+    return { action: "HOLD", reason: `instruction waiting for ${takeProfitTarget}% PnL`, parsed: true };
+  }
+
+  let stopLossTarget = extractInstructionPercent(instruction, [
+    /(?:sl|stop loss|cut loss|close if.*(?:below|under|<=|drops to|hits)).*?(-?\d+(?:\.\d+)?)\s*%/i,
+  ]);
+  if (stopLossTarget != null) {
+    if (stopLossTarget > 0) stopLossTarget *= -1;
+    if (Number.isFinite(pnlPct) && pnlPct <= stopLossTarget) {
+      return { action: "CLOSE", reason: `instruction stop loss ${stopLossTarget}% hit`, parsed: true };
+    }
+    return { action: "HOLD", reason: `instruction stop loss ${stopLossTarget}% not hit`, parsed: true };
+  }
+
+  const feeTargetMatch = instruction.match(/(?:claim|harvest).*(?:at|when|once|>=|above|after).*\$?\s*(\d+(?:\.\d+)?)/i);
+  if (feeTargetMatch) {
+    const feeTarget = Number(feeTargetMatch[1]);
+    if (Number.isFinite(feeTarget)) {
+      if (feesUsd >= feeTarget) {
+        return { action: "CLAIM", reason: `instruction claim at $${feeTarget}`, parsed: true };
+      }
+      return { action: "HOLD", reason: `instruction wait for fees $${feeTarget}`, parsed: true };
+    }
+  }
+
+  const closeOnOor = /(close|exit).*(out of range|oor)|(?:out of range|oor).*(close|exit)/i.test(instruction);
+  if (closeOnOor) {
+    if (position?.in_range === false || Number(position?.minutes_out_of_range || 0) > 0) {
+      return { action: "CLOSE", reason: "instruction close on out of range", parsed: true };
+    }
+    return { action: "HOLD", reason: "instruction wait until out of range", parsed: true };
+  }
+
+  return null;
+}
+
+function formatLossCircuitBreakerReason(status) {
+  const parts = [
+    status.daily_loss_triggered ? `24h PnL ${status.total_pnl_usd} USD breached daily loss limit` : null,
+    status.consecutive_loss_triggered ? `${status.consecutive_losses} consecutive losses (${status.consecutive_loss_pnl_usd} USD)` : null,
+    status.cooldown_until ? `cooldown until ${new Date(status.cooldown_until).toLocaleString("en-US", { hour12: false })}` : null,
+  ].filter(Boolean);
+  return parts.join(" | ") || "loss breaker active";
 }
 
 function shouldUsePnlRecheck() {
@@ -246,16 +371,24 @@ export async function runManagementCycle({ silent = false } = {}) {
         actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
         continue;
       }
-      // Instruction-set — pass to LLM, can't parse in JS
-      if (p.instruction) {
-        actionMap.set(p.position, { action: "INSTRUCTION" });
-        continue;
-      }
-
       const closeRule = getDeterministicCloseRule(p, config.management);
       if (closeRule) {
         actionMap.set(p.position, closeRule);
         continue;
+      }
+      // Parse common operator instructions deterministically before any LLM fallback.
+      if (p.instruction) {
+        const parsedInstruction = evaluateOperatorInstruction(p);
+        if (parsedInstruction?.parsed) {
+          if (parsedInstruction.action !== "ALLOW_DEFAULT") {
+            actionMap.set(p.position, parsedInstruction);
+            continue;
+          }
+        }
+        if (!parsedInstruction?.parsed) {
+          actionMap.set(p.position, { action: "INSTRUCTION" });
+          continue;
+        }
       }
       // Claim rule
       if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
@@ -274,11 +407,15 @@ export async function runManagementCycle({ silent = false } = {}) {
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
-      const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
+      const statusLabel =
+        act.action === "INSTRUCTION" ? "EVAL (instruction)" :
+        act.action === "HOLD" ? "HOLD (instruction)" :
+        act.action;
       let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if (act.action === "HOLD") line += `\nInstruction: ${act.reason}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
     });
@@ -417,6 +554,24 @@ export async function runScreeningCycle({ silent = false } = {}) {
       _screeningBusy = false;
       return screenReport;
     }
+    const lossBreaker = getLossCircuitBreakerStatus({
+      maxDailyLossUsd: config.risk.maxDailyLossUsd,
+      maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
+      cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
+    });
+    if (lossBreaker.triggered) {
+      const reason = formatLossCircuitBreakerReason(lossBreaker);
+      log("cron", `Screening paused by loss circuit breaker — ${reason}`);
+      screenReport = `Screening paused — ${reason}.\nManagement stays active on existing positions.`;
+      appendDecision({
+        type: "skip",
+        actor: "SCREENER",
+        summary: "Screening paused by loss circuit breaker",
+        reason,
+      });
+      _screeningBusy = false;
+      return screenReport;
+    }
     const liquidSol = getLiquidSolEquivalent(preBalance);
     const tentativeDeploy = computeDeployAmount(liquidSol);
     const reserveSol = getTargetSolReserve(preBalance);
@@ -458,6 +613,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
+    const screeningModeLabel = topCandidates?.screening_mode === "relaxed" ? "relaxed fallback" : "standard";
 
     const allCandidates = [];
     for (const pool of candidates) {
@@ -507,8 +663,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
         .map((entry) => `- ${entry.name}: ${entry.reason}`)
         .join("\n");
       screenReport = combinedExamples
-        ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
-        : `No candidates available (all filtered by launchpad / holder-quality rules).`;
+        ? `No candidates available (${screeningModeLabel}).\nFiltered examples:\n${combinedExamples}`
+        : `No candidates available (${screeningModeLabel}) (all filtered by launchpad / holder-quality rules).`;
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
@@ -519,20 +675,63 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return screenReport;
     }
 
+    if (config.learning.autoLearnTopLps) {
+      const autoLearnLimit = Math.max(0, Math.min(config.learning.topLpAutoLearnLimit ?? 0, passing.length));
+      for (const { pool, ti } of passing.slice(0, autoLearnLimit)) {
+        const baseMint = pool?.base?.mint || ti?.mint || ti?.address || null;
+        const stale = isTopLPStudyStale({
+          pool_address: pool.pool,
+          base_mint: baseMint,
+          ttlHours: config.learning.topLpStudyTtlHours,
+        });
+        if (!stale) continue;
+        try {
+          await studyTopLPers({ pool_address: pool.pool, limit: 4 });
+          log("screening", `Refreshed top LP memory for ${pool.name}`);
+        } catch (error) {
+          log("screening_warn", `Top LP study refresh failed for ${pool.name}: ${error.message}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    }
+
     // Pre-fetch active_bin for all passing candidates in parallel
     const activeBinResults = await Promise.allSettled(
       passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
     );
 
+    const enrichedCandidates = passing.map(({ pool, sw, n, ti, mem }, i) => {
+      const baseMint = pool?.base?.mint || ti?.mint || ti?.address || null;
+      const holographicRecall = getHolographicRecall({
+        pool_address: pool.pool,
+        base_mint: baseMint,
+      });
+      const strategyHint = getHolographicStrategyHint({
+        pool_address: pool.pool,
+        base_mint: baseMint,
+      });
+      const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
+      return {
+        pool,
+        sw,
+        n,
+        ti,
+        mem: mem || null,
+        holographicRecall,
+        strategyHint,
+        activeBin,
+        screeningScore: scoreScreeningCandidate(pool, strategyHint),
+      };
+    }).sort((a, b) => b.screeningScore - a.screeningScore);
+
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = enrichedCandidates.map(({ pool, sw, n, ti, mem, holographicRecall, strategyHint, activeBin }) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
       const launchpad = ti?.launchpad ?? null;
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
-      const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
 
       // OKX signals
       const okxParts = [
@@ -568,8 +767,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
+        strategyHint ? `  top_lp_hint: ${strategyHint.summary} | score_boost=+${strategyHint.score_boost}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
+        holographicRecall ? `  learned_edge_untrusted: ${sanitizeUntrustedPromptText(holographicRecall, 500)}` : null,
       ].filter(Boolean).join("\n");
 
       return block;
@@ -578,17 +779,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | USDC: ${(currentBalance.usdc ?? 0).toFixed ? currentBalance.usdc.toFixed(2) : currentBalance.usdc} | Liquid: ${liquidSol.toFixed(3)} SOL eq | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | USDC: ${(currentBalance.usdc ?? 0).toFixed ? currentBalance.usdc.toFixed(2) : currentBalance.usdc} | Liquid: ${liquidSol.toFixed(3)} SOL eq | Deploy: ${deployAmount} SOL | Discovery: ${screeningModeLabel}
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
-1. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
+1. Pick the best candidate based on narrative quality, smart wallets, pool metrics, and any top LP / holographic memory edge.
 2. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(35 + (volatility/5)*55) clamped to [35,90].
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
+   If a candidate has a top_lp_hint, treat it as a strong prior for strategy and range style unless live metrics clearly contradict it.
 3. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -905,7 +1107,10 @@ function formatConfigSnapshot() {
     `Trailing: ${config.management.trailingTakeProfit ? "on" : "off"} | trigger ${config.management.trailingTriggerPct}% | drop ${config.management.trailingDropPct}%`,
     `OOR: ${config.management.outOfRangeWaitMinutes}m | cooldown ${config.management.oorCooldownTriggerCount}x / ${config.management.oorCooldownHours}h`,
     `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
+    `Loss guard: daily $${config.risk.maxDailyLossUsd} | streak ${config.risk.maxConsecutiveLosses} | cooldown ${config.risk.cooldownAfterLossMinutes}m`,
+    `Quarantine: ${config.risk.lossQuarantineTriggerCount}x losses <= ${config.risk.lossQuarantineMinPnlPct}% for ${config.risk.lossQuarantineHours}h`,
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
+    `Top LP learning: ${config.learning.autoLearnTopLps ? "on" : "off"} | TTL ${config.learning.topLpStudyTtlHours}h | top ${config.learning.topLpAutoLearnLimit}`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
   ].join("\n");
 }
@@ -946,23 +1151,34 @@ function formatHelpText() {
 }
 
 async function runDeterministicScreen(limit = 5) {
+  const lossBreaker = getLossCircuitBreakerStatus({
+    maxDailyLossUsd: config.risk.maxDailyLossUsd,
+    maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
+    cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
+  });
+  if (lossBreaker.triggered) {
+    return `Screening paused — ${formatLossCircuitBreakerReason(lossBreaker)}.\nManagement stays active on existing positions.`;
+  }
   const top = await getTopCandidates({ limit });
   const candidates = (top?.candidates || top?.pools || []).slice(0, limit);
   setLatestCandidates(candidates);
+  const modeNote = top?.screening_mode === "relaxed"
+    ? "Screening mode: relaxed fallback\n\n"
+    : "";
   if (candidates.length > 0) {
     const lines = candidates.map((pool, i) => {
       const feeTvl = pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio ?? "?";
       const vol = pool.volume_window ?? pool.volume_24h ?? "?";
       return `${i + 1}. ${pool.name} | ${pool.pool}\n   fee/aTVL ${feeTvl}% | vol $${vol} | organic ${pool.organic_score ?? "?"}`;
     });
-    return `Top candidates (${candidates.length})\n\n${lines.join("\n")}`;
+    return `${modeNote}Top candidates (${candidates.length})\n\n${lines.join("\n")}`;
   }
   const examples = (top?.filtered_examples || []).slice(0, 3)
     .map((entry) => `- ${entry.name}: ${entry.reason}`)
     .join("\n");
   return examples
-    ? `No candidates available.\nFiltered examples:\n${examples}`
-    : "No candidates available right now.";
+    ? `${modeNote}No candidates available.\nFiltered examples:\n${examples}`
+    : `${modeNote}No candidates available right now.`;
 }
 
 async function deployLatestCandidate(index) {
@@ -970,7 +1186,8 @@ async function deployLatestCandidate(index) {
   if (!candidate) {
     throw new Error("Invalid candidate index. Run /screen first.");
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+  const balances = await getWalletBalances();
+  const deployAmount = computeDeployAmount(getLiquidSolEquivalent(balances));
   const binsBelow = Math.max(35, Math.min(90, Math.round(35 + ((Number(candidate.volatility) || 0) / 5) * 55)));
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,

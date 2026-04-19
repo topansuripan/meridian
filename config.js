@@ -47,6 +47,12 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    maxDailyLossUsd: u.maxDailyLossUsd ?? 80,
+    maxConsecutiveLosses: u.maxConsecutiveLosses ?? 3,
+    cooldownAfterLossMinutes: u.cooldownAfterLossMinutes ?? 180,
+    lossQuarantineTriggerCount: u.lossQuarantineTriggerCount ?? 2,
+    lossQuarantineHours: u.lossQuarantineHours ?? 24,
+    lossQuarantineMinPnlPct: u.lossQuarantineMinPnlPct ?? -8,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -121,6 +127,13 @@ export const config = {
     managementIntervalMin:  u.managementIntervalMin  ?? 10,
     screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
     healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+  },
+
+  // ─── Learning / Recall ─────────────────
+  learning: {
+    autoLearnTopLps: u.autoLearnTopLps ?? true,
+    topLpStudyTtlHours: u.topLpStudyTtlHours ?? 12,
+    topLpAutoLearnLimit: u.topLpAutoLearnLimit ?? 3,
   },
 
   // ─── LLM Settings ──────────────────────

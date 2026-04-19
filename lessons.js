@@ -711,3 +711,67 @@ export function getPerformanceSummary() {
     total_lessons: data.lessons.length,
   };
 }
+
+/**
+ * Summarize recent losses so screening can pause after a bad stretch
+ * without disabling management of open positions.
+ */
+export function getLossCircuitBreakerStatus({
+  windowHours = 24,
+  maxDailyLossUsd = null,
+  maxConsecutiveLosses = null,
+  cooldownAfterLossMinutes = 180,
+} = {}) {
+  const data = load();
+  const history = Array.isArray(data.performance) ? data.performance : [];
+  const cutoffMs = Date.now() - (windowHours * 60 * 60 * 1000);
+  const recent = history
+    .filter((entry) => {
+      const ts = new Date(entry.recorded_at || 0).getTime();
+      return Number.isFinite(ts) && ts >= cutoffMs;
+    })
+    .sort((a, b) => new Date(a.recorded_at || 0).getTime() - new Date(b.recorded_at || 0).getTime());
+
+  const totalPnlUsd = recent.reduce((sum, entry) => sum + Number(entry.pnl_usd || 0), 0);
+  const losingTrades = recent.filter((entry) => Number(entry.pnl_usd || 0) < 0);
+
+  let consecutiveLosses = 0;
+  let consecutiveLossPnlUsd = 0;
+  for (let i = recent.length - 1; i >= 0; i -= 1) {
+    const pnlUsd = Number(recent[i]?.pnl_usd || 0);
+    if (!(pnlUsd < 0)) break;
+    consecutiveLosses += 1;
+    consecutiveLossPnlUsd += pnlUsd;
+  }
+
+  const lastLoss = losingTrades.length ? losingTrades[losingTrades.length - 1] : null;
+  const cooldownUntil = lastLoss && cooldownAfterLossMinutes > 0
+    ? new Date(new Date(lastLoss.recorded_at).getTime() + cooldownAfterLossMinutes * 60 * 1000).toISOString()
+    : null;
+  const cooldownActive = cooldownUntil ? new Date(cooldownUntil).getTime() > Date.now() : false;
+  const dailyLossTriggered =
+    maxDailyLossUsd != null &&
+    maxDailyLossUsd > 0 &&
+    totalPnlUsd <= -Math.abs(maxDailyLossUsd);
+  const streakTriggered =
+    maxConsecutiveLosses != null &&
+    maxConsecutiveLosses > 0 &&
+    consecutiveLosses >= maxConsecutiveLosses;
+  const triggered = cooldownActive && (dailyLossTriggered || streakTriggered);
+
+  return {
+    triggered,
+    daily_loss_triggered: dailyLossTriggered,
+    consecutive_loss_triggered: streakTriggered,
+    cooldown_active: cooldownActive,
+    cooldown_until: cooldownUntil,
+    window_hours: windowHours,
+    sample_size: recent.length,
+    total_pnl_usd: Math.round(totalPnlUsd * 100) / 100,
+    losing_trades: losingTrades.length,
+    consecutive_losses: consecutiveLosses,
+    consecutive_loss_pnl_usd: Math.round(consecutiveLossPnlUsd * 100) / 100,
+    last_loss_at: lastLoss?.recorded_at || null,
+    last_loss_reason: lastLoss?.close_reason || null,
+  };
+}

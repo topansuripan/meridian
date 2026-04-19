@@ -49,6 +49,13 @@ function isAdjustedWinRateExcludedReason(reason) {
     text.includes("oor");
 }
 
+function isMaterialLossDeploy(deploy, minPnlPct = -8) {
+  const pnlPct = Number(deploy?.pnl_pct);
+  const reason = String(deploy?.close_reason || "").trim().toLowerCase();
+  if (reason.includes("stop loss") || reason.includes("cut loss")) return true;
+  return Number.isFinite(pnlPct) && pnlPct <= minPnlPct;
+}
+
 function setPoolCooldown(entry, hours, reason) {
   const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
   entry.cooldown_until = cooldownUntil;
@@ -169,6 +176,24 @@ export function recordPoolDeploy(poolAddress, deployData) {
     log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
     if (entry.base_mint && mintCooldownUntil) {
       log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+    }
+  }
+
+  const lossTriggerCount = config.risk.lossQuarantineTriggerCount ?? 2;
+  const lossQuarantineHours = config.risk.lossQuarantineHours ?? 24;
+  const lossMinPnlPct = config.risk.lossQuarantineMinPnlPct ?? -8;
+  const lossWindow = entry.deploys.slice(-lossTriggerCount);
+  const repeatedLosses =
+    lossWindow.length >= lossTriggerCount &&
+    lossWindow.every((d) => isMaterialLossDeploy(d, lossMinPnlPct));
+
+  if (repeatedLosses) {
+    const reason = `repeated losses (${lossTriggerCount}x <= ${lossMinPnlPct}% / stop loss)`;
+    const poolCooldownUntil = setPoolCooldown(entry, lossQuarantineHours, reason);
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, lossQuarantineHours, reason);
+    log("pool-memory", `Loss quarantine set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+    if (entry.base_mint && mintCooldownUntil) {
+      log("pool-memory", `Base mint loss quarantine set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
     }
   }
 
