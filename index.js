@@ -1134,12 +1134,12 @@ function renderSettingsMenu(page = "main") {
         settingButton("24h", "cfg:set:gmgnInterval:24h"),
       ],
       [
-        inputButton("gmgnMinVolume", "Min volume"),
-        inputButton("gmgnMinTokenAgeHours", "Min token age (h)"),
+        inputButton("gmgnMinVolume", "Min volume")[0],
+        inputButton("gmgnMinTokenAgeHours", "Min token age (h)")[0],
       ],
       [
-        inputButton("gmgnMaxTokenAgeHours", "Max token age (h)"),
-        inputButton("gmgnMaxBundlerRate", "Max bundler %"),
+        inputButton("gmgnMaxTokenAgeHours", "Max token age (h)")[0],
+        inputButton("gmgnMaxBundlerRate", "Max bundler %")[0],
       ],
       [settingButton("KOL settings", "cfg:page:kol")],
       inputButton("managementIntervalMin", "Manage interval (min)"),
@@ -1172,10 +1172,10 @@ function renderSettingsMenu(page = "main") {
     ];
   } else if (page === "kol") {
     rows = [
-      [inputButton("gmgnPreferredKolNames", "Preferred KOL (comma-sep)")],
-      [inputButton("gmgnPreferredKolMinHoldPct", "Preferred KOL min hold %")],
-      [inputButton("gmgnDumpKolNames", "Dump KOL (comma-sep)")],
-      [inputButton("gmgnDumpKolMinHoldPct", "Dump KOL min hold %")],
+      inputButton("gmgnPreferredKolNames", "Preferred KOL (comma-sep)"),
+      inputButton("gmgnPreferredKolMinHoldPct", "Preferred KOL min hold %"),
+      inputButton("gmgnDumpKolNames", "Dump KOL (comma-sep)"),
+      inputButton("gmgnDumpKolMinHoldPct", "Dump KOL min hold %"),
     ];
   } else if (page === "indicators") {
     rows = [
