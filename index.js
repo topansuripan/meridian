@@ -901,15 +901,21 @@ IMPORTANT:
 function buildDegenScreeningOverrides() {
   const d = config.degen;
   return {
+    timeframe:            d.timeframe,
+    category:             d.category,
     minVolume:            d.minVolume,
     minTvl:               d.minTvl,
     maxTvl:               d.maxTvl,
     minOrganic:           d.minOrganic,
+    minQuoteOrganic:      d.minQuoteOrganic,
     minHolders:           d.minHolders,
     minMcap:              d.minMcap,
     maxMcap:              d.maxMcap,
+    minBinStep:           d.minBinStep,
+    maxBinStep:           d.maxBinStep,
     minFeeActiveTvlRatio: d.minFeeActiveTvlRatio,
     minTokenAgeHours:     d.minTokenAgeHours,
+    excludeHighSupplyConcentration: d.excludeHighSupplyConcentration,
   };
 }
 
