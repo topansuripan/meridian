@@ -402,7 +402,7 @@ export async function deployPosition({
           initial_value_usd,
           degen,
         });
-        recordPoolDeployStart(pool_address, { pool_name, base_mint, strategy: activeStrategy, volatility });
+        recordPoolDeployStart(pool_address, { pool_name, base_mint: pool.lbPair.tokenXMint.toString(), strategy: activeStrategy, volatility });
       }
 
       appendDecision({
@@ -538,7 +538,7 @@ export async function deployPosition({
       initial_value_usd,
       degen,
     });
-    recordPoolDeployStart(pool_address, { pool_name, base_mint, strategy: activeStrategy, volatility });
+    recordPoolDeployStart(pool_address, { pool_name, base_mint: pool.lbPair.tokenXMint.toString(), strategy: activeStrategy, volatility });
 
     appendDecision({
       type: "deploy",
