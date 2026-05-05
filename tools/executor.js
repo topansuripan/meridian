@@ -745,17 +745,19 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+      const isDegen = !!args.degen;
+      const minDeploy = isDegen ? Math.max(0.05, config.degen?.maxDeployAmount ?? 0.2) : Math.max(0.1, config.management.deployAmountSol);
       if (amountY < minDeploy) {
         return {
           pass: false,
           reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
         };
       }
-      if (amountY > config.risk.maxDeployAmount) {
+      const maxDeploy = isDegen ? (config.degen?.maxDeployAmount ?? 0.2) : config.risk.maxDeployAmount;
+      if (amountY > maxDeploy) {
         return {
           pass: false,
-          reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
+          reason: `SOL amount ${amountY} exceeds maximum allowed per position (${maxDeploy}).`,
         };
       }
 
