@@ -95,6 +95,40 @@ function setBaseMintCooldown(db, baseMint, hours, reason) {
  * @param {string} deployData.strategy
  * @param {number} deployData.volatility
  */
+/**
+ * Record that a deploy just happened (called at deploy time, before close).
+ * Increments total_deploys and sets last_deployed_at so the screener
+ * can see deployment history even for still-open positions.
+ */
+export function recordPoolDeployStart(poolAddress, { pool_name, base_mint, strategy, volatility } = {}) {
+  if (!poolAddress) return;
+  const db = load();
+
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: pool_name || poolAddress.slice(0, 8),
+      base_mint: base_mint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+
+  const entry = db[poolAddress];
+  entry.total_deploys = (entry.total_deploys || 0) + 1;
+  entry.last_deployed_at = new Date().toISOString();
+  if (base_mint && !entry.base_mint) entry.base_mint = base_mint;
+
+  save(db);
+  log("pool-memory", `Recorded deploy start for ${entry.name} (total: ${entry.total_deploys})`);
+}
+
 export function recordPoolDeploy(poolAddress, deployData) {
   if (!poolAddress) return;
 

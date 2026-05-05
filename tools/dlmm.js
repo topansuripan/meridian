@@ -21,7 +21,7 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown, recordPoolDeployStart } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -202,6 +202,7 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  degen = false,
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -399,7 +400,9 @@ export async function deployPosition({
           amount_x: finalAmountX,
           active_bin: activeBin.binId,
           initial_value_usd,
+          degen,
         });
+        recordPoolDeployStart(pool_address, { pool_name, base_mint, strategy: activeStrategy, volatility });
       }
 
       appendDecision({
@@ -533,7 +536,9 @@ export async function deployPosition({
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd,
+      degen,
     });
+    recordPoolDeployStart(pool_address, { pool_name, base_mint, strategy: activeStrategy, volatility });
 
     appendDecision({
       type: "deploy",
@@ -1264,6 +1269,7 @@ export async function closePosition({ position_address, reason }) {
           minutes_in_range: minutesHeld - minutesOOR,
           minutes_held: minutesHeld,
           close_reason: reason || "agent decision",
+          degen: !!tracked.degen,
         });
 
         appendDecision({
@@ -1535,6 +1541,7 @@ export async function closePosition({ position_address, reason }) {
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
+        degen: !!tracked.degen,
       });
 
       appendDecision({

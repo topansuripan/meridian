@@ -98,6 +98,27 @@ const client = new OpenAI({
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "MiniMax-M2.7";
 
+// Free model rotation pool — cycle through these on 429 rate limits
+const FREE_MODEL_POOL = (process.env.LLM_FREE_MODEL_POOL || "").split(",").map(s => s.trim()).filter(Boolean);
+if (FREE_MODEL_POOL.length === 0 && DEFAULT_MODEL.includes(":free")) {
+  FREE_MODEL_POOL.push(
+    DEFAULT_MODEL,
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "minimax/minimax-m2.5:free",
+  );
+}
+let _freeModelIdx = 0;
+
+function rotateFreeModel(currentModel) {
+  if (FREE_MODEL_POOL.length < 2) return null;
+  const idx = FREE_MODEL_POOL.indexOf(currentModel);
+  const nextIdx = (idx >= 0 ? idx + 1 : _freeModelIdx + 1) % FREE_MODEL_POOL.length;
+  _freeModelIdx = nextIdx;
+  const next = FREE_MODEL_POOL[nextIdx];
+  return next !== currentModel ? next : null;
+}
+
 const MUTATING_TOOL_INTENTS = /\b(deploy|open position|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|add smart wallet|remove smart wallet|add wallet|remove wallet|pin|unpin|clear lesson|add lesson|set active strategy|remove strategy|add strategy|set |change |update |self.?update|pull latest|git pull|update yourself)\b/i;
 const LIVE_DATA_TOOL_INTENTS = /\b(balance|wallet|position|portfolio|pnl|yield|range|show positions|open positions|screen|candidate|find pool|search|research|analyze|check pool|token holders|narrative|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|list smart wallets|list blacklist|list blocked deployers|list lessons)\b/i;
 const CONFIG_READ_ONLY_INTENTS = /\b(check|show|what(?:'s| is)?|review|inspect|see)\b.*\b(config|settings?|thresholds?)\b/i;
@@ -147,11 +168,11 @@ function isToolChoiceRequiredError(error) {
  * @returns {string} - The agent's final text response
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
-  const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  const { interactive = false, onToolStart = null, onToolFinish = null, degen = false } = options;
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
-  const lessons = getLessonsForPrompt({ agentType });
+  const lessons = getLessonsForPrompt({ agentType, degen });
   const perfSummary = getPerformanceSummary();
   const decisionSummary = getDecisionSummary();
   const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, decisionSummary);
@@ -170,16 +191,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   let noToolRetryCount = 0;
 
   let emptyStreak = 0;
+  let currentModel = model || DEFAULT_MODEL;
   for (let step = 0; step < maxSteps; step++) {
     log("agent", `Step ${step + 1}/${maxSteps}`);
 
     try {
-      const activeModel = model || DEFAULT_MODEL;
-
-      // Retry up to 3 times on transient provider errors (502, 503, 529)
+      // Retry up to 3 times on transient provider errors (502, 503, 529, 429)
       const FALLBACK_MODEL = process.env.LLM_FALLBACK_MODEL || DEFAULT_MODEL;
       let response;
-      let usedModel = activeModel;
+      let usedModel = currentModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
@@ -215,11 +235,33 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             attempt -= 1;
             continue;
           }
+          // Handle 429 thrown as exception — rotate free model
+          if (error.status === 429) {
+            const next = rotateFreeModel(usedModel);
+            if (next) {
+              log("agent", `Rate limited on ${usedModel}, rotating to ${next}`);
+              usedModel = next;
+              currentModel = next;
+              await new Promise((r) => setTimeout(r, 3000));
+              continue;
+            }
+          }
           throw error;
         }
         if (response.choices?.length) break;
         const errCode = response.error?.code;
-        if (errCode === 502 || errCode === 503 || errCode === 529) {
+        if (errCode === 429) {
+          const next = rotateFreeModel(usedModel);
+          if (next) {
+            log("agent", `Rate limited on ${usedModel}, rotating to ${next}`);
+            usedModel = next;
+            currentModel = next;
+            await new Promise((r) => setTimeout(r, 3000));
+          } else {
+            log("agent", `Rate limited, waiting 30s (attempt ${attempt + 1}/3)`);
+            await new Promise((r) => setTimeout(r, 30000));
+          }
+        } else if (errCode === 502 || errCode === 503 || errCode === 529) {
           const wait = (attempt + 1) * 5000;
           if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
             usedModel = FALLBACK_MODEL;
@@ -377,10 +419,17 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     } catch (error) {
       log("error", `Agent loop error at step ${step}: ${error.message}`);
 
-      // If it's a rate limit, wait and retry
+      // If it's a rate limit, rotate to next free model and retry
       if (error.status === 429) {
-        log("agent", "Rate limited, waiting 30s...");
-        await sleep(30000);
+        const next = rotateFreeModel(currentModel);
+        if (next) {
+          log("agent", `Rate limited on ${currentModel}, rotating to ${next}`);
+          currentModel = next;
+          await sleep(3000);
+        } else {
+          log("agent", "Rate limited, waiting 30s...");
+          await sleep(30000);
+        }
         continue;
       }
 

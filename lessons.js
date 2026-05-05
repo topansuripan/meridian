@@ -110,6 +110,7 @@ export async function recordPerformance(perf) {
 
   const entry = {
     ...perf,
+    degen: !!perf.degen,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
@@ -235,6 +236,8 @@ function derivLesson(perf) {
     confidence = negativeEvidence ? 0.68 : 0.32;
   }
 
+  if (perf.degen) tags.push("degen");
+
   return {
     id: Date.now(),
     rule,
@@ -249,6 +252,7 @@ function derivLesson(perf) {
     range_efficiency: perf.range_efficiency,
     close_reason: perf.close_reason,
     pool: perf.pool,
+    degen: !!perf.degen,
     created_at: new Date().toISOString(),
   };
 }
@@ -264,6 +268,8 @@ function derivLesson(perf) {
  * @returns {{ changes: Object, rationale: Object } | null}
  */
 export function evolveThresholds(perfData, config) {
+  // Only evolve regular screening thresholds from non-degen performance
+  perfData = (perfData || []).filter((p) => !p.degen);
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
   const winners = perfData.filter((p) => p.pnl_pct > 0);
@@ -578,9 +584,17 @@ export function getLessonsForPrompt(opts = {}) {
   // Support legacy call signature: getLessonsForPrompt(20)
   if (typeof opts === "number") opts = { maxLessons: opts };
 
-  const { agentType = "GENERAL", maxLessons } = opts;
+  const { agentType = "GENERAL", maxLessons, degen = false } = opts;
 
   const data = load();
+  // Filter lessons by degen/regular mode so each pool of knowledge stays separate
+  data.lessons = data.lessons.filter((l) => {
+    const isDegen = !!l.degen || !!l.tags?.includes("degen");
+    // Manual/evolution lessons with no degen tag go to regular mode only
+    if (l.sourceType !== "performance" && !isDegen) return !degen;
+    // Performance-derived lessons: match degen flag
+    return isDegen === degen;
+  });
   if (data.lessons.length === 0) return null;
 
   // Smaller caps for automated cycles — they don't need the full lesson history
@@ -691,9 +705,12 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
 /**
  * Get performance stats summary.
  */
-export function getPerformanceSummary() {
+export function getPerformanceSummary({ degen = null } = {}) {
   const data = load();
-  const p = data.performance;
+  // Filter by degen/regular when specified
+  const p = degen != null
+    ? data.performance.filter((x) => !!x.degen === degen)
+    : data.performance;
 
   if (p.length === 0) return null;
 
@@ -721,9 +738,12 @@ export function getLossCircuitBreakerStatus({
   maxDailyLossUsd = null,
   maxConsecutiveLosses = null,
   cooldownAfterLossMinutes = 180,
+  degen = false,
 } = {}) {
   const data = load();
-  const history = Array.isArray(data.performance) ? data.performance : [];
+  // Separate circuit breaker evaluation for degen vs regular positions
+  const history = (Array.isArray(data.performance) ? data.performance : [])
+    .filter((p) => !!p.degen === degen);
   const cutoffMs = Date.now() - (windowHours * 60 * 60 * 1000);
   const recent = history
     .filter((entry) => {

@@ -122,6 +122,32 @@ export const config = {
     binsBelow: u.binsBelow ?? 69,
   },
 
+  // ─── Degen Play Mode ───────────────────
+  degen: {
+    enabled:              u.degenEnabled              ?? false,
+    maxPositions:         u.degenMaxPositions         ?? 1,
+    managementIntervalMin: u.degenManagementIntervalMin ?? 1,
+    screeningIntervalMin: u.degenScreeningIntervalMin ?? 30,
+    // Screening overrides
+    minVolume:            u.degenMinVolume            ?? 50_000,
+    minTvl:               u.degenMinTvl               ?? 5_000,
+    maxTvl:               u.degenMaxTvl               ?? 200_000,
+    minOrganic:           u.degenMinOrganic           ?? 40,
+    minHolders:           u.degenMinHolders           ?? 800,
+    minMcap:              u.degenMinMcap              ?? 200_000,
+    maxMcap:              u.degenMaxMcap              ?? 10_000_000,
+    minFeeActiveTvlRatio: u.degenMinFeeActiveTvlRatio ?? 0.03,
+    minTokenAgeHours:     u.degenMinTokenAgeHours     ?? 0.5,
+    maxBundlePct:         u.degenMaxBundlePct         ?? 30,
+    maxBotHoldersPct:     u.degenMaxBotHoldersPct     ?? 40,
+    maxTop10Pct:          u.degenMaxTop10Pct          ?? 60,
+    maxDeployAmount:      u.degenMaxDeployAmount      ?? 0.2,
+    // Management overrides
+    stopLossPct:          u.degenStopLossPct          ?? -10,
+    takeProfitPct:        u.degenTakeProfitPct        ?? 3,
+    outOfRangeWaitMinutes: u.degenOutOfRangeWaitMinutes ?? 5,
+  },
+
   // ─── Scheduling ─────────────────────────
   schedule: {
     managementIntervalMin:  u.managementIntervalMin  ?? 10,

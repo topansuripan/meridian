@@ -61,6 +61,11 @@ let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+// ── Degen mode state ────────────────────
+let _degenEnabled = config.degen?.enabled ?? false;
+let _degenScreeningBusy = false;
+let _degenMgmtBusy = false;
+let _degenCronTasks = [];
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
@@ -307,6 +312,7 @@ function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
   _cronTasks = [];
+  stopDegenCrons();
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
@@ -324,7 +330,12 @@ export async function runManagementCycle({ silent = false } = {}) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
-    positions = livePositions?.positions || [];
+    const allPositions = livePositions?.positions || [];
+
+    // Skip degen-tagged positions — they're managed by the degen management cycle
+    positions = _degenEnabled
+      ? allPositions.filter(p => getTrackedPosition(p.position)?.degen !== true)
+      : allPositions;
 
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
@@ -411,7 +422,8 @@ export async function runManagementCycle({ silent = false } = {}) {
         act.action === "INSTRUCTION" ? "EVAL (instruction)" :
         act.action === "HOLD" ? "HOLD (instruction)" :
         act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      let line = `${p.pair} | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      if (p.base_mint) line += `\nhttps://gmgn.ai/sol/token/${p.base_mint}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
@@ -516,11 +528,11 @@ After executing, write a brief one-line result per position.
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
-        else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+        else sendHTML(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
+          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range, baseMint: p.base_mint }).catch(() => { });
         }
       }
     }
@@ -542,9 +554,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let screenReport = null;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
-    if (prePositions.total_positions >= config.risk.maxPositions) {
-      log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
-      screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
+    // Exclude degen positions from normal position count
+    const normalPositionCount = _degenEnabled
+      ? (prePositions.positions || []).filter(p => getTrackedPosition(p.position)?.degen !== true).length
+      : prePositions.total_positions;
+    if (normalPositionCount >= config.risk.maxPositions) {
+      log("cron", `Screening skipped — max positions reached (${normalPositionCount}/${config.risk.maxPositions})`);
+      screenReport = `Screening skipped — max positions reached (${normalPositionCount}/${config.risk.maxPositions}).`;
       appendDecision({
         type: "skip",
         actor: "SCREENER",
@@ -870,8 +886,301 @@ IMPORTANT:
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
+    // Piggyback degen screening onto normal screening cycle
+    if (_degenEnabled) {
+      runDegenScreeningCycle().catch((e) => log("degen_error", `Degen screening (piggyback) failed: ${e.message}`));
+    }
   }
   return screenReport;
+}
+
+// ═══════════════════════════════════════════
+//  DEGEN MODE — parallel screening & management
+// ═══════════════════════════════════════════
+
+function buildDegenScreeningOverrides() {
+  const d = config.degen;
+  return {
+    minVolume:            d.minVolume,
+    minTvl:               d.minTvl,
+    maxTvl:               d.maxTvl,
+    minOrganic:           d.minOrganic,
+    minHolders:           d.minHolders,
+    minMcap:              d.minMcap,
+    maxMcap:              d.maxMcap,
+    minFeeActiveTvlRatio: d.minFeeActiveTvlRatio,
+    minTokenAgeHours:     d.minTokenAgeHours,
+  };
+}
+
+function buildDegenMgmtConfig() {
+  return {
+    ...config.management,
+    stopLossPct:          config.degen.stopLossPct,
+    takeProfitPct:        config.degen.takeProfitPct,
+    outOfRangeWaitMinutes: config.degen.outOfRangeWaitMinutes,
+  };
+}
+
+function countDegenPositions(positions) {
+  return positions.filter(p => {
+    const tracked = getTrackedPosition(p.position);
+    return tracked?.degen === true;
+  }).length;
+}
+
+export async function runDegenManagementCycle() {
+  if (!_degenEnabled || _degenMgmtBusy) return null;
+  _degenMgmtBusy = true;
+  log("degen", "Starting degen management cycle");
+  const degenMgmt = buildDegenMgmtConfig();
+  let report = null;
+
+  try {
+    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const positions = livePositions?.positions || [];
+
+    // Only manage positions tagged as degen
+    const degenPositions = positions.filter(p => {
+      const tracked = getTrackedPosition(p.position);
+      return tracked?.degen === true;
+    });
+
+    if (degenPositions.length === 0) return null;
+
+    const actionMap = new Map();
+    for (const p of degenPositions) {
+      recordPositionSnapshot(p.pool, p);
+      const exit = updatePnlAndCheckExits(p.position, p, degenMgmt);
+      if (exit) {
+        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: `[DEGEN] ${exit.reason}` });
+        continue;
+      }
+      const closeRule = getDeterministicCloseRule(p, degenMgmt);
+      if (closeRule) {
+        actionMap.set(p.position, { ...closeRule, reason: `[DEGEN] ${closeRule.reason}` });
+        continue;
+      }
+      if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
+        actionMap.set(p.position, { action: "CLAIM" });
+        continue;
+      }
+      actionMap.set(p.position, { action: "STAY" });
+    }
+
+    const actions = degenPositions.filter(p => {
+      const a = actionMap.get(p.position);
+      return a && (a.action === "CLOSE" || a.action === "CLAIM");
+    });
+
+    const results = [];
+    for (const p of actions) {
+      const act = actionMap.get(p.position);
+      const toolName = act.action === "CLOSE" ? "close_position" : "claim_fees";
+      const toolArgs = act.action === "CLOSE"
+        ? { position_address: p.position, reason: act.reason }
+        : { position_address: p.position };
+      const result = await executeTool(toolName, toolArgs);
+      const success = result?.success !== false && !result?.error && !result?.blocked;
+      results.push(`${act.action} ${p.pair} — ${success ? "ok" : "failed"}${act.reason ? ` (${act.reason})` : ""}`);
+    }
+
+    const cur = config.management.solMode ? "◎" : "$";
+    const totalVal = degenPositions.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
+    const reportLines = degenPositions.map(p => {
+      const act = actionMap.get(p.position);
+      const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
+      return `${p.pair} | PnL: ${p.pnl_pct ?? "?"}% | ${inRange} | ${act?.action || "STAY"}`;
+    });
+    report = `🔥 Degen Management\n\n${reportLines.join("\n")}`;
+    if (results.length > 0) report += `\n\nExecuted:\n- ${results.join("\n- ")}`;
+    report += `\n\nValue: ${cur}${totalVal.toFixed(4)}`;
+
+    if (telegramEnabled() && results.length > 0) {
+      sendHTML(report).catch(() => {});
+    }
+  } catch (error) {
+    log("degen_error", `Degen management failed: ${error.message}`);
+  } finally {
+    _degenMgmtBusy = false;
+  }
+  return report;
+}
+
+export async function runDegenScreeningCycle() {
+  if (!_degenEnabled || _degenScreeningBusy) return null;
+  _degenScreeningBusy = true;
+  log("degen", "Starting degen screening cycle");
+  let screenReport = null;
+  let liveMessage = null;
+
+  try {
+    const [prePositions, preBalance] = await Promise.all([
+      getMyPositions({ force: true }),
+      getWalletBalances(),
+    ]);
+
+    // Count only degen positions against degen max
+    const degenCount = countDegenPositions(prePositions.positions || []);
+    if (degenCount >= config.degen.maxPositions) {
+      log("degen", `Degen screening skipped — max degen positions reached (${degenCount}/${config.degen.maxPositions})`);
+      _degenScreeningBusy = false;
+      return null;
+    }
+
+    const liquidSol = getLiquidSolEquivalent(preBalance);
+    const deployAmount = Math.min(computeDeployAmount(liquidSol), config.degen.maxDeployAmount);
+    const reserveSol = getTargetSolReserve(preBalance);
+    const isDryRun = process.env.DRY_RUN === "true";
+    if (!isDryRun && liquidSol < deployAmount + reserveSol) {
+      log("degen", `Degen screening skipped — insufficient balance (${liquidSol.toFixed(3)} SOL)`);
+      _degenScreeningBusy = false;
+      return null;
+    }
+
+    if (telegramEnabled()) {
+      liveMessage = await createLiveMessage("🔥 Degen Screening", "Hunting volume spikes...");
+    }
+
+    const degenOverrides = buildDegenScreeningOverrides();
+    const topCandidates = await getTopCandidates({ limit: 10, screeningOverrides: degenOverrides }).catch(() => null);
+    const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
+    const screeningModeLabel = topCandidates?.screening_mode === "relaxed" ? "relaxed fallback" : "degen";
+
+    // Recon each candidate
+    const allCandidates = [];
+    for (const pool of candidates) {
+      const mint = pool.base?.mint;
+      const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
+        checkSmartWalletsOnPool({ pool_address: pool.pool }),
+        mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
+        mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+      ]);
+      allCandidates.push({
+        pool,
+        sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
+        n: narrative.status === "fulfilled" ? narrative.value : null,
+        ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
+        mem: recallForPool(pool.pool),
+      });
+      await new Promise(r => setTimeout(r, 150));
+    }
+
+    // Hard filters — bot holders and bundle checks using degen thresholds
+    const filteredOut = [];
+    const passing = allCandidates.filter(({ pool, ti }) => {
+      const botPct = ti?.audit?.bot_holders_pct;
+      if (botPct != null && botPct > config.degen.maxBotHoldersPct) {
+        log("degen", `Degen filter: dropped ${pool.name} — bots ${botPct}% > ${config.degen.maxBotHoldersPct}%`);
+        filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}%` });
+        return false;
+      }
+      const bundlePct = pool.bundle_pct;
+      if (bundlePct != null && bundlePct > config.degen.maxBundlePct) {
+        log("degen", `Degen filter: dropped ${pool.name} — bundle ${bundlePct}% > ${config.degen.maxBundlePct}%`);
+        filteredOut.push({ name: pool.name, reason: `bundle ${bundlePct}%` });
+        return false;
+      }
+      return true;
+    });
+
+    if (passing.length === 0) {
+      screenReport = `No degen candidates (${screeningModeLabel}).`;
+      log("degen", screenReport);
+      return screenReport;
+    }
+
+    // Pre-fetch active bins
+    const activeBinResults = await Promise.allSettled(
+      passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
+    );
+
+    const enriched = passing.map(({ pool, sw, n, ti, mem }, i) => {
+      const baseMint = pool?.base?.mint || ti?.mint || ti?.address || null;
+      const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
+      const strategyHint = getHolographicStrategyHint({ pool_address: pool.pool, base_mint: baseMint });
+      return { pool, sw, n, ti, mem, activeBin, strategyHint, screeningScore: scoreScreeningCandidate(pool, strategyHint) };
+    }).sort((a, b) => b.screeningScore - a.screeningScore);
+
+    const candidateBlocks = enriched.map(({ pool, sw, n, ti, mem, activeBin, strategyHint }) => {
+      const botPct = ti?.audit?.bot_holders_pct ?? "?";
+      const top10Pct = ti?.audit?.top_holders_pct ?? "?";
+      const feesSol = ti?.global_fees_sol ?? "?";
+      const launchpad = ti?.launchpad ?? null;
+      const priceChange = ti?.stats_1h?.price_change;
+      const netBuyers = ti?.stats_1h?.net_buyers;
+
+      return [
+        `POOL: ${pool.name} (${pool.pool})`,
+        `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
+        `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        `  smart_wallets: ${sw?.in_pool?.length ?? 0} present`,
+        activeBin != null ? `  active_bin: ${activeBin}` : null,
+        priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
+        strategyHint ? `  top_lp_hint: ${strategyHint.summary}` : null,
+        n?.narrative ? `  narrative: ${sanitizeUntrustedPromptText(n.narrative, 300)}` : null,
+        mem ? `  memory: ${sanitizeUntrustedPromptText(mem, 300)}` : null,
+      ].filter(Boolean).join("\n");
+    });
+
+    const strategyBlock = `EXECUTION STRATEGY: ${config.strategy.strategy} | bins_above: 0 | deposit: SOL only (amount_y, amount_x=0). Do not invent alternate strategy presets.`;
+
+    const { content } = await agentLoop(`
+DEGEN SCREENING CYCLE — high-volume momentum plays
+${strategyBlock}
+Degen positions: ${degenCount}/${config.degen.maxPositions} | SOL: ${preBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL | Discovery: ${screeningModeLabel}
+
+DEGEN RULES:
+- This is a FAST momentum play. Volume spike is the primary signal.
+- Use tighter ranges (more bins_below) for faster fee capture.
+- Take profit quickly — degen TP is ${config.degen.takeProfitPct}%, stop loss is ${config.degen.stopLossPct}%.
+- OOR close after ${config.degen.outOfRangeWaitMinutes} minutes.
+
+PRE-LOADED CANDIDATES (${passing.length} pools):
+${candidateBlocks.join("\n\n")}
+
+STEPS:
+1. Pick the highest-volume candidate with acceptable risk.
+2. Call deploy_position with degen=true flag.
+   bins_below = round(35 + (volatility/5)*55) clamped to [35,90].
+   Set amount_y only, keep amount_x = 0, bins_above = 0.
+3. Report in this format:
+   🔥 DEGEN DEPLOYED
+   <pool name> | Vol: $<x> | Deploy: ◎<x> SOL
+   <pool address>
+4. If no pool qualifies: ⛔ NO DEGEN DEPLOY
+    `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
+      degen: true,
+      onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+      onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+    });
+
+    screenReport = content;
+  } catch (error) {
+    log("degen_error", `Degen screening failed: ${error.message}`);
+    screenReport = `Degen screening failed: ${error.message}`;
+  } finally {
+    _degenScreeningBusy = false;
+    if (telegramEnabled() && screenReport) {
+      if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
+      else sendMessage(`🔥 Degen Screening\n\n${stripThink(screenReport)}`).catch(() => {});
+    }
+  }
+  return screenReport;
+}
+
+function startDegenCrons() {
+  stopDegenCrons();
+  const degenMgmtTask = cron.schedule(`*/${Math.max(1, config.degen.managementIntervalMin)} * * * *`, async () => {
+    await runDegenManagementCycle();
+  });
+  _degenCronTasks = [degenMgmtTask];
+  log("degen", `Degen crons started — management every ${config.degen.managementIntervalMin}m, screening piggybacks on normal cycle`);
+}
+
+function stopDegenCrons() {
+  for (const task of _degenCronTasks) task.stop();
+  _degenCronTasks = [];
 }
 
 export function startCronJobs() {
@@ -911,7 +1220,9 @@ export function startCronJobs() {
         ) {
           schedulePeakConfirmation(p.position);
         }
-        const exit = updatePnlAndCheckExits(p.position, p, config.management);
+        const isDegen = _degenEnabled && getTrackedPosition(p.position)?.degen === true;
+        const mgmtCfg = isDegen ? buildDegenMgmtConfig() : config.management;
+        const exit = updatePnlAndCheckExits(p.position, p, mgmtCfg);
         if (exit) {
           if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
             if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
@@ -953,6 +1264,9 @@ export function startCronJobs() {
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+
+  // Start degen crons if enabled
+  if (_degenEnabled) startDegenCrons();
 }
 
 // ═══════════════════════════════════════════
@@ -1144,6 +1458,7 @@ function formatHelpText() {
     "/candidates — show latest cached candidates",
     "/deploy <n> — deploy candidate by cached index",
     "/briefing — morning briefing",
+    "/degen — toggle degen mode (on/off/status)",
     "/pause — stop cron cycles",
     "/resume — start cron cycles again",
     "/stop — shut down agent",
@@ -1417,6 +1732,23 @@ async function telegramHandler(msg) {
       ].filter(Boolean).join("\n")).catch(() => {});
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (/^\/degen(\s+(on|off|status))?$/i.test(text)) {
+    const action = text.match(/\b(on|off|status)\b/i)?.[1]?.toLowerCase();
+    if (action === "on") {
+      _degenEnabled = true;
+      startDegenCrons();
+      await sendMessage(`🔥 Degen mode ON\nScreening: with normal cycle\nManagement: every ${config.degen.managementIntervalMin}m\nMax positions: ${config.degen.maxPositions}\nMax deploy: ${config.degen.maxDeployAmount} SOL\nVolume filter: $${config.degen.minVolume}\nSL: ${config.degen.stopLossPct}% | TP: ${config.degen.takeProfitPct}%`).catch(() => {});
+    } else if (action === "off") {
+      _degenEnabled = false;
+      stopDegenCrons();
+      await sendMessage("🔥 Degen mode OFF").catch(() => {});
+    } else {
+      const status = _degenEnabled ? "ON" : "OFF";
+      await sendMessage(`🔥 Degen mode: ${status}\nMax positions: ${config.degen.maxPositions}\nVolume: $${config.degen.minVolume} | SL: ${config.degen.stopLossPct}% | TP: ${config.degen.takeProfitPct}%\nOOR close: ${config.degen.outOfRangeWaitMinutes}m`).catch(() => {});
     }
     return;
   }

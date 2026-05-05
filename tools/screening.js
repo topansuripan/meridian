@@ -279,13 +279,13 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true } = {}) {
+export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true, screeningOverrides = null } = {}) {
   const { config } = await import("../config.js");
   let discoveryMode = "standard";
   let relaxedThresholds = null;
-  let { pools } = await discoverPools({ page_size: 50 });
+  let { pools } = await discoverPools({ page_size: 50, screeningOverrides });
   if (allowRelaxedFallback && pools.length === 0) {
-    relaxedThresholds = buildRelaxedScreeningConfig(config.screening);
+    relaxedThresholds = buildRelaxedScreeningConfig({ ...config.screening, ...(screeningOverrides || {}) });
     const retry = await discoverPools({ page_size: 50, screeningOverrides: relaxedThresholds }).catch(() => ({ pools: [] }));
     if (retry.pools.length > 0) {
       pools = retry.pools;
