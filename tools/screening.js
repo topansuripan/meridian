@@ -293,6 +293,32 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
       log("screening", `Relaxed discovery fallback engaged — found ${pools.length} pools after widening thresholds`);
     }
   }
+  // Aggregate volume across all pools per token and pick best pool per token
+  const aggMin = screeningOverrides?.aggregateMinVolume;
+  if (aggMin && pools.length > 0) {
+    const byMint = new Map();
+    for (const p of pools) {
+      const mint = p.base?.mint;
+      if (!mint) continue;
+      if (!byMint.has(mint)) byMint.set(mint, { totalVol: 0, pools: [] });
+      const entry = byMint.get(mint);
+      entry.totalVol += (p.volume_window || 0);
+      entry.pools.push(p);
+    }
+    const aggregated = [];
+    for (const [mint, { totalVol, pools: tokenPools }] of byMint) {
+      if (totalVol < aggMin) continue;
+      // Pick the pool with the highest fee_active_tvl_ratio
+      tokenPools.sort((a, b) => (b.fee_active_tvl_ratio || 0) - (a.fee_active_tvl_ratio || 0));
+      const best = tokenPools[0];
+      best.aggregate_volume = Math.round(totalVol);
+      best.pool_count = tokenPools.length;
+      aggregated.push(best);
+    }
+    log("screening", `Aggregate volume filter: ${byMint.size} tokens → ${aggregated.length} passed (>= $${aggMin})`);
+    pools = aggregated;
+  }
+
   const filteredOut = [];
 
   // Exclude pools where the wallet already has an open position

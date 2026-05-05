@@ -131,7 +131,8 @@ export const config = {
     // Screening overrides
     timeframe:            u.degenTimeframe            ?? "1h",
     category:             u.degenCategory             ?? "trending",
-    minVolume:            u.degenMinVolume            ?? 50_000,
+    minVolume:            u.degenMinVolume            ?? 5_000,
+    aggregateMinVolume:   u.degenAggregateMinVolume   ?? 50_000,
     minTvl:               u.degenMinTvl               ?? 5_000,
     maxTvl:               u.degenMaxTvl               ?? 200_000,
     minOrganic:           u.degenMinOrganic           ?? 40,

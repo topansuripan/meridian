@@ -904,6 +904,7 @@ function buildDegenScreeningOverrides() {
     timeframe:            d.timeframe,
     category:             d.category,
     minVolume:            d.minVolume,
+    aggregateMinVolume:   d.aggregateMinVolume,
     minTvl:               d.minTvl,
     maxTvl:               d.maxTvl,
     minOrganic:           d.minOrganic,
