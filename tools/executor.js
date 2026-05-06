@@ -696,8 +696,9 @@ async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
       // Reject pools with bin_step out of configured range
-      const minStep = config.screening.minBinStep;
-      const maxStep = config.screening.maxBinStep;
+      const isDegen = !!args.degen;
+      const minStep = isDegen ? (config.degen?.minBinStep ?? 20) : config.screening.minBinStep;
+      const maxStep = isDegen ? (config.degen?.maxBinStep ?? 200) : config.screening.maxBinStep;
       if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
         return {
           pass: false,
@@ -745,7 +746,6 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      const isDegen = !!args.degen;
       const minDeploy = isDegen ? Math.max(0.05, config.degen?.maxDeployAmount ?? 0.2) : Math.max(0.1, config.management.deployAmountSol);
       if (amountY < minDeploy) {
         return {
