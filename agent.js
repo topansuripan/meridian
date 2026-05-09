@@ -98,6 +98,22 @@ const client = new OpenAI({
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "MiniMax-M2.7";
 
+// Fallback model chain — tried in order when primary model fails
+const FALLBACK_CHAIN = (process.env.LLM_FALLBACK_MODELS || "").split(",").map(s => s.trim()).filter(Boolean);
+if (FALLBACK_CHAIN.length === 0) {
+  FALLBACK_CHAIN.push("deepseek-v4-flash", "openai/gpt-oss-20b", "qwen/qwen3-30b-a3b-instruct-2507");
+}
+
+function nextFallbackModel(currentModel) {
+  // If current model is not in the chain, return the first fallback
+  const idx = FALLBACK_CHAIN.indexOf(currentModel);
+  if (idx < 0) return FALLBACK_CHAIN[0] || null;
+  // If there's a next one in the chain, return it
+  if (idx + 1 < FALLBACK_CHAIN.length) return FALLBACK_CHAIN[idx + 1];
+  // Exhausted the chain
+  return null;
+}
+
 // Free model rotation pool — cycle through these on 429 rate limits
 const FREE_MODEL_POOL = (process.env.LLM_FREE_MODEL_POOL || "").split(",").map(s => s.trim()).filter(Boolean);
 if (FREE_MODEL_POOL.length === 0 && DEFAULT_MODEL.includes(":free")) {
@@ -117,6 +133,13 @@ function rotateFreeModel(currentModel) {
   _freeModelIdx = nextIdx;
   const next = FREE_MODEL_POOL[nextIdx];
   return next !== currentModel ? next : null;
+}
+
+// Detect rate-limit errors even when wrapped in 500/APIConnectionError
+function isRateLimitError(error) {
+  if (error.status === 429) return true;
+  const msg = String(error?.message || error?.error?.message || "");
+  return /rate.?limit|429|too many requests/i.test(msg);
 }
 
 const MUTATING_TOOL_INTENTS = /\b(deploy|open position|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|add smart wallet|remove smart wallet|add wallet|remove wallet|pin|unpin|clear lesson|add lesson|set active strategy|remove strategy|add strategy|set |change |update |self.?update|pull latest|git pull|update yourself)\b/i;
@@ -196,15 +219,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     log("agent", `Step ${step + 1}/${maxSteps}`);
 
     try {
-      // Retry up to 3 times on transient provider errors (502, 503, 529, 429)
-      const FALLBACK_MODEL = process.env.LLM_FALLBACK_MODEL || DEFAULT_MODEL;
+      // Retry up to 3 + fallback chain length on transient provider errors
+      const maxAttempts = 3 + FALLBACK_CHAIN.length;
       let response;
       let usedModel = currentModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
-      for (let attempt = 0; attempt < 3; attempt++) {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
           const requestBody = {
             model: usedModel,
@@ -235,8 +258,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             attempt -= 1;
             continue;
           }
-          // Handle 429 thrown as exception — rotate free model
-          if (error.status === 429) {
+          // Handle rate limits (429, or 500 wrapping a 429) — try free pool, then fallback chain
+          if (isRateLimitError(error)) {
             const next = rotateFreeModel(usedModel);
             if (next) {
               log("agent", `Rate limited on ${usedModel}, rotating to ${next}`);
@@ -245,12 +268,25 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               await new Promise((r) => setTimeout(r, 3000));
               continue;
             }
+            // Try next model in fallback chain
+            const fb = nextFallbackModel(usedModel);
+            if (fb) {
+              log("agent", `Rate limited on ${usedModel}, switching to fallback ${fb}`);
+              usedModel = fb;
+              currentModel = fb;
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
+            }
+            // Exhausted all fallbacks, just wait and retry last model
+            log("agent", `All fallbacks exhausted, waiting 30s (attempt ${attempt + 1}/${maxAttempts})`);
+            await new Promise((r) => setTimeout(r, 30000));
+            continue;
           }
           throw error;
         }
         if (response.choices?.length) break;
         const errCode = response.error?.code;
-        if (errCode === 429) {
+        if (errCode === 429 || isRateLimitError({ status: errCode, message: response.error?.message })) {
           const next = rotateFreeModel(usedModel);
           if (next) {
             log("agent", `Rate limited on ${usedModel}, rotating to ${next}`);
@@ -258,16 +294,26 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             currentModel = next;
             await new Promise((r) => setTimeout(r, 3000));
           } else {
-            log("agent", `Rate limited, waiting 30s (attempt ${attempt + 1}/3)`);
-            await new Promise((r) => setTimeout(r, 30000));
+            const fb = nextFallbackModel(usedModel);
+            if (fb) {
+              log("agent", `Rate limited on ${usedModel}, switching to fallback ${fb}`);
+              usedModel = fb;
+              currentModel = fb;
+              await new Promise((r) => setTimeout(r, 2000));
+            } else {
+              log("agent", `All fallbacks exhausted, waiting 30s (attempt ${attempt + 1}/${maxAttempts})`);
+              await new Promise((r) => setTimeout(r, 30000));
+            }
           }
         } else if (errCode === 502 || errCode === 503 || errCode === 529) {
-          const wait = (attempt + 1) * 5000;
-          if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
-            usedModel = FALLBACK_MODEL;
-            log("agent", `Switching to fallback model ${FALLBACK_MODEL}`);
+          const fb = nextFallbackModel(usedModel);
+          if (fb) {
+            usedModel = fb;
+            currentModel = fb;
+            log("agent", `Provider error ${errCode}, switching to fallback ${fb}`);
           } else {
-            log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
+            const wait = (attempt + 1) * 5000;
+            log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/${maxAttempts})`);
             await new Promise((r) => setTimeout(r, wait));
           }
         } else {
@@ -309,6 +355,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         if (!msg.content) {
           messages.pop(); // remove the empty assistant message
           log("agent", "Empty response, retrying...");
+          step--; // don't consume a step for empty responses
           continue;
         }
         if (mustUseRealTool && !sawToolCall) {
@@ -327,6 +374,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               ? "You have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result."
               : "[SYSTEM REMINDER]\nYou have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result.",
           });
+          step--; // keep step at 0 so toolChoice stays "required" on retry
           continue;
         }
         log("agent", "Final answer reached");
@@ -419,16 +467,23 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     } catch (error) {
       log("error", `Agent loop error at step ${step}: ${error.message}`);
 
-      // If it's a rate limit, rotate to next free model and retry
-      if (error.status === 429) {
+      // If it's a rate limit (including 500-wrapped 429), try fallback chain
+      if (isRateLimitError(error)) {
         const next = rotateFreeModel(currentModel);
         if (next) {
           log("agent", `Rate limited on ${currentModel}, rotating to ${next}`);
           currentModel = next;
           await sleep(3000);
         } else {
-          log("agent", "Rate limited, waiting 30s...");
-          await sleep(30000);
+          const fb = nextFallbackModel(currentModel);
+          if (fb) {
+            log("agent", `Rate limited on ${currentModel}, switching to fallback ${fb}`);
+            currentModel = fb;
+            await sleep(2000);
+          } else {
+            log("agent", `All fallbacks exhausted, waiting 30s...`);
+            await sleep(30000);
+          }
         }
         continue;
       }

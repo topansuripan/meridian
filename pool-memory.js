@@ -254,6 +254,24 @@ export function isBaseMintOnCooldown(baseMint) {
   );
 }
 
+/**
+ * Check if a base_mint was deployed since a given cutoff date.
+ * Used for Saturday rule: block tokens that were deployed on Friday.
+ */
+export function wasBaseMintDeployedSince(baseMint, sinceDate) {
+  if (!baseMint) return false;
+  const cutoff = new Date(sinceDate);
+  const db = load();
+  for (const entry of Object.values(db)) {
+    if (entry?.base_mint !== baseMint) continue;
+    if (entry.last_deployed_at && new Date(entry.last_deployed_at) >= cutoff) return true;
+    for (const dep of entry.deploys || []) {
+      if (dep.deployed_at && new Date(dep.deployed_at) >= cutoff) return true;
+    }
+  }
+  return false;
+}
+
 // ─── Read ──────────────────────────────────────────────────────
 
 /**

@@ -94,7 +94,7 @@ export const config = {
     autoFundSolFromUsdc:    u.autoFundSolFromUsdc    ?? true,
     solUsdReserve:          u.solUsdReserve          ?? 8,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
-    outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 40,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
@@ -104,7 +104,7 @@ export const config = {
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
-    deployAmountSol:       u.deployAmountSol       ?? 0.5,
+    deployAmountSol:       u.deployAmountSol       ?? 0.6,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
@@ -148,7 +148,7 @@ export const config = {
     maxBundlePct:         u.degenMaxBundlePct         ?? 30,
     maxBotHoldersPct:     u.degenMaxBotHoldersPct     ?? 40,
     maxTop10Pct:          u.degenMaxTop10Pct          ?? 60,
-    maxDeployAmount:      u.degenMaxDeployAmount      ?? 0.2,
+    maxDeployAmount:      u.degenMaxDeployAmount      ?? 0.4,
     // Management overrides
     stopLossPct:          u.degenStopLossPct          ?? -10,
     takeProfitPct:        u.degenTakeProfitPct        ?? 3,

@@ -95,6 +95,26 @@ export async function generateBriefing() {
     learnedLines.push("• [STABLE] No major tuning changes or new lessons in the last 24h.");
   }
 
+  // 5. Degen History (last 24h)
+  const degenOpenedLast24h = allPositions.filter(p => p.degen && new Date(p.deployed_at) > last24h);
+  const degenClosedLast24h = allPositions.filter(p => p.degen && p.closed && new Date(p.closed_at) > last24h);
+  const degenOpen = allPositions.filter(p => p.degen && !p.closed);
+
+  const degenPerfLast24h = (lessonsData.performance || []).filter(p => p.degen && new Date(p.recorded_at) > last24h);
+  const degenTotalPnl = degenPerfLast24h.reduce((sum, p) => sum + (p.pnl_usd || 0), 0);
+  const degenTotalFees = degenPerfLast24h.reduce((sum, p) => sum + (p.fees_earned_usd || 0), 0);
+  const degenWins = degenPerfLast24h.filter(p => p.pnl_usd > 0).length;
+  const degenWinRate = degenPerfLast24h.length > 0 ? Math.round((degenWins / degenPerfLast24h.length) * 100) : null;
+
+  // All-time degen stats
+  const allDegenPerf = (lessonsData.performance || []).filter(p => p.degen);
+  const degenAllTimePnl = allDegenPerf.reduce((sum, p) => sum + (p.pnl_usd || 0), 0);
+  const degenAllTimeFees = allDegenPerf.reduce((sum, p) => sum + (p.fees_earned_usd || 0), 0);
+  const degenAllTimeWins = allDegenPerf.filter(p => p.pnl_usd > 0).length;
+  const degenAllTimeWinRate = allDegenPerf.length > 0 ? Math.round((degenAllTimeWins / allDegenPerf.length) * 100) : null;
+
+  const hasDegen = degenPerfLast24h.length > 0 || degenOpenedLast24h.length > 0 || degenClosedLast24h.length > 0 || degenOpen.length > 0;
+
   const recentFocus = openPositions
     .slice(-2)
     .map((p) => p.pool_name || p.pairName || p.pair || p.pool || p.position)
@@ -119,6 +139,24 @@ export async function generateBriefing() {
     winRate !== null
       ? `📈 Win Rate (24h): ${winRate}%`
       : `📈 Win Rate (24h): N/A`,
+  ];
+
+  // Degen section — only shown if there's any degen activity
+  if (hasDegen) {
+    const degenPnlSign = degenTotalPnl >= 0 ? "+" : "";
+    lines.push(
+      ``,
+      `<b>🔥 Degen Mode:</b>`,
+      `📥 Opened: ${degenOpenedLast24h.length} | 📤 Closed: ${degenClosedLast24h.length} | 📂 Open: ${degenOpen.length}`,
+      `💰 PnL: ${degenPnlSign}$${formatUsd(degenTotalPnl)} | 💎 Fees: $${formatUsd(degenTotalFees)}`,
+      degenWinRate !== null ? `📈 Win Rate: ${degenWinRate}% (${degenPerfLast24h.length} trades)` : null,
+      allDegenPerf.length > 0
+        ? `📊 All-time: ${formatSignedUsd(degenAllTimePnl)} | ${degenAllTimeWinRate}% win (${allDegenPerf.length} trades)`
+        : null,
+    );
+  }
+
+  lines.push(
     ``,
     `<b>Lessons Learned:</b>`,
     ...learnedLines,
@@ -135,7 +173,7 @@ export async function generateBriefing() {
       ? `🎯 Focus Now: ${recentFocus.join(", ")}`
       : `🎯 Focus Now: Screening for the next high-quality setup`,
     `────────────────`,
-  ];
+  );
 
   return lines.filter(Boolean).join("\n");
 }

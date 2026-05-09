@@ -14,7 +14,7 @@ import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { getPoolMemory, addPoolNote, wasBaseMintDeployedSince } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
@@ -30,7 +30,7 @@ import { execSync, spawn } from "child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap, notifySwapBack } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifySwap, notifySwapBack, sendHTML } from "../telegram.js";
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
@@ -571,6 +571,9 @@ export async function executeTool(name, args) {
     const safetyCheck = await runSafetyChecks(name, args);
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
+      if (name === "deploy_position") {
+        sendHTML(`⛔ <b>Deploy Blocked</b>\n\n${safetyCheck.reason}`).catch(() => {});
+      }
       return {
         blocked: true,
         reason: safetyCheck.reason,
@@ -733,6 +736,19 @@ async function runSafetyChecks(name, args) {
           return {
             pass: false,
             reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
+          };
+        }
+      }
+
+      // Saturday rule: block tokens that were deployed on Friday (weekend loss prevention)
+      if (args.base_mint && new Date().getDay() === 6) {
+        const fridayStart = new Date();
+        fridayStart.setDate(fridayStart.getDate() - 1);
+        fridayStart.setHours(0, 0, 0, 0);
+        if (wasBaseMintDeployedSince(args.base_mint, fridayStart)) {
+          return {
+            pass: false,
+            reason: `Saturday rule: token ${args.base_mint.slice(0, 8)}… was already deployed on Friday. Skipping to avoid weekend losses.`,
           };
         }
       }

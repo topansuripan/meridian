@@ -72,6 +72,9 @@ const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
+// ── Emergency exit state ─────────────────
+let _consecutiveLlmFailures = 0;
+const EMERGENCY_EXIT_THRESHOLD = 3; // close all positions after N consecutive total LLM failures
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
@@ -315,6 +318,89 @@ function stopCronJobs() {
   stopDegenCrons();
 }
 
+// ═══════════════════════════════════════════
+//  EMERGENCY EXIT — close all positions without LLM
+// ═══════════════════════════════════════════
+let _emergencyExitBusy = false;
+
+async function emergencyExitAllPositions(triggerReason) {
+  if (_emergencyExitBusy) return;
+  _emergencyExitBusy = true;
+  log("emergency", `🚨 EMERGENCY EXIT triggered: ${triggerReason}`);
+
+  try {
+    if (telegramEnabled()) {
+      await sendHTML(`🚨 <b>EMERGENCY EXIT</b>\n\nAll LLM models failed. Closing ALL positions to protect funds.\n\nReason: ${triggerReason}`).catch(() => {});
+    }
+
+    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const allPositions = livePositions?.positions || [];
+
+    if (allPositions.length === 0) {
+      log("emergency", "No open positions found — nothing to close");
+      if (telegramEnabled()) {
+        await sendHTML("🚨 Emergency exit: no open positions found.").catch(() => {});
+      }
+      return;
+    }
+
+    log("emergency", `Found ${allPositions.length} position(s) to close`);
+    const results = [];
+
+    for (const p of allPositions) {
+      const reason = `[EMERGENCY] LLM unavailable — ${triggerReason}`;
+      try {
+        log("emergency", `Closing ${p.pair || p.position}...`);
+        const result = await executeTool("close_position", {
+          position_address: p.position,
+          reason,
+        });
+        const success = result?.success !== false && !result?.error && !result?.blocked;
+        results.push({ pair: p.pair, position: p.position, success, error: result?.error });
+        log("emergency", `${p.pair || p.position}: ${success ? "CLOSED" : `FAILED — ${result?.error || "unknown"}`}`);
+      } catch (err) {
+        results.push({ pair: p.pair, position: p.position, success: false, error: err.message });
+        log("emergency", `${p.pair || p.position}: EXCEPTION — ${err.message}`);
+      }
+    }
+
+    // Send summary via Telegram
+    const closed = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success).length;
+    const lines = results.map(r =>
+      r.success ? `✅ ${r.pair} — closed` : `❌ ${r.pair} — failed: ${r.error}`
+    );
+    const summary = [
+      `🚨 <b>EMERGENCY EXIT COMPLETE</b>`,
+      ``,
+      `Closed: ${closed}/${results.length}`,
+      failed > 0 ? `Failed: ${failed}` : null,
+      ``,
+      ...lines,
+    ].filter(Boolean).join("\n");
+
+    log("emergency", `Emergency exit done: ${closed}/${results.length} closed`);
+    if (telegramEnabled()) {
+      await sendHTML(summary).catch(() => {});
+    }
+
+    appendDecision({
+      type: "emergency_exit",
+      actor: "SYSTEM",
+      summary: `Emergency exit: ${closed}/${results.length} positions closed`,
+      reason: triggerReason,
+      details: results,
+    });
+  } catch (err) {
+    log("emergency", `Emergency exit itself failed: ${err.message}`);
+    if (telegramEnabled()) {
+      await sendHTML(`🚨 <b>EMERGENCY EXIT FAILED</b>\n\n${err.message}\n\nManual intervention required!`).catch(() => {});
+    }
+  } finally {
+    _emergencyExitBusy = false;
+  }
+}
+
 export async function runManagementCycle({ silent = false } = {}) {
   if (_managementBusy) return null;
   _managementBusy = true;
@@ -513,6 +599,9 @@ After executing, write a brief one-line result per position.
       }
     }
 
+    // Management cycle completed successfully — reset LLM failure counter
+    _consecutiveLlmFailures = 0;
+
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
@@ -523,6 +612,17 @@ After executing, write a brief one-line result per position.
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
     mgmtReport = `Management cycle failed: ${error.message}`;
+
+    // Track consecutive LLM failures for emergency exit
+    const isLlmFailure = /rate.?limit|429|too many requests|API returned no choices|couldn.*complete.*reliably/i.test(error.message);
+    if (isLlmFailure) {
+      _consecutiveLlmFailures++;
+      log("emergency", `Consecutive LLM failures: ${_consecutiveLlmFailures}/${EMERGENCY_EXIT_THRESHOLD}`);
+      if (_consecutiveLlmFailures >= EMERGENCY_EXIT_THRESHOLD) {
+        _consecutiveLlmFailures = 0;
+        await emergencyExitAllPositions(`${EMERGENCY_EXIT_THRESHOLD} consecutive LLM failures — last error: ${error.message}`);
+      }
+    }
   } finally {
     _managementBusy = false;
     if (!silent && telegramEnabled()) {
@@ -867,6 +967,7 @@ IMPORTANT:
         onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
       });
     screenReport = content;
+    _consecutiveLlmFailures = 0; // Screening succeeded — reset LLM failure counter
     if (/⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({
         type: "no_deploy",
@@ -878,6 +979,17 @@ IMPORTANT:
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
+
+    // Track consecutive LLM failures for emergency exit
+    const isLlmFailure = /rate.?limit|429|too many requests|API returned no choices|couldn.*complete.*reliably/i.test(error.message);
+    if (isLlmFailure) {
+      _consecutiveLlmFailures++;
+      log("emergency", `Consecutive LLM failures: ${_consecutiveLlmFailures}/${EMERGENCY_EXIT_THRESHOLD}`);
+      if (_consecutiveLlmFailures >= EMERGENCY_EXIT_THRESHOLD) {
+        _consecutiveLlmFailures = 0;
+        await emergencyExitAllPositions(`${EMERGENCY_EXIT_THRESHOLD} consecutive LLM failures — last error: ${error.message}`);
+      }
+    }
   } finally {
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
