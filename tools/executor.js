@@ -20,7 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -29,8 +29,145 @@ import { execSync, spawn } from "child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
+const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const MIN_VOLATILITY_TIMEFRAME = "30m";
+const TIMEFRAME_MINUTES = {
+  "5m": 5,
+  "15m": 15,
+  "30m": 30,
+  "1h": 60,
+  "2h": 120,
+  "4h": 240,
+  "12h": 720,
+  "24h": 1440,
+};
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap, notifySwapBack } from "../telegram.js";
+
+function numberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getVolatilityTimeframe(sourceTimeframe) {
+  const source = String(sourceTimeframe || "").trim();
+  const sourceMinutes = TIMEFRAME_MINUTES[source];
+  const minMinutes = TIMEFRAME_MINUTES[MIN_VOLATILITY_TIMEFRAME];
+  return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
+}
+
+function poolDetailTvl(pool) {
+  return numberOrNull(pool?.tvl ?? pool?.active_tvl ?? pool?.liquidity);
+}
+
+function poolDetailBinStep(pool) {
+  return numberOrNull(pool?.dlmm_params?.bin_step ?? pool?.pool_config?.bin_step);
+}
+
+function poolDetailFeeActiveTvlRatio(pool) {
+  return numberOrNull(pool?.fee_active_tvl_ratio);
+}
+
+function poolDetailVolatility(pool) {
+  return numberOrNull(pool?.volatility);
+}
+
+async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
+  const encodedTimeframe = encodeURIComponent(timeframe);
+  const filter = encodeURIComponent(`pool_address=${poolAddress}`);
+  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  return (data?.data || [])[0] ?? null;
+}
+
+async function validateDeployPoolThresholds(args) {
+  let detail;
+  try {
+    detail = await fetchFreshPoolDetail(args.pool_address);
+    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+  } catch (error) {
+    return {
+      pass: false,
+      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
+    };
+  }
+
+  const tvl = poolDetailTvl(detail);
+  const minTvl = numberOrNull(config.screening.minTvl);
+  const maxTvl = numberOrNull(config.screening.maxTvl);
+  if (tvl == null) {
+    return {
+      pass: false,
+      reason: "Could not verify pool TVL before deploy.",
+    };
+  }
+  if (minTvl != null && minTvl > 0 && tvl < minTvl) {
+    return {
+      pass: false,
+      reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
+    };
+  }
+  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
+    return {
+      pass: false,
+      reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
+    };
+  }
+
+  const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
+  const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
+  if (
+    minFeeActiveTvlRatio != null &&
+    minFeeActiveTvlRatio > 0 &&
+    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
+  ) {
+    return {
+      pass: false,
+      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+    };
+  }
+
+  const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
+  let volatilityDetail = detail;
+  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
+    try {
+      volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
+    } catch (error) {
+      return {
+        pass: false,
+        reason: `Could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
+      };
+    }
+  }
+
+  const volatility = poolDetailVolatility(volatilityDetail);
+  if (volatility == null || volatility <= 0) {
+    return {
+      pass: false,
+      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
+    };
+  }
+
+  const actualBinStep = poolDetailBinStep(detail);
+  const minStep = numberOrNull(config.screening.minBinStep);
+  const maxStep = numberOrNull(config.screening.maxBinStep);
+  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
+    return {
+      pass: false,
+      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
+    };
+  }
+  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
+    return {
+      pass: false,
+      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
+    };
+  }
+
+  return { pass: true };
+}
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
@@ -320,15 +457,20 @@ const toolMap = {
       }
       // Delay restart so this tool response (and Telegram message) gets sent first
       setTimeout(() => {
-        const child = spawn(process.execPath, process.argv.slice(1), {
-          detached: true,
-          stdio: "inherit",
-          cwd: process.cwd(),
-        });
-        child.unref();
+        if (!process.env.pm_id) {
+          const child = spawn(process.execPath, process.argv.slice(1), {
+            detached: true,
+            stdio: "inherit",
+            cwd: process.cwd(),
+          });
+          child.unref();
+        }
         process.exit(0);
       }, 3000);
-      return { success: true, updated: true, message: `Updated! Restarting in 3s...\n${result}` };
+      const restartMode = process.env.pm_id
+        ? "PM2 detected — exiting in 3s so PM2 can restart the managed process."
+        : "Restarting in 3s...";
+      return { success: true, updated: true, message: `Updated! ${restartMode}\n${result}` };
     } catch (e) {
       return { success: false, error: e.message };
     }
@@ -416,6 +558,11 @@ const toolMap = {
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],
+      repeatDeployCooldownEnabled: ["management", "repeatDeployCooldownEnabled"],
+      repeatDeployCooldownTriggerCount: ["management", "repeatDeployCooldownTriggerCount"],
+      repeatDeployCooldownHours: ["management", "repeatDeployCooldownHours"],
+      repeatDeployCooldownScope: ["management", "repeatDeployCooldownScope"],
+      repeatDeployCooldownMinFeeEarnedPct: ["management", "repeatDeployCooldownMinFeeEarnedPct"],
       minVolumeToRebalance: ["management", "minVolumeToRebalance"],
       stopLossPct: ["management", "stopLossPct"],
       takeProfitPct: ["management", "takeProfitPct"],
@@ -456,7 +603,10 @@ const toolMap = {
       maxSteps: ["llm", "maxSteps"],
       // strategy
       strategy: ["strategy", "strategy"],
-      binsBelow: ["strategy", "binsBelow"],
+      binsBelow: ["strategy", "maxBinsBelow", ["maxBinsBelow"]],
+      minBinsBelow: ["strategy", "minBinsBelow"],
+      maxBinsBelow: ["strategy", "maxBinsBelow"],
+      defaultBinsBelow: ["strategy", "defaultBinsBelow"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -466,6 +616,16 @@ const toolMap = {
       publicApiKey: ["api", "publicApiKey"],
       agentMeridianApiUrl: ["api", "url"],
       lpAgentRelayEnabled: ["api", "lpAgentRelayEnabled"],
+      // chart indicators
+      chartIndicatorsEnabled: ["indicators", "enabled", ["chartIndicators", "enabled"]],
+      indicatorEntryPreset: ["indicators", "entryPreset", ["chartIndicators", "entryPreset"]],
+      indicatorExitPreset: ["indicators", "exitPreset", ["chartIndicators", "exitPreset"]],
+      rsiLength: ["indicators", "rsiLength", ["chartIndicators", "rsiLength"]],
+      indicatorIntervals: ["indicators", "intervals", ["chartIndicators", "intervals"]],
+      indicatorCandles: ["indicators", "candles", ["chartIndicators", "candles"]],
+      rsiOversold: ["indicators", "rsiOversold", ["chartIndicators", "rsiOversold"]],
+      rsiOverbought: ["indicators", "rsiOverbought", ["chartIndicators", "rsiOverbought"]],
+      requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
     };
 
     const applied = {};
@@ -480,11 +640,22 @@ const toolMap = {
       return { success: false, error: "changes must be an object", reason };
     }
 
+    const STRATEGY_BIN_KEYS = new Set(["binsBelow", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow"]);
     for (const [key, val] of Object.entries(changes)) {
       const match = CONFIG_MAP[key] ? [key, CONFIG_MAP[key]] : CONFIG_MAP_LOWER[key.toLowerCase()];
       if (!match) { unknown.push(key); continue; }
       try {
-        applied[match[0]] = normalizeConfigValue(match[0], val);
+        let normalizedVal = val;
+        if (STRATEGY_BIN_KEYS.has(match[0])) {
+          const numericVal = Number(val);
+          if (!Number.isFinite(numericVal)) {
+            throw new Error(`${match[0]} must be a finite number`);
+          }
+          normalizedVal = Math.max(MIN_SAFE_BINS_BELOW, Math.round(numericVal));
+        } else {
+          normalizedVal = normalizeConfigValue(match[0], val);
+        }
+        applied[match[0]] = normalizedVal;
       } catch (error) {
         return { success: false, error: error.message, key: match[0], reason };
       }
@@ -511,8 +682,38 @@ const toolMap = {
       config[section][field] = val;
       log("config", `update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`);
     }
+    if (
+      applied.binsBelow != null ||
+      applied.minBinsBelow != null ||
+      applied.maxBinsBelow != null ||
+      applied.defaultBinsBelow != null
+    ) {
+      config.strategy.minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW)));
+      config.strategy.maxBinsBelow = Math.max(config.strategy.minBinsBelow, Math.round(Number(config.strategy.maxBinsBelow ?? config.strategy.minBinsBelow)));
+      config.strategy.defaultBinsBelow = Math.max(
+        config.strategy.minBinsBelow,
+        Math.min(
+          config.strategy.maxBinsBelow,
+          Math.round(Number(config.strategy.defaultBinsBelow ?? config.strategy.maxBinsBelow)),
+        ),
+      );
+    }
 
-    Object.assign(userConfig, applied);
+    for (const [key, val] of Object.entries(applied)) {
+      const persistPath = CONFIG_MAP[key]?.[2];
+      if (Array.isArray(persistPath) && persistPath.length > 0) {
+        let target = userConfig;
+        for (const part of persistPath.slice(0, -1)) {
+          if (!target[part] || typeof target[part] !== "object" || Array.isArray(target[part])) {
+            target[part] = {};
+          }
+          target = target[part];
+        }
+        target[persistPath[persistPath.length - 1]] = val;
+      } else {
+        userConfig[key] = val;
+      }
+    }
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
@@ -695,6 +896,9 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      const poolThresholds = await validateDeployPoolThresholds(args);
+      if (!poolThresholds.pass) return poolThresholds;
+
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
@@ -702,6 +906,65 @@ async function runSafetyChecks(name, args) {
         return {
           pass: false,
           reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
+        };
+      }
+
+      const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
+      const deployAmountX = Number(args.amount_x ?? 0);
+      if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
+        return {
+          pass: false,
+          reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
+        };
+      }
+      const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
+      const requestedBinsAbove = Number(args.bins_above ?? 0);
+      const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+      const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
+      const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
+      const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
+      if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
+        return {
+          pass: false,
+          reason: `volatility ${args.volatility} is invalid. Refusing deploy because the volatility feed is unusable.`,
+        };
+      }
+      if (
+        args.downside_pct == null &&
+        args.upside_pct == null &&
+        (
+          !Number.isFinite(requestedBinsBelow) ||
+          !Number.isFinite(requestedBinsAbove) ||
+          !Number.isInteger(requestedBinsBelow) ||
+          !Number.isInteger(requestedBinsAbove) ||
+          requestedBinsBelow < 0 ||
+          requestedBinsAbove < 0 ||
+          requestedTotalBins < minBinsBelow
+        )
+      ) {
+        return {
+          pass: false,
+          reason: `deploy range ${requestedTotalBins} total bins is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+        };
+      }
+      if (
+        isSingleSidedSol &&
+        args.downside_pct == null &&
+        (!Number.isFinite(requestedBinsBelow) || !Number.isInteger(requestedBinsBelow) || requestedBinsBelow < minBinsBelow)
+      ) {
+        return {
+          pass: false,
+          reason: `bins_below ${args.bins_below ?? "missing"} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+        };
+      }
+      if (
+        isSingleSidedSol &&
+        args.upside_pct == null &&
+        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove !== 0)
+      ) {
+        return {
+          pass: false,
+          reason: "Single-side SOL deploy must use bins_above=0.",
         };
       }
 
@@ -737,8 +1000,8 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check amount limits
-      const amountY = args.amount_y ?? args.amount_sol ?? 0;
-      if (amountY <= 0) {
+      const amountY = deployAmountY;
+      if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
           pass: false,
           reason: `Must provide a positive SOL amount (amount_y).`,

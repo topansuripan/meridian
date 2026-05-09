@@ -49,11 +49,14 @@ function isAdjustedWinRateExcludedReason(reason) {
     text.includes("oor");
 }
 
-function isMaterialLossDeploy(deploy, minPnlPct = -8) {
-  const pnlPct = Number(deploy?.pnl_pct);
-  const reason = String(deploy?.close_reason || "").trim().toLowerCase();
-  if (reason.includes("stop loss") || reason.includes("cut loss")) return true;
-  return Number.isFinite(pnlPct) && pnlPct <= minPnlPct;
+function isFeeGeneratingDeploy(deploy) {
+  const minFeeEarnedPct = Number(config.management.repeatDeployCooldownMinFeeEarnedPct ?? 0);
+  const feeEarnedPct = Number(deploy.fee_earned_pct ?? 0);
+  const feesUsd = Number(deploy.fees_earned_usd ?? 0);
+  const feesSol = Number(deploy.fees_earned_sol ?? 0);
+  const hasFees = (Number.isFinite(feesUsd) && feesUsd > 0) || (Number.isFinite(feesSol) && feesSol > 0);
+  if (!hasFees) return false;
+  return Number.isFinite(feeEarnedPct) && feeEarnedPct >= minFeeEarnedPct;
 }
 
 function setPoolCooldown(entry, hours, reason) {
@@ -123,6 +126,9 @@ export function recordPoolDeploy(poolAddress, deployData) {
     closed_at: deployData.closed_at || new Date().toISOString(),
     pnl_pct: deployData.pnl_pct ?? null,
     pnl_usd: deployData.pnl_usd ?? null,
+    fees_earned_usd: deployData.fees_earned_usd ?? null,
+    fees_earned_sol: deployData.fees_earned_sol ?? null,
+    fee_earned_pct: deployData.fee_earned_pct ?? null,
     range_efficiency: deployData.range_efficiency ?? null,
     minutes_held: deployData.minutes_held ?? null,
     close_reason: deployData.close_reason || null,
@@ -179,21 +185,29 @@ export function recordPoolDeploy(poolAddress, deployData) {
     }
   }
 
-  const lossTriggerCount = config.risk.lossQuarantineTriggerCount ?? 2;
-  const lossQuarantineHours = config.risk.lossQuarantineHours ?? 24;
-  const lossMinPnlPct = config.risk.lossQuarantineMinPnlPct ?? -8;
-  const lossWindow = entry.deploys.slice(-lossTriggerCount);
-  const repeatedLosses =
-    lossWindow.length >= lossTriggerCount &&
-    lossWindow.every((d) => isMaterialLossDeploy(d, lossMinPnlPct));
+  if (config.management.repeatDeployCooldownEnabled) {
+    const triggerCount = Math.max(1, Number(config.management.repeatDeployCooldownTriggerCount ?? 3));
+    const cooldownHours = Math.max(0, Number(config.management.repeatDeployCooldownHours ?? 12));
+    const rawScope = String(config.management.repeatDeployCooldownScope || "token").toLowerCase();
+    const scope = ["pool", "token", "both"].includes(rawScope) ? rawScope : "token";
+    const recentRepeatDeploys = entry.deploys.slice(-triggerCount);
+    const repeatedFeeGeneratingDeploys =
+      cooldownHours > 0 &&
+      recentRepeatDeploys.length >= triggerCount &&
+      recentRepeatDeploys.every((d) => d.pnl_pct != null && isFeeGeneratingDeploy(d));
 
-  if (repeatedLosses) {
-    const reason = `repeated losses (${lossTriggerCount}x <= ${lossMinPnlPct}% / stop loss)`;
-    const poolCooldownUntil = setPoolCooldown(entry, lossQuarantineHours, reason);
-    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, lossQuarantineHours, reason);
-    log("pool-memory", `Loss quarantine set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
-    if (entry.base_mint && mintCooldownUntil) {
-      log("pool-memory", `Base mint loss quarantine set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+    if (repeatedFeeGeneratingDeploys) {
+      const reason = `repeat fee-generating deploys (${triggerCount}x)`;
+      if (scope === "pool" || scope === "both" || !entry.base_mint) {
+        const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
+        log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+      }
+      if ((scope === "token" || scope === "both") && entry.base_mint) {
+        const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
+        if (mintCooldownUntil) {
+          log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
+        }
+      }
     }
   }
 

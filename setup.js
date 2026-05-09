@@ -4,6 +4,7 @@
  * Run: npm run setup
  */
 
+import "./envcrypt.js";
 import readline from "readline";
 import fs from "fs";
 import path from "path";
@@ -226,6 +227,24 @@ const dryRun = await askBool(
   e("dryRun", true)
 );
 
+const minBinsBelow = await askNum(
+  "Minimum bins below active bin",
+  e("minBinsBelow", 35),
+  { min: 35, max: 1400 }
+);
+
+const maxBinsBelow = await askNum(
+  "Maximum bins below active bin",
+  e("maxBinsBelow", e("binsBelow", 69)),
+  { min: minBinsBelow, max: 1400 }
+);
+
+const defaultBinsBelow = await askNum(
+  "Default bins below active bin",
+  e("defaultBinsBelow", e("binsBelow", maxBinsBelow)),
+  { min: minBinsBelow, max: maxBinsBelow }
+);
+
 // ─── Section 5: Risk & Filters ────────────────────────────────────────────────
 console.log("\n── Risk & Filters ────────────────────────────────────────────");
 
@@ -271,6 +290,34 @@ const outOfRangeWaitMinutes = await askNum(
   "Minutes out-of-range before closing",
   p("outOfRangeWaitMinutes", 30),
   { min: 1 }
+);
+
+const repeatDeployCooldownEnabled = await askBool(
+  "Cooldown token/pool after repeated fee-generating deploys?",
+  p("repeatDeployCooldownEnabled", true)
+);
+
+const repeatDeployCooldownTriggerCount = await askNum(
+  "Repeat deploy cooldown trigger count",
+  p("repeatDeployCooldownTriggerCount", 3),
+  { min: 1 }
+);
+
+const repeatDeployCooldownHours = await askNum(
+  "Repeat deploy cooldown hours",
+  p("repeatDeployCooldownHours", 12),
+  { min: 0 }
+);
+
+const repeatDeployCooldownScope = await ask(
+  "Repeat deploy cooldown scope (pool/token/both)",
+  p("repeatDeployCooldownScope", "token")
+);
+
+const repeatDeployCooldownMinFeeEarnedPct = await askNum(
+  "Repeat deploy min fee earned %",
+  p("repeatDeployCooldownMinFeeEarnedPct", 0),
+  { min: 0 }
 );
 
 // ─── Section 7: Scheduling ────────────────────────────────────────────────────
@@ -372,6 +419,9 @@ const userConfig = {
   deployAmountSol,
   maxPositions,
   minSolToOpen,
+  minBinsBelow,
+  maxBinsBelow,
+  defaultBinsBelow,
   timeframe,
   minOrganic,
   minHolders,
@@ -379,6 +429,11 @@ const userConfig = {
   takeProfitFeePct,
   stopLossPct,
   outOfRangeWaitMinutes,
+  repeatDeployCooldownEnabled,
+  repeatDeployCooldownTriggerCount,
+  repeatDeployCooldownHours,
+  repeatDeployCooldownScope,
+  repeatDeployCooldownMinFeeEarnedPct,
   managementIntervalMin,
   screeningIntervalMin,
 };
@@ -420,6 +475,7 @@ console.log(`
   Take profit:  fees ≥ ${takeProfitFeePct}%
   Stop loss:    ${stopLossPct}% price drop
   OOR close:    after ${outOfRangeWaitMinutes} min
+  Repeat CD:    ${repeatDeployCooldownEnabled ? `${repeatDeployCooldownTriggerCount}x / ${repeatDeployCooldownHours}h / ${repeatDeployCooldownScope}` : "disabled"}
 
   Cycles:       management every ${managementIntervalMin}m  ·  screening every ${screeningIntervalMin}m
   Provider:     ${provider.label.split("(")[0].trim()}

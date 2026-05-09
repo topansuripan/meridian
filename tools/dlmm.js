@@ -2,13 +2,16 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  SystemInstruction,
+  SystemProgram,
   Transaction,
+  TransactionInstruction,
   VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
-import { config, computeDeployAmount } from "../config.js";
+import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -34,6 +37,12 @@ let _DLMM = null;
 let _StrategyType = null;
 let _getBinIdFromPrice = null;
 let _getPriceOfBinByBinId = null;
+let _getBinArrayKeysCoverage = null;
+let _getBinArrayIndexesCoverage = null;
+let _deriveBinArrayBitmapExtension = null;
+let _isOverflowDefaultBinArrayBitmap = null;
+let _BIN_ARRAY_FEE = null;
+let _BIN_ARRAY_BITMAP_FEE = null;
 
 async function getDLMM() {
   if (!_DLMM) {
@@ -42,12 +51,24 @@ async function getDLMM() {
     _StrategyType = mod.StrategyType;
     _getBinIdFromPrice = mod.default?.getBinIdFromPrice;
     _getPriceOfBinByBinId = mod.getPriceOfBinByBinId;
+    _getBinArrayKeysCoverage = mod.getBinArrayKeysCoverage;
+    _getBinArrayIndexesCoverage = mod.getBinArrayIndexesCoverage;
+    _deriveBinArrayBitmapExtension = mod.deriveBinArrayBitmapExtension;
+    _isOverflowDefaultBinArrayBitmap = mod.isOverflowDefaultBinArrayBitmap;
+    _BIN_ARRAY_FEE = mod.BIN_ARRAY_FEE;
+    _BIN_ARRAY_BITMAP_FEE = mod.BIN_ARRAY_BITMAP_FEE;
   }
   return {
     DLMM: _DLMM,
     StrategyType: _StrategyType,
     getBinIdFromPrice: _getBinIdFromPrice,
     getPriceOfBinByBinId: _getPriceOfBinByBinId,
+    getBinArrayKeysCoverage: _getBinArrayKeysCoverage,
+    getBinArrayIndexesCoverage: _getBinArrayIndexesCoverage,
+    deriveBinArrayBitmapExtension: _deriveBinArrayBitmapExtension,
+    isOverflowDefaultBinArrayBitmap: _isOverflowDefaultBinArrayBitmap,
+    BIN_ARRAY_FEE: _BIN_ARRAY_FEE,
+    BIN_ARRAY_BITMAP_FEE: _BIN_ARRAY_BITMAP_FEE,
   };
 }
 
@@ -99,10 +120,147 @@ function signSerializedTransaction(serialized, wallet) {
   }
 }
 
+function deserializeSignedTransaction(signedBase64) {
+  const bytes = Buffer.from(signedBase64, "base64");
+  try {
+    return VersionedTransaction.deserialize(bytes);
+  } catch {
+    return Transaction.from(bytes);
+  }
+}
+
+function getStaticAccountKeyStrings(tx) {
+  if (tx instanceof VersionedTransaction) {
+    return tx.message.staticAccountKeys.map((key) => key.toString());
+  }
+  return tx.compileMessage().accountKeys.map((key) => key.toString());
+}
+
+function getTransactionInstructions(tx) {
+  if (!(tx instanceof VersionedTransaction)) return tx.instructions;
+
+  const keys = tx.message.staticAccountKeys;
+  return tx.message.compiledInstructions
+    .map((ix) => {
+      const programId = keys[ix.programIdIndex];
+      if (!programId) return null;
+      const indexes = ix.accountKeyIndexes || ix.accounts || [];
+      const accounts = indexes
+        .map((accountIndex) => keys[accountIndex])
+        .filter(Boolean);
+      return new TransactionInstruction({
+        programId,
+        keys: accounts.map((pubkey) => ({ pubkey, isSigner: false, isWritable: false })),
+        data: Buffer.from(ix.data),
+      });
+    })
+    .filter(Boolean);
+}
+
+function assertNoUnsafeSystemTransfer(tx, wallet, allowedDestinations = []) {
+  const owner = wallet.publicKey.toString();
+  const allowed = new Set(allowedDestinations.filter(Boolean).map(String));
+
+  for (const ix of getTransactionInstructions(tx)) {
+    if (!ix.programId.equals(SystemProgram.programId)) continue;
+
+    let type = null;
+    try {
+      type = SystemInstruction.decodeInstructionType(ix);
+    } catch {
+      continue;
+    }
+    if (type !== "Transfer" && type !== "TransferWithSeed") continue;
+
+    const decoded = type === "Transfer"
+      ? SystemInstruction.decodeTransfer(ix)
+      : SystemInstruction.decodeTransferWithSeed(ix);
+    const source = decoded.fromPubkey?.toString();
+    const destination = decoded.toPubkey?.toString();
+    if (source === owner && !allowed.has(destination)) {
+      throw new Error(
+        `Relay transaction contains direct SOL transfer from owner to ${destination?.slice(0, 8) || "unknown"}.`,
+      );
+    }
+  }
+}
+
 function signSerializedTransactions(serializedTxs, wallet) {
   return (serializedTxs || [])
     .filter((entry) => typeof entry === "string" && entry.length > 0)
     .map((entry) => signSerializedTransaction(entry, wallet));
+}
+
+async function signAndSimulateRelayTransactions(serializedTxs, wallet, {
+  label,
+  allowedDebitMints = [],
+  allowedSystemTransferDestinations = [],
+  maxSolLoss = 0.05,
+  requiredStaticAccounts = [],
+} = {}) {
+  const signed = [];
+  const owner = wallet.publicKey.toString();
+  const allowedMints = new Set(allowedDebitMints.filter(Boolean).map(String));
+  const maxLamportLoss = Math.floor(Number(maxSolLoss) * 1e9);
+
+  for (const [index, serialized] of (serializedTxs || []).entries()) {
+    if (typeof serialized !== "string" || serialized.length === 0) continue;
+
+    const signedBase64 = signSerializedTransaction(serialized, wallet);
+    const tx = deserializeSignedTransaction(signedBase64);
+    assertNoUnsafeSystemTransfer(tx, wallet, allowedSystemTransferDestinations);
+    const staticKeys = getStaticAccountKeyStrings(tx);
+    for (const account of requiredStaticAccounts.filter(Boolean)) {
+      if (!staticKeys.includes(String(account))) {
+        throw new Error(`Relay ${label || "transaction"} ${index + 1} missing required account ${String(account).slice(0, 8)}.`);
+      }
+    }
+
+    const ownerIndex = staticKeys.indexOf(owner);
+    const simulation = await getConnection().simulateTransaction(tx, {
+      sigVerify: false,
+      replaceRecentBlockhash: false,
+    });
+    const value = simulation.value;
+    if (value.err) {
+      throw new Error(`Relay ${label || "transaction"} ${index + 1} simulation failed: ${JSON.stringify(value.err)}`);
+    }
+
+    if (ownerIndex >= 0 && value.preBalances?.[ownerIndex] != null && value.postBalances?.[ownerIndex] != null) {
+      const lamportDelta = value.postBalances[ownerIndex] - value.preBalances[ownerIndex];
+      if (lamportDelta < -maxLamportLoss) {
+        throw new Error(
+          `Relay ${label || "transaction"} ${index + 1} would debit ${(Math.abs(lamportDelta) / 1e9).toFixed(6)} SOL from owner.`,
+        );
+      }
+    }
+
+    const preByMint = new Map();
+    for (const balance of value.preTokenBalances || []) {
+      if (balance.owner !== owner) continue;
+      preByMint.set(balance.mint, BigInt(balance.uiTokenAmount?.amount || "0"));
+    }
+    for (const balance of value.postTokenBalances || []) {
+      if (balance.owner !== owner) continue;
+      const preAmount = preByMint.get(balance.mint) ?? 0n;
+      const postAmount = BigInt(balance.uiTokenAmount?.amount || "0");
+      if (postAmount < preAmount && !allowedMints.has(balance.mint)) {
+        throw new Error(
+          `Relay ${label || "transaction"} ${index + 1} would debit unrelated token mint ${balance.mint}.`,
+        );
+      }
+      preByMint.delete(balance.mint);
+    }
+    for (const [mint, preAmount] of preByMint) {
+      if (preAmount > 0n && !allowedMints.has(mint)) {
+        throw new Error(`Relay ${label || "transaction"} ${index + 1} would close/debit unrelated token mint ${mint}.`);
+      }
+    }
+
+    signed.push(signedBase64);
+  }
+
+  return signed;
 }
 
 function normalizeExecutionSignatures(result) {
@@ -119,6 +277,111 @@ function normalizeExecutionSignatures(result) {
     signatures.push(value);
   }
   return signatures;
+}
+
+const METEORA_INIT_BIN_ARRAY_DISCRIMINATOR = Buffer.from([35, 86, 19, 185, 78, 212, 75, 211]).toString("hex");
+const METEORA_INIT_BITMAP_EXTENSION_DISCRIMINATOR = Buffer.from([47, 157, 226, 180, 12, 240, 33, 71]).toString("hex");
+
+function getDlmmProgramId() {
+  return new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+}
+
+function formatSolFee(value) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number.toFixed(8).replace(/0+$/, "").replace(/\.$/, "") : "unknown";
+}
+
+async function assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId) {
+  const {
+    getBinArrayKeysCoverage,
+    getBinArrayIndexesCoverage,
+    deriveBinArrayBitmapExtension,
+    isOverflowDefaultBinArrayBitmap,
+    BIN_ARRAY_FEE,
+    BIN_ARRAY_BITMAP_FEE,
+  } = await getDLMM();
+
+  if (!getBinArrayKeysCoverage || !getBinArrayIndexesCoverage) {
+    throw new Error("Cannot verify Meteora bin-array initialization risk; refusing deploy.");
+  }
+
+  const programId = getDlmmProgramId();
+  const poolPubkey = new PublicKey(pool.pubkey?.toString?.() || pool.lbPair?.publicKey?.toString?.() || pool.lbPair?.pubkey?.toString?.());
+  const lower = new BN(Math.min(minBinId, maxBinId));
+  const upper = new BN(Math.max(minBinId, maxBinId));
+  const indexes = getBinArrayIndexesCoverage(lower, upper);
+  const keys = getBinArrayKeysCoverage(lower, upper, poolPubkey, programId);
+  const accounts = await getConnection().getMultipleAccountsInfo(keys, "confirmed");
+  const missing = accounts
+    .map((account, index) => account ? null : {
+      index: indexes[index]?.toString?.() ?? String(index),
+      address: keys[index].toString(),
+    })
+    .filter(Boolean);
+
+  if (missing.length > 0) {
+    const totalFee = missing.length * Number(BIN_ARRAY_FEE ?? 0.07143744);
+    const sample = missing.slice(0, 3).map((entry) => `${entry.index}:${entry.address.slice(0, 8)}`).join(", ");
+    throw new Error(
+      `Deploy skipped: selected range requires ${missing.length} missing Meteora bin-array initialization(s) ` +
+      `(~${formatSolFee(totalFee)} SOL non-refundable pool rent; ${formatSolFee(BIN_ARRAY_FEE ?? 0.07143744)} SOL each). ` +
+      `Missing indexes: ${sample}${missing.length > 3 ? ", ..." : ""}. Pick an already-initialized range/pool.`,
+    );
+  }
+
+  if (deriveBinArrayBitmapExtension && isOverflowDefaultBinArrayBitmap) {
+    const needsBitmapExtension = indexes.some((index) => isOverflowDefaultBinArrayBitmap(index));
+    if (needsBitmapExtension) {
+      const [bitmapExtension] = deriveBinArrayBitmapExtension(poolPubkey, programId);
+      const account = await getConnection().getAccountInfo(bitmapExtension, "confirmed");
+      if (!account) {
+        throw new Error(
+          `Deploy skipped: selected range requires Meteora bin-array bitmap extension initialization ` +
+          `(~${formatSolFee(BIN_ARRAY_BITMAP_FEE ?? 0.01180416)} SOL non-refundable pool rent). Pick a closer initialized range/pool.`,
+        );
+      }
+    }
+  }
+}
+
+function assertNoInitializeBinArrayInstructions(serializedTxs) {
+  const offenders = [];
+  for (const serialized of serializedTxs || []) {
+    if (typeof serialized !== "string" || serialized.length === 0) continue;
+    for (const discriminator of getDlmmInstructionDiscriminators(serialized)) {
+      if (discriminator === METEORA_INIT_BIN_ARRAY_DISCRIMINATOR) {
+        offenders.push("initializeBinArray");
+      } else if (discriminator === METEORA_INIT_BITMAP_EXTENSION_DISCRIMINATOR) {
+        offenders.push("initializeBinArrayBitmapExtension");
+      }
+    }
+  }
+  if (offenders.length > 0) {
+    throw new Error(
+      `Deploy skipped: generated transaction includes Meteora ${[...new Set(offenders)].join(" / ")} ` +
+      "instruction(s), which would charge non-refundable pool initialization rent.",
+    );
+  }
+}
+
+function getDlmmInstructionDiscriminators(serialized) {
+  const bytes = Buffer.from(serialized, "base64");
+  const dlmmProgramId = getDlmmProgramId().toString();
+  try {
+    const versioned = VersionedTransaction.deserialize(bytes);
+    return versioned.message.compiledInstructions
+      .map((ix) => {
+        const programId = versioned.message.staticAccountKeys[ix.programIdIndex]?.toString();
+        if (programId !== dlmmProgramId) return null;
+        return Buffer.from(ix.data || []).subarray(0, 8).toString("hex");
+      })
+      .filter(Boolean);
+  } catch {
+    const legacy = Transaction.from(bytes);
+    return legacy.instructions
+      .map((ix) => ix.programId.toString() === dlmmProgramId ? Buffer.from(ix.data || []).subarray(0, 8).toString("hex") : null)
+      .filter(Boolean);
+  }
 }
 
 // ─── Pool Cache ────────────────────────────────────────────────
@@ -205,8 +468,14 @@ export async function deployPosition({
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
-  let activeBinsBelow = bins_below ?? config.strategy.binsBelow;
+  let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
+  const parsedVolatility = volatility == null ? null : Number(volatility);
+  const normalizedVolatility = parsedVolatility != null && Number.isFinite(parsedVolatility) ? parsedVolatility : null;
+
+  if (volatility != null && (normalizedVolatility == null || normalizedVolatility <= 0)) {
+    throw new Error(`Invalid volatility ${volatility} — refusing deploy because the volatility feed is unusable.`);
+  }
 
   if (isPoolOnCooldown(pool_address)) {
     log("deploy", `Pool ${pool_address.slice(0, 8)} is on cooldown — skipping`);
@@ -244,25 +513,6 @@ export async function deployPosition({
     activeBinsAbove = Math.max(0, upperBinId - activeBin.binId);
   }
 
-  if (process.env.DRY_RUN === "true") {
-    const totalBins = activeBinsBelow + activeBinsAbove;
-    return {
-      dry_run: true,
-      would_deploy: {
-        pool_address,
-        strategy: activeStrategy,
-        bins_below: activeBinsBelow,
-        bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-        amount_x: amount_x || 0,
-        amount_y: amount_y || amount_sol || 0,
-        wide_range: totalBins > 69,
-      },
-      message: "DRY RUN — no transaction sent",
-    };
-  }
-
   const strategyMap = {
     spot: StrategyType.Spot,
     curve: StrategyType.Curve,
@@ -280,8 +530,17 @@ export async function deployPosition({
     amount_y == null && amount_sol == null
       ? computeDeployAmount((await getWalletBalances()).sol)
       : 0;
-  const finalAmountY = amount_y ?? amount_sol ?? fallbackAmountY;
-  const finalAmountX = amount_x ?? 0;
+  const finalAmountY = Number(amount_y ?? amount_sol ?? fallbackAmountY);
+  const finalAmountX = Number(amount_x ?? 0);
+  if (!Number.isFinite(finalAmountY) || !Number.isFinite(finalAmountX) || finalAmountY < 0 || finalAmountX < 0) {
+    throw new Error("Invalid deploy amount: amount_x and amount_y must be valid non-negative numbers.");
+  }
+  if (finalAmountX > 0) {
+    throw new Error("Unsupported deploy amount: this agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.");
+  }
+  if (finalAmountY <= 0) {
+    throw new Error("Invalid deploy amount: provide a positive amount_y/amount_sol.");
+  }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
   if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
     throw new Error(
@@ -291,7 +550,43 @@ export async function deployPosition({
   if (isSingleSidedSol) {
     activeBinsAbove = 0;
   }
+  activeBinsBelow = Number(activeBinsBelow);
+  activeBinsAbove = Number(activeBinsAbove);
+  if (!Number.isFinite(activeBinsBelow) || !Number.isFinite(activeBinsAbove)) {
+    throw new Error("Invalid bin range: bins_below and bins_above must be valid numbers.");
+  }
+  if (activeBinsBelow < 0 || activeBinsAbove < 0) {
+    throw new Error("Invalid bin range: bins_below and bins_above cannot be negative.");
+  }
+  if (!Number.isInteger(activeBinsBelow) || !Number.isInteger(activeBinsAbove)) {
+    throw new Error("Invalid bin range: bins_below and bins_above must be whole-bin integers.");
+  }
+  const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
   const totalBins = activeBinsBelow + activeBinsAbove;
+  if (totalBins < minBinsBelow) {
+    throw new Error(
+      `Invalid deploy range: total bins ${totalBins} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+    );
+  }
+
+  if (process.env.DRY_RUN === "true") {
+    return {
+      dry_run: true,
+      would_deploy: {
+        pool_address,
+        strategy: activeStrategy,
+        bins_below: activeBinsBelow,
+        bins_above: activeBinsAbove,
+        downside_pct: downside_pct ?? null,
+        upside_pct: upside_pct ?? null,
+        amount_x: finalAmountX,
+        amount_y: finalAmountY,
+        wide_range: totalBins > 69,
+      },
+      message: "DRY RUN — no transaction sent",
+    };
+  }
+
   const isWideRange = totalBins > 69;
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
@@ -304,6 +599,8 @@ export async function deployPosition({
       `Single-side SOL deploy must end at the SDK active bin. Expected ${activeBin.binId}, got ${maxBinId}.`,
     );
   }
+
+  await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
 
   const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());
@@ -356,6 +653,7 @@ export async function deployPosition({
       if (addLiquidityUnsigned.length + swapUnsigned.length === 0) {
         throw new Error("LPAgent order returned no transactions. Check the pool address, deploy amount, and selected range.");
       }
+      assertNoInitializeBinArrayInstructions(addLiquidityUnsigned);
 
       const addLiquidity = signSerializedTransactions(addLiquidityUnsigned, wallet);
       const swap = signSerializedTransactions(swapUnsigned, wallet);
@@ -392,7 +690,7 @@ export async function deployPosition({
           strategy: activeStrategy,
           bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
           bin_step,
-          volatility,
+          volatility: normalizedVolatility,
           fee_tvl_ratio,
           organic_score,
           amount_sol: finalAmountY,
@@ -411,7 +709,7 @@ export async function deployPosition({
         summary: `Relay deployed ${finalAmountY} SOL with ${activeStrategy}`,
         reason: `Chosen range ${minBinId}→${maxBinId} around active bin ${activeBin.binId}`,
         risks: [
-          volatility != null ? `volatility ${volatility}` : null,
+          normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
           fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
         ].filter(Boolean),
         metrics: {
@@ -526,7 +824,7 @@ export async function deployPosition({
       strategy: activeStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step,
-      volatility,
+      volatility: normalizedVolatility,
       fee_tvl_ratio,
       organic_score,
       amount_sol: finalAmountY,
@@ -544,7 +842,7 @@ export async function deployPosition({
       summary: `Deployed ${finalAmountY} SOL with ${activeStrategy}`,
       reason: `Chosen range ${minBinId}→${maxBinId} around active bin ${activeBin.binId}`,
       risks: [
-        volatility != null ? `volatility ${volatility}` : null,
+        normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
         fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
       ].filter(Boolean),
       metrics: {
@@ -1121,21 +1419,19 @@ export async function closePosition({ position_address, reason }) {
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
     if (shouldUseLpAgentRelay()) {
+      let relaySubmitted = false;
+      try {
+      const pool = await getPool(poolAddress);
+      const relayAllowedDebitMints = [
+        pool.lbPair.tokenXMint.toString(),
+        pool.lbPair.tokenYMint.toString(),
+        config.tokens.SOL,
+      ];
       const livePositions = await getMyPositions({ force: true, silent: true });
       const livePosition = livePositions?.positions?.find((position) => position.position === position_address);
       const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
       const closeToBinId = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
       const closeOutput = "allToken1";
-
-      const quotes = await agentMeridianJson("/execution/zap-out/quotes", {
-        method: "POST",
-        headers: getAgentMeridianHeaders({ json: true }),
-        body: JSON.stringify({
-          agentId: getAgentIdForRequests(),
-          positionId: position_address,
-          bps: 10000,
-        }),
-      });
 
       const order = await agentMeridianJson("/execution/zap-out/order", {
         method: "POST",
@@ -1152,16 +1448,29 @@ export async function closePosition({ position_address, reason }) {
           type: "meteora",
           fromBinId: closeFromBinId,
           toBinId: closeToBinId,
-          quoteRequestId: quotes.requestId,
         }),
       });
 
       const closeUnsigned = order?.order?.transactions?.close || [];
       const swapUnsigned = order?.order?.transactions?.swap || [];
       if (closeUnsigned.length + swapUnsigned.length === 0) {
-        throw new Error("LPAgent close order returned no transactions. Check the position, quote response, and selected output.");
+        throw new Error("LPAgent close order returned no transactions. Check the position, selected output, and relay order response.");
       }
 
+      const closeSigned = await signAndSimulateRelayTransactions(closeUnsigned, wallet, {
+        label: "zap-out close",
+        allowedDebitMints: relayAllowedDebitMints,
+        maxSolLoss: 0.05,
+        requiredStaticAccounts: [wallet.publicKey.toString(), position_address],
+      });
+      const swapSigned = await signAndSimulateRelayTransactions(swapUnsigned, wallet, {
+        label: "zap-out swap",
+        allowedDebitMints: relayAllowedDebitMints,
+        maxSolLoss: 0.05,
+        requiredStaticAccounts: [wallet.publicKey.toString()],
+      });
+
+      relaySubmitted = true;
       const submit = await agentMeridianJson("/execution/zap-out/submit", {
         method: "POST",
         headers: getAgentMeridianHeaders({ json: true }),
@@ -1169,8 +1478,8 @@ export async function closePosition({ position_address, reason }) {
           requestId: order.requestId,
           lastValidBlockHeight: order?.order?.lastValidBlockHeight,
           transactions: {
-            close: signSerializedTransactions(closeUnsigned, wallet),
-            swap: signSerializedTransactions(swapUnsigned, wallet),
+            close: closeSigned,
+            swap: swapSigned,
           },
         }),
       });
@@ -1254,7 +1563,7 @@ export async function closePosition({ position_address, reason }) {
           strategy: tracked.strategy,
           bin_range: tracked.bin_range,
           bin_step: tracked.bin_step || null,
-          volatility: tracked.volatility || null,
+          volatility: tracked.volatility ?? null,
           fee_tvl_ratio: tracked.fee_tvl_ratio || null,
           organic_score: tracked.organic_score || null,
           amount_sol: tracked.amount_sol,
@@ -1325,6 +1634,10 @@ export async function closePosition({ position_address, reason }) {
         txs: txHashes,
         base_mint: livePosition?.base_mint || null,
       };
+      } catch (relayError) {
+        if (relaySubmitted) throw relayError;
+        log("close_warn", `Relay zap-out failed before submit; falling back to local close + Jupiter autoswap: ${relayError.message}`);
+      }
     }
 
     // Clear cached pool so SDK loads fresh position fee state
@@ -1525,7 +1838,7 @@ export async function closePosition({ position_address, reason }) {
         strategy: tracked.strategy,
         bin_range: tracked.bin_range,
         bin_step: tracked.bin_step || null,
-        volatility: tracked.volatility || null,
+        volatility: tracked.volatility ?? null,
         fee_tvl_ratio: tracked.fee_tvl_ratio || null,
         organic_score: tracked.organic_score || null,
         amount_sol: tracked.amount_sol,
