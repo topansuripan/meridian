@@ -18,7 +18,7 @@ Pools are pre-filtered for safety:
 - Both tokens organic score >= 60
 
 Returns condensed pool data: address, name, tokens, bin_step, fee_pct,
-active_tvl, fee_window, volume_window, fee_tvl_ratio, volatility, organic_score,
+active_tvl, fee_window, volume_window, fee_tvl_ratio, volatility from max(timeframe, 30m), organic_score,
 holders, mcap, active_positions, price_change_pct, warning count.
 
 Use this as the primary tool for finding new LP opportunities.`,
@@ -48,11 +48,12 @@ Use this as the primary tool for finding new LP opportunities.`,
     type: "function",
     function: {
       name: "get_top_candidates",
-      description: `Get the top pre-scored pool candidates ready for deployment.
+      description: `Get the top pre-scored pool candidates for deployment review.
 All filtering, scoring, and rule-checking is done in code — no analysis needed.
 Returns the top N eligible pools ranked by score (fee/TVL, organic, stability, volume).
 Each pool includes a score (0-100) and has already passed all hard disqualifiers.
-Use this instead of discover_pools for screening cycles.`,
+Use this instead of discover_pools for screening cycles.
+If this returns one candidate, still judge whether it is actually worth deploying; one weak candidate should be skipped.`,
       parameters: {
         type: "object",
         properties: {
@@ -133,13 +134,15 @@ PRIORITY ORDER for strategy and bins:
 HARD RULES:
 - Never use 'curve'.
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
+- Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
+- Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
 - For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
   use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
 
 Guidelines (only when user hasn't specified):
 - Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
-- Bins: choose 35–69 for standard volatility; up to 350 for wide-range strategies. Max 1400 total.
-- Deposit: Can be single-sided (SOL only or Base only) or dual-sided.
+- Bins: choose from configured minBinsBelow/maxBinsBelow by positive volatility. The hard lower floor is 35 bins.
+- Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -155,7 +158,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           amount_x: {
             type: "number",
-            description: "Amount of base token to deposit (if doing dual-sided)."
+            description: "Unsupported for this agent. Keep at 0; deploys are single-side SOL via amount_y."
           },
           amount_sol: {
             type: "number",
@@ -186,7 +189,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
           bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
           base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },
-          volatility: { type: "number", description: "Pool volatility at deploy time" },
+          volatility: { type: "number", description: "Pool volatility at deploy time, sourced from max(screening timeframe, 30m)" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
           initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },
@@ -384,11 +387,11 @@ Changes persist to user-config.json and take effect immediately — no restart n
 
 VALID KEYS (use EXACTLY these key names, nothing else):
 Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, allowedLaunchpads, blockedLaunchpads
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
-Strategy: binsBelow
+Strategy: minBinsBelow, maxBinsBelow, defaultBinsBelow (legacy binsBelow maps to maxBinsBelow)
 
 Reason is optional but helpful — logged as a lesson when provided.`,
       parameters: {

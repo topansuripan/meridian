@@ -2,6 +2,8 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLMs.**
 
+**Links:** [Website](https://agentmeridian.xyz) | [Telegram](https://t.me/agentmeridian) | [X](https://x.com/meridian_agent)
+
 Meridian runs continuous screening and management cycles, deploying capital into high-quality Meteora DLMM pools and closing positions based on live PnL, yield, and range data. It learns from every position it closes.
 
 ---
@@ -25,6 +27,12 @@ Meridian runs a **ReAct agent loop** — each cycle the LLM reasons over live da
 |---|---|---|
 | **Screening Agent** | Every 30 min | Pool screening — finds and deploys into the best candidate |
 | **Management Agent** | Every 10 min | Position management — evaluates each open position and acts |
+
+### Agent harness
+
+Meridian's agent harness is the runtime wrapper around every autonomous cycle. It gives both **main** and **experimental** agents the same control loop: load live state, inject relevant memory, expose only role-appropriate tools, execute tool calls, and return a readable cycle report.
+
+The harness also keeps a structured decision log in `decision-log.json` for deployments, closes, skips, and no-deploy outcomes. Each entry records the actor, pool or position, summary, reason, key risks, metrics, and rejected alternatives. Recent decisions are injected back into the system prompt and are available through `get_recent_decisions`, so the agent can answer "why did you deploy?", "why did you close?", or "why did you skip?" without guessing after the fact.
 
 **Data sources:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close transactions
@@ -85,6 +93,16 @@ DRY_RUN=true                            # set false for live trading
 
 > Never commit your private key or API keys. `.env` and `user-config.json` are gitignored, but secrets should still stay local.
 
+Optional encrypted `.env` flow:
+
+```bash
+cp .env .env.raw
+printf "replace-with-a-long-local-key\n" > .envrypt
+npm run env:encrypt
+```
+
+Meridian loads envrypt-style encrypted values automatically. Keep `.env.raw` and `.envrypt` local; both are gitignored.
+
 Copy config and edit as needed:
 
 ```bash
@@ -101,6 +119,32 @@ npm start      # live mode
 ```
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
+
+### Run with PM2
+
+PM2 is supported and is the recommended way to keep Telegram control online on a VPS:
+
+```bash
+npm install
+npm run pm2:start
+pm2 save
+```
+
+To update an existing PM2 install:
+
+```bash
+git pull
+npm install
+npm run pm2:restart
+```
+
+If the process restarts repeatedly after an update, inspect the app error first:
+
+```bash
+npm run pm2:logs
+```
+
+Most post-update PM2 crashes are app startup errors, commonly from skipping `npm install` after `package-lock.json` changed, starting PM2 from the wrong directory, or missing `.env` / `user-config.json` values. Avoid `nohup`; it runs outside PM2 and can leave Telegram polling in a duplicate unmanaged process.
 
 ---
 
@@ -431,7 +475,7 @@ Role defaults resolve from `LLM_MODEL` in `.env`. Current default:
 |---|---|---|
 | `LLM_MODEL` | `MiniMax-M2.7` | Shared default for management, screening, and general chat |
 
-> Override the model by editing `.env` and restarting the bot.
+> Override model at runtime: `node cli.js config set screeningModel anthropic/claude-opus-4-5`
 
 ---
 
@@ -486,7 +530,49 @@ After 5+ positions have been closed, run:
 node cli.js evolve
 ```
 
-This analyzes closed position performance (win rate, avg PnL, fee yields) and suggests threshold changes in `user-config.json`. Use it deliberately after enough samples rather than letting the bot drift on tiny datasets.
+This analyzes closed position performance (win rate, avg PnL, fee yields) and automatically adjusts screening thresholds in `user-config.json`. Changes take effect immediately.
+
+---
+
+## HiveMind
+
+HiveMind sync uses Agent Meridian at `https://api.agentmeridian.xyz` by default with the built-in public key. Agents can register, pull shared lessons/presets, and push learning events without a separate registration flow.
+
+**What you get:**
+- Shared lessons from other Meridian agents
+- Strategy presets and crowd performance context
+- Role-aware lessons injected into future screener/manager prompts when `hiveMindPullMode` is `auto`
+
+**What you share:**
+- Lessons from `lessons.json`
+- Closed-position performance events: pool, pool name, base mint, strategy, close reason, PnL, fees, and hold time
+- Agent heartbeat metadata: agent ID, version, timestamp, and basic capability flags
+- **Private keys and wallet balances are never sent**
+
+HiveMind failures are non-blocking. If Agent Meridian is unavailable, the agent logs a warning and keeps running.
+
+### Setup
+
+No manual HiveMind registration command is required for the shared Agent Meridian setup. `agentId` is generated automatically on startup if it is missing.
+
+To use a private HiveMind API key, check the Telegram announcement channel and set it as `hiveMindApiKey`.
+
+Relevant config fields:
+
+```json
+{
+  "agentId": "",
+  "hiveMindUrl": "",
+  "hiveMindApiKey": "",
+  "hiveMindPullMode": "auto"
+}
+```
+
+Blank `hiveMindUrl` and `hiveMindApiKey` values intentionally fall back to the Agent Meridian defaults. Set `hiveMindPullMode` to `manual` if you do not want shared lessons and presets pulled automatically.
+
+### Disable
+
+There is currently no empty-string disable path for HiveMind; blank values fall back to the built-in Agent Meridian defaults. A true off switch should be implemented as an explicit config flag before documenting HiveMind as disabled by clearing fields.
 
 ---
 
@@ -510,7 +596,8 @@ agent.js            ReAct loop: LLM → tool call → repeat
 config.js           Runtime config from user-config.json + .env
 prompt.js           System prompt builder (SCREENER / MANAGER / GENERAL roles)
 state.js            Position registry (state.json)
-lessons.js          Local learning engine: records performance, derives lessons, supports manual threshold evolution
+decision-log.js     Structured decision log for deploy, close, skip, and no-deploy rationale
+lessons.js          Learning engine: records performance, derives lessons, evolves thresholds
 pool-memory.js      Per-pool deploy history + snapshots
 strategy-library.js Saved LP strategies
 telegram.js         Telegram bot: polling + notifications
