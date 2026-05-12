@@ -160,7 +160,10 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  return { pass: true };
+  // Extract real base mint from pool detail for downstream checks
+  const resolvedBaseMint = detail?.token_x?.address || detail?.base_token_address || null;
+
+  return { pass: true, detail, resolvedBaseMint };
 }
 
 const SENSITIVE_CONFIG_KEYS = new Set([
@@ -873,7 +876,7 @@ export async function executeTool(name, args) {
         try {
           setDeployFailureCooldown(
             args.pool_address,
-            args.base_mint || null,
+            safetyCheck.resolvedBaseMint || args.base_mint || null,
             `deploy blocked: ${safetyCheck.reason}`.slice(0, 200),
           );
         } catch (e) {
@@ -1008,18 +1011,21 @@ async function runSafetyChecks(name, args) {
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
 
+      // Use real base mint from pool data, not LLM args (LLM often passes symbol instead of CA)
+      const baseMint = poolThresholds.resolvedBaseMint || args.base_mint;
+
       // Reject mintable/freezable tokens
-      if (args.base_mint && config.screening.blockMintableTokens !== false) {
+      if (baseMint && config.screening.blockMintableTokens !== false) {
         try {
-          const audit = await getTokenAudit(args.base_mint);
+          const audit = await getTokenAudit(baseMint);
           if (audit.mintable) {
-            return { pass: false, reason: `Token ${args.base_mint.slice(0, 8)}… has active mint authority — mintable tokens are blocked.` };
+            return { pass: false, reason: `Token ${baseMint.slice(0, 8)}… has active mint authority — mintable tokens are blocked.` };
           }
           if (audit.freezable) {
-            return { pass: false, reason: `Token ${args.base_mint.slice(0, 8)}… has active freeze authority — freezable tokens are blocked.` };
+            return { pass: false, reason: `Token ${baseMint.slice(0, 8)}… has active freeze authority — freezable tokens are blocked.` };
           }
         } catch (e) {
-          log("safety_block", `Token audit check failed for ${args.base_mint}: ${e.message}`);
+          log("safety_block", `Token audit check failed for ${baseMint}: ${e.message}`);
           // Don't block deploy if audit API is down — other checks still apply
         }
       }
@@ -1112,28 +1118,28 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Block same base token across different pools
-      if (args.base_mint) {
+      // Block same base token across different pools (use resolved CA, not LLM symbol)
+      if (baseMint) {
         const alreadyHasMint = positions.positions.some(
-          (p) => p.base_mint === args.base_mint
+          (p) => p.base_mint === baseMint
         );
         if (alreadyHasMint) {
           return {
             pass: false,
-            reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
+            reason: `Already holding base token ${baseMint.slice(0, 8)}… in another pool. One position per token only.`,
           };
         }
       }
 
       // Saturday rule: block tokens that were deployed on Friday (weekend loss prevention)
-      if (args.base_mint && new Date().getDay() === 6) {
+      if (baseMint && new Date().getDay() === 6) {
         const fridayStart = new Date();
         fridayStart.setDate(fridayStart.getDate() - 1);
         fridayStart.setHours(0, 0, 0, 0);
-        if (wasBaseMintDeployedSince(args.base_mint, fridayStart)) {
+        if (wasBaseMintDeployedSince(baseMint, fridayStart)) {
           return {
             pass: false,
-            reason: `Saturday rule: token ${args.base_mint.slice(0, 8)}… was already deployed on Friday. Skipping to avoid weekend losses.`,
+            reason: `Saturday rule: token ${baseMint.slice(0, 8)}… was already deployed on Friday. Skipping to avoid weekend losses.`,
           };
         }
       }
@@ -1178,7 +1184,7 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      return { pass: true };
+      return { pass: true, resolvedBaseMint: baseMint };
     }
 
     case "swap_token": {
