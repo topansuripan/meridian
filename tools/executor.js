@@ -19,7 +19,7 @@ import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStra
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
-import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
+import { getTokenInfo, getTokenHolders, getTokenNarrative, getTokenAudit } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
@@ -1007,6 +1007,22 @@ async function runSafetyChecks(name, args) {
     case "deploy_position": {
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
+
+      // Reject mintable/freezable tokens
+      if (args.base_mint && config.screening.blockMintableTokens !== false) {
+        try {
+          const audit = await getTokenAudit(args.base_mint);
+          if (audit.mintable) {
+            return { pass: false, reason: `Token ${args.base_mint.slice(0, 8)}… has active mint authority — mintable tokens are blocked.` };
+          }
+          if (audit.freezable) {
+            return { pass: false, reason: `Token ${args.base_mint.slice(0, 8)}… has active freeze authority — freezable tokens are blocked.` };
+          }
+        } catch (e) {
+          log("safety_block", `Token audit check failed for ${args.base_mint}: ${e.message}`);
+          // Don't block deploy if audit API is down — other checks still apply
+        }
+      }
 
       // Reject pools with bin_step out of configured range
       const isDegen = !!args.degen;
