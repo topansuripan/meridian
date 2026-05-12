@@ -33,6 +33,7 @@ const INTENT_TOOLS = {
   close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
+  config:      new Set(["update_config"]),
   blocklist:   new Set(["add_to_blacklist", "remove_from_blacklist", "list_blacklist", "block_deployer", "unblock_deployer", "list_blocked_deployers"]),
   selfupdate:  new Set(["self_update"]),
   balance:     new Set(["get_wallet_balance", "get_my_positions", "get_wallet_positions"]),
@@ -54,6 +55,7 @@ const INTENT_PATTERNS = [
   { intent: "swap",        re: /\b(swap|convert|sell|exchange)\b/i },
   { intent: "selfupdate",  re: /\b(self.?update|git pull|pull latest|update (the )?bot|update (the )?agent|update yourself)\b/i },
   { intent: "blocklist",   re: /\b(blacklist|block|unblock|blocklist|blocked deployer|rugger|block dev|block deployer)\b/i },
+  { intent: "config",      re: /\b(config|setting|threshold|update|set |change)\b/i },
   { intent: "balance",     re: /\b(balance|wallet|sol|how much)\b/i },
   { intent: "positions",   re: /\b(position|portfolio|open|pnl|yield|range)\b/i },
   { intent: "strategy",    re: /\b(strategy|strategies|set active strategy|use strategy|switch strategy|lp style)\b/i },
@@ -198,7 +200,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const lessons = getLessonsForPrompt({ agentType, degen });
   const perfSummary = getPerformanceSummary();
   const decisionSummary = getDecisionSummary();
-  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, decisionSummary);
+  let weightsSummary = null;
+  if (agentType === "SCREENER") {
+    try {
+      const { getWeightsSummary } = await import("./signal-weights.js");
+      const { config } = await import("./config.js");
+      if (config.darwin?.enabled) weightsSummary = getWeightsSummary();
+    } catch { /* signal-weights not critical */ }
+  }
+  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, decisionSummary);
 
   let providerMode = "system";
   let messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);

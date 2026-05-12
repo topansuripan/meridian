@@ -1,4 +1,11 @@
 {
+  "preset": "custom",
+  "rpcUrl": "https://pump.helius-rpc.com",
+  "llmBaseUrl": "",
+  "llmApiKey": "",
+  "llmModel": "minimax/minimax-m2.7",
+  "dryRun": true,
+
   "deployAmountSol": 0.5,
   "maxPositions": 3,
   "maxDailyLossUsd": 80,
@@ -44,6 +51,7 @@
   "minTokenAgeHours": null,
   "maxTokenAgeHours": null,
   "athFilterPct": null,
+  "screeningSource": "meteora",
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,
@@ -56,6 +64,7 @@
   "oorCooldownHours": 12,
   "minVolumeToRebalance": 1000,
   "stopLossPct": -50,
+  "emergencyPriceDropPct": -50,
   "takeProfitPct": 5,
   "maxHoldMinutes": 60,
   "minFeePerTvl24h": 7,
@@ -68,10 +77,18 @@
 
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
+  "healthCheckIntervalMin": 60,
 
   "autoLearnTopLps": true,
   "topLpStudyTtlHours": 12,
   "topLpAutoLearnLimit": 3,
+
+  "temperature": 0.373,
+  "maxTokens": 4096,
+  "maxSteps": 20,
+  "managementModel": "minimax/minimax-m2.5",
+  "screeningModel": "minimax/minimax-m2.5",
+  "generalModel": "minimax/minimax-m2.7",
 
   "darwinEnabled": true,
   "darwinWindowDays": 60,
@@ -97,6 +114,7 @@
     "rsiOverbought": 80,
     "requireAllIntervals": false
   },
+  "telegramChatId": "",
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
   "hiveMindPullMode": "auto"

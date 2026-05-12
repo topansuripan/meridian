@@ -398,6 +398,21 @@ export function stopPolling() {
   _polling = false;
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function shortHash(value, prefix = 8, suffix = 6) {
+  const text = String(value || "");
+  if (!text) return "";
+  if (text.length <= prefix + suffix + 3) return text;
+  return `${text.slice(0, prefix)}...${text.slice(-suffix)}`;
+}
+
 // ─── Notification helpers ────────────────────────────────────────
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee, baseMint }) {
   if (hasActiveLiveMessage()) return;
@@ -422,20 +437,6 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     `Position: <code>${position?.slice(0, 8)}...</code>\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
   );
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function shortHash(value, prefix = 8, suffix = 6) {
-  const text = String(value || "");
-  if (!text) return "";
-  if (text.length <= prefix + suffix + 3) return text;
-  return `${text.slice(0, prefix)}...${text.slice(-suffix)}`;
 }
 
 export async function notifyClose({ pair, pnlUsd, pnlPct, tx, baseMint }) {

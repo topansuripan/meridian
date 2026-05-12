@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -127,6 +128,9 @@ export async function recordPerformance(perf) {
   }
 
   save(data);
+  if (lesson) {
+    void pushHiveLesson(lesson);
+  }
 
   // Update pool-level memory
   if (perf.pool) {
@@ -162,6 +166,31 @@ export async function recordPerformance(perf) {
     });
   }
 
+  // Evolve thresholds every 5 closed positions
+  if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
+    const { config, reloadScreeningThresholds } = await import("./config.js");
+    const result = evolveThresholds(data.performance, config);
+    if (result?.changes && Object.keys(result.changes).length > 0) {
+      reloadScreeningThresholds();
+      log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
+    }
+
+    // Darwinian signal weight recalculation
+    if (config.darwin?.enabled) {
+      const { recalculateWeights } = await import("./signal-weights.js");
+      const wResult = recalculateWeights(data.performance, config);
+      if (wResult.changes.length > 0) {
+        log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
+      }
+    }
+  }
+
+  void pushHivePerformanceEvent({
+    ...entry,
+    base_mint: perf.base_mint || null,
+    fees_earned_sol: perf.fees_earned_sol || 0,
+    eventId: `close:${perf.position}:${entry.recorded_at}`,
+  });
 }
 
 /**
@@ -477,6 +506,7 @@ export function addLesson(rule, tags = [], { pinned = false, role = null } = {})
   data.lessons.push(lesson);
   save(data);
   log("lessons", `Manual lesson added${pinned ? " [PINNED]" : ""}${role ? ` [${role}]` : ""}: ${safeRule}`);
+  void pushHiveLesson(lesson);
 }
 
 /**
@@ -644,12 +674,18 @@ export function getLessonsForPrompt(opts = {}) {
     : [];
 
   const selected = [...pinned, ...roleMatched, ...recent];
-  if (selected.length === 0) return null;
+  const shared = getSharedLessonsForPrompt({
+    agentType,
+    maxLessons: isAutoCycle ? 4 : 6,
+  });
+  if (selected.length === 0 && !shared) return null;
 
   const sections = [];
   if (pinned.length)      sections.push(`── PINNED (${pinned.length}) ──\n` + fmt(pinned));
   if (roleMatched.length) sections.push(`── ${agentType} (${roleMatched.length}) ──\n` + fmt(roleMatched));
   if (recent.length)      sections.push(`── RECENT (${recent.length}) ──\n` + fmt(recent));
+  if (shared)             sections.push(`── HIVEMIND ──\n${shared}`);
+
   return sections.join("\n\n");
 }
 

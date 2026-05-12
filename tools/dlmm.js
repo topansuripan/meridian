@@ -105,6 +105,7 @@ function shouldUseLpAgentRelayForDeploy() {
   return false;
 }
 
+
 function signSerializedTransaction(serialized, wallet) {
   const bytes = Buffer.from(serialized, "base64");
   try {
@@ -513,6 +514,7 @@ export async function deployPosition({
     activeBinsBelow = Math.max(0, activeBin.binId - lowerBinId);
     activeBinsAbove = Math.max(0, upperBinId - activeBin.binId);
   }
+
 
   const strategyMap = {
     spot: StrategyType.Spot,
@@ -1426,8 +1428,8 @@ export async function closePosition({ position_address, reason }) {
     if (shouldUseLpAgentRelay()) {
       let relaySubmitted = false;
       try {
-      const pool = await getPool(poolAddress);
-      const relayAllowedDebitMints = [
+        const pool = await getPool(poolAddress);
+        const relayAllowedDebitMints = [
         pool.lbPair.tokenXMint.toString(),
         pool.lbPair.tokenYMint.toString(),
         config.tokens.SOL,
@@ -1581,17 +1583,18 @@ export async function closePosition({ position_address, reason }) {
           degen: !!tracked.degen,
         });
 
+
         appendDecision({
           type: "close",
           actor: "MANAGER",
           pool: poolAddress,
-          pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+          pool_name: tracked?.pool_name || poolMeta.name || poolAddress.slice(0, 8),
           position: position_address,
           summary: `Relay closed at ${pnlPct.toFixed(2)}%`,
           reason: reason || "agent decision",
           risks: [
             minutesOOR > 0 ? `out of range ${minutesOOR}m` : null,
-            tracked.volatility != null ? `volatility ${tracked.volatility}` : null,
+            tracked?.volatility != null ? `volatility ${tracked.volatility}` : null,
           ].filter(Boolean),
           metrics: {
             pnl_usd: pnlUsd,
@@ -1607,7 +1610,7 @@ export async function closePosition({ position_address, reason }) {
           request_id: order.requestId,
           position: position_address,
           pool: poolAddress,
-          pool_name: tracked.pool_name || poolMeta.name || null,
+          pool_name: tracked?.pool_name || poolMeta.name || null,
           claim_txs: claimTxHashes,
           close_txs: closeTxHashes,
           txs: txHashes,

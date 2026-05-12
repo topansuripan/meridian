@@ -4,6 +4,7 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
+import { discoverGmgnPools } from "./gmgn.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
@@ -31,6 +32,9 @@ function normalizeSymbol(symbol) {
 }
 
 function scoreCandidate(pool) {
+  if (Number.isFinite(Number(pool.gmgn_score))) {
+    return Number(pool.gmgn_score) + Number(pool.fee_active_tvl_ratio || 0) * 500;
+  }
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
   const organic = Number(pool.organic_score || 0);
   const volume = Number(pool.volume_window || 0);
@@ -155,13 +159,24 @@ async function fetchDiscordSignalCandidates() {
 }
 
 async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category }) {
-  const url = `${POOL_DISCOVERY_BASE}/pools?` +
-    `page_size=${page_size}` +
-    `&filter_by=${encodeURIComponent(filters)}` +
-    `&timeframe=${timeframe}` +
-    `&category=${category}`;
+  const useServerDiscovery = !!config.api.publicApiKey;
+  const url = useServerDiscovery
+    ? `${config.api.url}/discovery/pools?` +
+      `page_size=${page_size}` +
+      `&filter_by=${encodeURIComponent(filters)}` +
+      `&timeframe=${timeframe}` +
+      `&category=${category}`
+    : `${POOL_DISCOVERY_BASE}/pools?` +
+      `page_size=${page_size}` +
+      `&filter_by=${encodeURIComponent(filters)}` +
+      `&timeframe=${timeframe}` +
+      `&category=${category}`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: useServerDiscovery && config.api.publicApiKey
+      ? { "x-api-key": config.api.publicApiKey }
+      : {},
+  });
 
   if (!res.ok) {
     throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
@@ -171,19 +186,26 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
 }
 
 async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
-  const url = `${POOL_DISCOVERY_BASE}/pools?` +
-    `page_size=1` +
-    `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
-    `&timeframe=${timeframe}`;
+  const useServerDiscovery = !!config.api.publicApiKey;
+  const url = useServerDiscovery
+    ? `${config.api.url}/discovery/pools/${poolAddress}?timeframe=${encodeURIComponent(timeframe)}`
+    : `${POOL_DISCOVERY_BASE}/pools?` +
+      `page_size=1` +
+      `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
+      `&timeframe=${timeframe}`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: useServerDiscovery && config.api.publicApiKey
+      ? { "x-api-key": config.api.publicApiKey }
+      : {},
+  });
 
   if (!res.ok) {
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
   }
 
   const data = await res.json();
-  return (data.data || [])[0] ?? null;
+  return useServerDiscovery ? data : (data.data || [])[0] ?? null;
 }
 
 async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
@@ -494,9 +516,34 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true, screeningOverrides = null } = {}) {
   const { config } = await import("../config.js");
-  const discovery = await discoverPools({ page_size: 50, screeningOverrides });
+  const source = String(config.screening.source || "meteora").toLowerCase();
+  if (!["meteora", "gmgn"].includes(source)) {
+    throw new Error(`Invalid screeningSource: ${config.screening.source}. Use meteora or gmgn.`);
+  }
+  const discovery = source === "gmgn"
+    ? await discoverGmgnPools({ limit: Math.max(limit, config.gmgn.enrichLimit || 20) })
+    : await discoverPools({ page_size: 50, screeningOverrides });
   let { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
+
+  // Token blacklist + dev blocklist (Meteora path runs these inside discoverPools; GMGN path does not)
+  if (source === "gmgn") {
+    const before = pools.length;
+    pools = pools.filter((p) => {
+      if (isBlacklisted(p.base?.mint)) {
+        log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
+        pushFilteredReason(filteredOut, p, "blacklisted token");
+        return false;
+      }
+      if (p.dev && isDevBlocked(p.dev)) {
+        log("dev_blocklist", `Filtered blocked deployer ${p.dev?.slice(0, 8)} token ${p.base?.symbol}`);
+        pushFilteredReason(filteredOut, p, "blocked deployer");
+        return false;
+      }
+      return true;
+    });
+    if (pools.length < before) log("blacklist", `GMGN: filtered ${before - pools.length} blacklisted/blocked pool(s)`);
+  }
 
   // Aggregate volume across all pools per token and pick best pool per token
   const aggMin = screeningOverrides?.aggregateMinVolume;
@@ -528,7 +575,9 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = Number(config.screening.minTvl ?? 0);
+  const minTvl = source === "gmgn"
+    ? Number(config.gmgn.minTvl ?? config.screening.minTvl ?? 0)
+    : Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
 
@@ -589,7 +638,8 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
   }
 
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
-  if (eligible.length > 0) {
+  // Skipped for GMGN: bundler/bot/wash data already sourced from GMGN pipeline
+  if (source !== "gmgn" && eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
     const okxResults = await Promise.allSettled(
       eligible.map(async (p) => {
@@ -727,8 +777,11 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
 
   return {
     candidates: eligible,
-    total_screened: pools.length,
+    total_screened: discovery.total ?? pools.length,
+    source,
     filtered_examples: filteredOut.slice(0, 3),
+    stage_counts: discovery.stage_counts ? { ranked: discovery.total, ...discovery.stage_counts } : null,
+    all_filtered: filteredOut,
   };
 }
 

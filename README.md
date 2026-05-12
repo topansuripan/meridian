@@ -74,25 +74,6 @@ npm run setup
 
 The wizard walks you through creating `.env` (API keys, wallet, RPC, Telegram) and `user-config.json` (deploy size, thresholds, schedules, models). Takes about 2 minutes.
 
-**Or set up manually:**
-
-Create `.env`:
-
-```env
-WALLET_PRIVATE_KEY=your_base58_private_key
-RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
-LLM_BASE_URL=https://api.minimax.io/v1
-LLM_API_KEY=your_minimax_api_key
-LLM_MODEL=MiniMax-M2.7
-HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
-TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
-TELEGRAM_CHAT_ID=                       # set explicitly
-TELEGRAM_ALLOWED_USER_IDS=              # set explicitly for command/control
-DRY_RUN=true                            # set false for live trading
-```
-
-> Never commit your private key or API keys. `.env` and `user-config.json` are gitignored, but secrets should still stay local.
-
 Optional encrypted `.env` flow:
 
 ```bash
@@ -103,7 +84,7 @@ npm run env:encrypt
 
 Meridian loads envrypt-style encrypted values automatically. Keep `.env.raw` and `.envrypt` local; both are gitignored.
 
-Copy config and edit as needed:
+**4. Copy the example config**
 
 ```bash
 cp user-config.example.json user-config.json
@@ -438,12 +419,14 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxMcap` | `10000000` | Maximum market cap (USD) |
 | `minBinStep` | `80` | Minimum bin step |
 | `maxBinStep` | `125` | Maximum bin step |
-| `timeframe` | `5m` | Candle timeframe for screening |
-| `category` | `trending` | Pool category filter |
+| `timeframe` | `5m` | Candle timeframe used in screening |
+| `category` | `trending` | Pool category filter for screening |
 | `minTokenFeesSol` | `30` | Minimum all-time fees in SOL |
 | `maxBundlersPct` | `30` | Maximum bundler % in top 100 holders |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
+| `takeProfitPct` | `5` | Close position when PnL reaches this % threshold |
+| `outOfRangeWaitMinutes` | `30` | Minutes a position can be out of range before alerting / acting |
 
 ### Management
 
@@ -505,8 +488,6 @@ Security notes:
 - Screening alerts when a good candidate is found but deployment is blocked
 - On deploy: pair, amount, position address, tx hash
 - On close: pair, PnL, and PnL card link
-
-Full management and screening reports are intended to be opened on demand from Telegram or the terminal, rather than spammed every cycle.
 
 You can also chat with the agent via Telegram using the same free-form interface as the REPL: `"check wallet 7tB8..."`, `"who are the top LPers in pool ABC..."`, `"close all positions"`, etc. Only explicitly allowed Telegram user IDs can issue commands.
 
