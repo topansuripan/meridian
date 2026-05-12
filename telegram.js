@@ -428,8 +428,12 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   const poolStr = (binStep || baseFee)
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
+  const caStr = baseMint && baseMint.length > 20
+    ? `CA: <code>${baseMint}</code>\n`
+    : "";
   await sendHTML(
     `✅ <b>Deployed</b> ${pairLabel}\n` +
+    caStr +
     `Amount: ${amountSol} SOL\n` +
     priceStr +
     coverageStr +

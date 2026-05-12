@@ -735,6 +735,7 @@ export async function deployPosition({
         position: positionAddress,
         pool: pool_address,
         pool_name,
+        base_mint: pool.lbPair.tokenXMint.toString(),
         bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
         price_range: { min: minPrice, max: maxPrice },
         range_coverage: {
@@ -868,6 +869,7 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
+      base_mint: pool.lbPair.tokenXMint.toString(),
       bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
       price_range: { min: minPrice, max: maxPrice },
       range_coverage: {
