@@ -25,10 +25,17 @@ export async function getTokenAudit(mint) {
   const data = await res.json();
   const token = Array.isArray(data) ? data[0] : data;
   const audit = token?.audit;
+  // Check both: top-level authority fields (always present) and audit flags (sometimes missing)
+  const hasMintAuthority = !!token?.mintAuthority;
+  const hasFreezeAuthority = !!token?.freezeAuthority;
+  const auditSaysMintable = audit?.mintAuthorityDisabled === false;
+  const auditSaysFreezable = audit?.freezeAuthorityDisabled === false;
   return {
     mint,
-    mintable: audit?.mintAuthorityDisabled === false,
-    freezable: audit?.freezeAuthorityDisabled === false,
+    mintable: hasMintAuthority || auditSaysMintable,
+    freezable: hasFreezeAuthority || auditSaysFreezable,
+    mintAuthority: token?.mintAuthority || null,
+    freezeAuthority: token?.freezeAuthority || null,
   };
 }
 
