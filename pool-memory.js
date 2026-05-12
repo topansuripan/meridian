@@ -286,6 +286,43 @@ export function wasBaseMintDeployedSince(baseMint, sinceDate) {
   return false;
 }
 
+/**
+ * Set a cooldown after a deploy was blocked by safety checks.
+ * Prevents the screener from re-selecting the same pool/token next cycle.
+ */
+export function setDeployFailureCooldown(poolAddress, baseMint, reason, hours = 2) {
+  if (!poolAddress) return;
+  const db = load();
+
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: poolAddress.slice(0, 8),
+      base_mint: baseMint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+
+  const entry = db[poolAddress];
+  if (baseMint && !entry.base_mint) entry.base_mint = baseMint;
+  const cooldownUntil = setPoolCooldown(entry, hours, reason);
+  log("pool-memory", `Deploy-failure cooldown set for ${entry.name} until ${cooldownUntil} (${reason})`);
+
+  if (baseMint) {
+    setBaseMintCooldown(db, baseMint, hours, reason);
+    log("pool-memory", `Deploy-failure token cooldown set for ${baseMint.slice(0, 8)} (${reason})`);
+  }
+
+  save(db);
+}
+
 // ─── Read ──────────────────────────────────────────────────────
 
 /**

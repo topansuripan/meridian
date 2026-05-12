@@ -14,7 +14,7 @@ import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
-import { getPoolMemory, addPoolNote, wasBaseMintDeployedSince } from "../pool-memory.js";
+import { getPoolMemory, addPoolNote, wasBaseMintDeployedSince, setDeployFailureCooldown } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
@@ -30,7 +30,6 @@ import { execSync, spawn } from "child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 const GMGN_CONFIG_PATH = path.join(__dirname, "../gmgn-config.json");
-const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
@@ -74,13 +73,7 @@ function poolDetailVolatility(pool) {
 }
 
 async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
-  const encodedTimeframe = encodeURIComponent(timeframe);
-  const filter = encodeURIComponent(`pool_address=${poolAddress}`);
-  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
-  const data = await res.json();
-  return (data?.data || [])[0] ?? null;
+  return getPoolDetail({ pool_address: poolAddress, timeframe });
 }
 
 async function validateDeployPoolThresholds(args) {
@@ -876,6 +869,16 @@ export async function executeTool(name, args) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       if (name === "deploy_position") {
         sendHTML(`⛔ <b>Deploy Blocked</b>\n\n${safetyCheck.reason}`).catch(() => {});
+        // Set cooldown so screener skips this pool/token next cycle
+        try {
+          setDeployFailureCooldown(
+            args.pool_address,
+            args.base_mint || null,
+            `deploy blocked: ${safetyCheck.reason}`.slice(0, 200),
+          );
+        } catch (e) {
+          log("pool-memory", `Failed to set deploy-failure cooldown: ${e.message}`);
+        }
       }
       return {
         blocked: true,
