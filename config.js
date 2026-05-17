@@ -341,21 +341,27 @@ export const config = {
  * Compute the optimal deploy amount for a given wallet balance.
  * Scales position size with wallet growth (compounding).
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * When openPositions > 0, estimates the original total wallet by
+ * back-calculating how much SOL was already deployed, so each
+ * position is sized as pct% of the *original* wallet, not the remainder.
  *
- * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
- *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
- *   2.0 SOL wallet → 0.63 SOL deploy
- *   3.0 SOL wallet → 0.98 SOL deploy
- *   4.0 SOL wallet → 1.33 SOL deploy
+ * Formula: clamp(estimatedOriginal × pct, floor=deployAmountSol, ceil=maxDeployAmount)
+ *
+ * Example (gasReserve=0, positionSizePct=0.40, maxPositions=2):
+ *   2.0 SOL wallet, 0 open → deploy 0.80 SOL (40% of 2.0)
+ *   1.2 SOL wallet, 1 open → deploy 0.80 SOL (40% of estimated 2.0 original)
  */
-export function computeDeployAmount(walletSol) {
+export function computeDeployAmount(walletSol, openPositions = 0) {
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
   const floor    = config.management.deployAmountSol;
   const ceil     = config.risk.maxDeployAmount;
   const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
+  // Estimate original wallet: current balance is what's left after
+  // openPositions × pct% was already deployed from the original
+  const fractionRemaining = Math.max(0.1, 1 - openPositions * pct);
+  const estimatedOriginal = deployable / fractionRemaining;
+  const dynamic = estimatedOriginal * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
 }

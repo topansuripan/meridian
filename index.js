@@ -718,7 +718,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return screenReport;
     }
     const liquidSol = getLiquidSolEquivalent(preBalance);
-    const tentativeDeploy = computeDeployAmount(liquidSol);
+    const tentativeDeploy = computeDeployAmount(liquidSol, normalPositionCount);
     const reserveSol = getTargetSolReserve(preBalance);
     const minRequired = tentativeDeploy + reserveSol;
     const isDryRun = process.env.DRY_RUN === "true";
@@ -749,8 +749,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
     const liquidSolEq = getLiquidSolEquivalent(currentBalance);
-    const deployAmount = computeDeployAmount(liquidSolEq);
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (liquid: ${liquidSolEq.toFixed(3)} SOL eq | wallet SOL: ${currentBalance.sol} | USDC: ${currentBalance.usdc})`);
+    const deployAmount = computeDeployAmount(liquidSolEq, normalPositionCount);
+    log("cron", `Computed deploy amount: ${deployAmount} SOL (liquid: ${liquidSolEq.toFixed(3)} SOL eq | wallet SOL: ${currentBalance.sol} | USDC: ${currentBalance.usdc} | open: ${normalPositionCount})`);
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
@@ -1263,7 +1263,7 @@ export async function runDegenScreeningCycle() {
     }
 
     const liquidSol = getLiquidSolEquivalent(preBalance);
-    const deployAmount = Math.min(computeDeployAmount(liquidSol), config.degen.maxDeployAmount);
+    const deployAmount = Math.min(computeDeployAmount(liquidSol, degenCount), config.degen.maxDeployAmount);
     const reserveSol = getTargetSolReserve(preBalance);
     const isDryRun = process.env.DRY_RUN === "true";
     if (!isDryRun && liquidSol < deployAmount + reserveSol) {
@@ -1699,7 +1699,7 @@ function describeLatestCandidates(limit = 5) {
 
 function formatWalletStatus(wallet, positions) {
   const liquidSol = getLiquidSolEquivalent(wallet);
-  const deployAmount = computeDeployAmount(liquidSol);
+  const deployAmount = computeDeployAmount(liquidSol, positions.total_positions);
   const reserveSol = getTargetSolReserve(wallet);
   const hive = isHiveMindEnabled() ? "on" : "off";
   return [
@@ -2194,9 +2194,9 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const walletBal = await getWalletBalances();
+  const [walletBal, currentPositions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
   const liquidSol = getLiquidSolEquivalent(walletBal);
-  const deployAmount = computeDeployAmount(liquidSol);
+  const deployAmount = computeDeployAmount(liquidSol, currentPositions.total_positions);
   const binsBelow = computeBinsBelow(candidate.volatility);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
