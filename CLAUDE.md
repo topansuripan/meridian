@@ -222,7 +222,66 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ---
 
+## VPS Deployment
+
+- **Host**: `root@43.133.133.150`
+- **Path**: `/root/meridian`
+- **Branch**: `feature/degen-mode`
+- **Process manager**: PM2 (process name: `meridian`)
+- **Deploy workflow**: `git push origin feature/degen-mode` locally → `ssh root@43.133.133.150 "cd ~/meridian && git pull origin feature/degen-mode && npm install && pm2 restart meridian"`
+- **Logs**: `pm2 logs meridian --lines 50 --nostream`
+- **Config**: `/root/meridian/user-config.json` (not in git, edit directly on VPS)
+
+---
+
+## Operational Details
+
+- **Wallet**: `BeEGreU2nwr8bXmrsi1Tf8ALZbVWP9VomfeaEMDLmSYg`
+- **LLM Provider**: MiniMax-M2.7-highspeed via `https://ai.sumopod.com/v1`
+- **Agent Meridian API**: `https://api.agentmeridian.xyz/api` (relay for pool discovery, PnL, top LP, study)
+- **HiveMind URL**: `https://api.agentmeridian.xyz`
+- **Discord Signals**: enabled, mode `merge` (merges Discord signal candidates into screening pipeline)
+
+### VPS Config (user-config.json, not in git)
+
+Key non-default values on VPS:
+- `publicApiKey`: `"bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz"` (Agent Meridian relay key)
+- `agentMeridianApiUrl`: `"https://api.agentmeridian.xyz/api"`
+- `lpAgentRelayEnabled`: `true`
+- `hiveMindUrl`: `"https://api.agentmeridian.xyz"`
+- `hiveMindApiKey`: `"hm_8f3c7d1b4a6e92c5f0d8a3b7c1e4f9a2b6d7c8e1f3a5b9d2c4e6f8a1b3d5c7"`
+- `useDiscordSignals`: `true`
+- `discordSignalMode`: `"merge"`
+
+---
+
+## Safety Checks Added (May 2026)
+
+### Mint/Freeze Authority Check
+- `getTokenAudit(mint)` in `token.js` checks both top-level `mintAuthority`/`freezeAuthority` fields AND `audit.mintAuthorityDisabled`/`audit.freezeAuthorityDisabled`
+- Token-2022 tokens may omit `audit` sub-fields; top-level fields are always present when authority is active
+- Enforced in `executor.js runSafetyChecks()` — blocks deploy if token is mintable or freezable
+- Controlled by `config.screening.blockMintableTokens` (default: true)
+
+### Resolved Base Mint (CA vs Symbol Fix)
+- LLM sometimes passes token symbol (e.g. "ANDURIL") instead of actual CA in `args.base_mint`
+- `validateDeployPoolThresholds()` now extracts real CA from pool discovery data: `detail?.token_x?.address || detail?.base_token_address`
+- Returns `resolvedBaseMint` which is used by ALL downstream safety checks (mint/freeze, duplicate token, Saturday rule, cooldown)
+- `dlmm.js` deploy return now includes `base_mint: pool.lbPair.tokenXMint.toString()` for Telegram notifications
+
+### Deploy Failure Cooldown
+- `setDeployFailureCooldown()` in `pool-memory.js` sets 2-hour cooldown on both pool address AND base mint token when deploy is blocked
+- Prevents infinite re-screening of pools that fail safety checks
+- Screening already checks `isPoolOnCooldown()` and `isBaseMintOnCooldown()` before presenting candidates
+
+### Pool Detail API Consistency
+- `executor.js` now delegates to `getPoolDetail()` from `screening.js` instead of hitting raw Meteora API directly
+- This ensures pool data goes through the same relay path (Agent Meridian) as screening, avoiding data mismatches
+
+---
+
 ## Known Issues / Tech Debt
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
+- **MiniMax-M2.7 intermittent failures**: The model occasionally fails to make tool calls (returns text-only response) or rejects `system` role messages. This is a model-level issue, not a code bug. Manifests as "I couldn't complete that reliably because no tool call was made" in screening/management cycles. Frequency: ~30 occurrences on May 11, ~6 on May 12. No code fix needed — retries on next cron cycle.
