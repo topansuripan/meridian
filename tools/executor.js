@@ -1021,6 +1021,38 @@ async function runSafetyChecks(name, args) {
         }
       }
 
+      // Fresh token data recheck — prevents stale screening data from sneaking through
+      if (baseMint) {
+        try {
+          const freshToken = await getTokenInfo({ query: baseMint });
+          const token = freshToken?.results?.[0] || freshToken;
+          if (token && token.mint) {
+            const freshMcap = Number(token.mcap);
+            const minMcap = numberOrNull(config.screening.minMcap);
+            const maxMcap = numberOrNull(config.screening.maxMcap);
+            if (minMcap != null && (!Number.isFinite(freshMcap) || freshMcap < minMcap)) {
+              return { pass: false, reason: `Fresh token mcap $${freshMcap || "unknown"} is below minMcap $${minMcap}. Screening data was stale.` };
+            }
+            if (maxMcap != null && Number.isFinite(freshMcap) && freshMcap > maxMcap) {
+              return { pass: false, reason: `Fresh token mcap $${freshMcap} is above maxMcap $${maxMcap}.` };
+            }
+            const freshHolders = Number(token.holders);
+            const minHolders = numberOrNull(config.screening.minHolders);
+            if (minHolders != null && (!Number.isFinite(freshHolders) || freshHolders < minHolders)) {
+              return { pass: false, reason: `Fresh holder count ${freshHolders || "unknown"} is below minHolders ${minHolders}.` };
+            }
+            const freshBotPct = Number(token.audit?.bot_holders_pct);
+            const maxBotPct = numberOrNull(config.screening.maxBotHoldersPct);
+            if (maxBotPct != null && Number.isFinite(freshBotPct) && freshBotPct > maxBotPct) {
+              return { pass: false, reason: `Fresh bot holders ${freshBotPct}% exceeds max ${maxBotPct}%.` };
+            }
+            log("safety_check", `Fresh token recheck passed: mcap=$${freshMcap}, holders=${freshHolders}, bots=${freshBotPct}%`);
+          }
+        } catch (e) {
+          log("safety_check", `Fresh token recheck failed for ${baseMint}: ${e.message} — proceeding with existing data`);
+        }
+      }
+
       // Reject pools with bin_step out of configured range
       const isDegen = !!args.degen;
       const minStep = isDegen ? (config.degen?.minBinStep ?? 20) : config.screening.minBinStep;
