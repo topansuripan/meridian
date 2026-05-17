@@ -276,7 +276,7 @@ async function enrichDiscordSignalLaunchpads(rawPools) {
       dev: result.value.asset?.dev || null,
       holderCount: numeric(result.value.asset?.holderCount),
       organicScore: numeric(result.value.asset?.organicScore),
-      marketCap: numeric(result.value.asset?.mcap ?? result.value.asset?.fdv),
+      marketCap: numeric(result.value.asset?.mcap),
       createdAt: result.value.asset?.createdAt ? Date.parse(result.value.asset.createdAt) : null,
     });
   }
