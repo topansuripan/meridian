@@ -678,13 +678,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
   _screeningLastTriggered = Date.now();
 
   // Hard guards — don't even run the agent if preconditions aren't met
-  let prePositions, preBalance;
+  let prePositions, preBalance, normalPositionCount;
   let liveMessage = null;
   let screenReport = null;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     // Exclude degen positions from normal position count
-    const normalPositionCount = _degenEnabled
+    normalPositionCount = _degenEnabled
       ? (prePositions.positions || []).filter(p => getTrackedPosition(p.position)?.degen !== true).length
       : prePositions.total_positions;
     if (normalPositionCount >= config.risk.maxPositions) {
