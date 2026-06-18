@@ -12,7 +12,7 @@ import {
 import { getWalletBalances, swapToken, waitForWalletTokenBalance } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, getTrackedPosition } from "../state.js";
 
 import { getPoolMemory, addPoolNote, wasBaseMintDeployedSince, setDeployFailureCooldown } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -1123,12 +1123,19 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
+      // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache.
+      // Caps are per-type: degen positions count against config.degen.maxPositions,
+      // normal positions against config.risk.maxPositions — independently of each other.
       const positions = await getMyPositions({ force: true });
-      if (positions.total_positions >= config.risk.maxPositions) {
+      const isDegenPos = (p) => getTrackedPosition(p.position)?.degen === true;
+      const typeCount = isDegen
+        ? (positions.positions || []).filter(isDegenPos).length
+        : (positions.positions || []).filter((p) => !isDegenPos(p)).length;
+      const typeMax = isDegen ? config.degen.maxPositions : config.risk.maxPositions;
+      if (typeCount >= typeMax) {
         return {
           pass: false,
-          reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
+          reason: `Max ${isDegen ? "degen" : "normal"} positions (${typeMax}) reached. Close a ${isDegen ? "degen" : "normal"} position first.`,
         };
       }
       const alreadyInPool = positions.positions.some(

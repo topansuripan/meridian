@@ -82,7 +82,7 @@ function gmgnArray(key, legacyKey, fallback) {
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
-    maxPositions:    u.maxPositions    ?? 3,
+    maxPositions:    u.maxPositions    ?? 2,
     maxDeployAmount: u.maxDeployAmount ?? 50,
     maxDailyLossUsd: u.maxDailyLossUsd ?? 80,
     maxConsecutiveLosses: u.maxConsecutiveLosses ?? 3,
@@ -225,7 +225,7 @@ export const config = {
   // ─── Degen Play Mode ───────────────────
   degen: {
     enabled:              u.degenEnabled              ?? false,
-    maxPositions:         u.degenMaxPositions         ?? 1,
+    maxPositions:         u.degenMaxPositions         ?? 2,
     managementIntervalMin: u.degenManagementIntervalMin ?? 1,
     screeningIntervalMin: u.degenScreeningIntervalMin ?? 30,
     // Screening overrides

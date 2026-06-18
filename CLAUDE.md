@@ -83,7 +83,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | blockedLaunchpads | screening | [] |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
-| maxPositions | risk | 3 |
+| maxPositions | risk | 2 |
 | gasReserve | management | 0.2 |
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
@@ -111,7 +111,7 @@ Before `deploy_position` executes:
 - `bin_step` must be within `[minBinStep, maxBinStep]`
 - `volatility` must be a positive finite number when provided; fresh pool detail with volatility 0/null is rejected
 - Total range must be at least `max(35, minBinsBelow)` bins; 1-bin/tiny deploys are refused
-- Position count must be below `maxPositions` (force-fresh scan, no cache)
+- Position count must be below the per-type cap (force-fresh scan, no cache): degen deploys count only degen positions against `config.degen.maxPositions`; normal deploys count only normal positions against `config.risk.maxPositions`. The two caps are independent — e.g. `risk.maxPositions=2` + `degen.maxPositions=2` allows 2 normal + 2 degen simultaneously
 - No duplicate pool allowed (same pool_address)
 - No duplicate base token allowed (same base_mint in another pool)
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
