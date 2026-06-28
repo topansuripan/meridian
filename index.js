@@ -10,7 +10,7 @@ import { getWalletBalances, swapToken } from "./tools/wallet.js";
 import * as solCrashGuard from "./sol-crash-guard.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, setSpectateMode } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getLossCircuitBreakerStatus } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -565,7 +565,9 @@ export async function runManagementCycle({ silent = false } = {}) {
       return a.action === "CLOSE" || a.action === "CLAIM";
     });
     const deterministicResults = [];
-    if (deterministicActions.length > 0) {
+    if (config.spectateMode && deterministicActions.length > 0) {
+      log("spectate", "Deterministic close/claim loop skipped (spectate mode).");
+    } else if (deterministicActions.length > 0) {
       log("cron", `Management: ${deterministicActions.length} hardcoded action(s) — executing directly`);
       for (const p of deterministicActions) {
         const act = actionMap.get(p.position);
@@ -2197,6 +2199,7 @@ function formatHelpText() {
     "/hive pull — manual HiveMind pull now",
     "/pause — stop cron cycles",
     "/resume — start cron cycles again",
+    "/spectate on|off — watch-only mode (cycles run, no actions)",
     "/stop — shut down agent",
   ].join("\n");
 }
@@ -2567,6 +2570,22 @@ async function telegramHandler(msg) {
     } else {
       const status = _degenEnabled ? "ON" : "OFF";
       await sendMessage(`Degen mode: ${status}\nMax positions: ${config.degen.maxPositions}\nVolume: $${config.degen.minVolume} | SL: ${config.degen.stopLossPct}% | TP: ${config.degen.takeProfitPct}%\nOOR close: ${config.degen.outOfRangeWaitMinutes}m`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/spectate" || text === "/spectate on" || text === "/spectate off") {
+    if (text === "/spectate on" || text === "/spectate off") {
+      const on = text.endsWith(" on");
+      setSpectateMode(on);
+      await sendMessage(
+        on
+          ? "👁 Spectate mode ON — monitoring continues, but NO actions: no SL/TP/close, no deploys, no claims/swaps, SOL-crash breaker stands down. You'll get '⚠️/👁 WOULD …' alerts.\n\nCycles still run — this is NOT /pause. Use /spectate off to resume automation."
+          : "▶️ Spectate mode OFF — automation resumed on the next cycle."
+      ).catch(() => {});
+    } else {
+      const live = await getMyPositions({ silent: true }).catch(() => ({ total_positions: 0 }));
+      await sendMessage(`👁 Spectate mode is ${config.spectateMode ? "ON" : "OFF"}. Open positions: ${live?.total_positions ?? "?"}.`).catch(() => {});
     }
     return;
   }
