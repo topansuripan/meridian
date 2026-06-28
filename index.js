@@ -27,7 +27,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, shouldSendAlert } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
@@ -603,7 +603,12 @@ export async function runManagementCycle({ silent = false } = {}) {
         ].filter(Boolean).join("\n");
       }).join("\n\n");
 
-      const { content } = await agentLoop(`
+      let content;
+      if (config.spectateMode) {
+        log("spectate", "Management LLM step skipped (spectate mode) — monitoring only.");
+        content = "👁 [SPECTATE] Instruction review skipped — monitoring only, no action taken.";
+      } else {
+        ({ content } = await agentLoop(`
 MANAGEMENT INSTRUCTION REVIEW — ${instructionPositions.length} position(s)
 
 ${actionBlocks}
@@ -617,9 +622,10 @@ RULES:
 Execute only the instruction-driven actions that are truly met.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
-        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
-      });
+          onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+          onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+        }));
+      }
 
       mgmtReport += `${deterministicResults.length ? `\n\nExecuted:\n- ${deterministicResults.join("\n- ")}` : ""}\n\n${content}`;
     } else {
@@ -646,8 +652,9 @@ After executing, write a brief one-line result per position.
     // Wrapped in its own try/catch so a guard failure can never break management.
     try {
       const bal = await getWalletBalances();
-      await solCrashGuard.tick({
+      const tickRes = await solCrashGuard.tick({
         solPrice: bal.sol_price,
+        observeOnly: config.spectateMode,
         deps: {
           getNormalOpenPositions: async () => {
             const live = await getMyPositions({ force: true, silent: true }).catch(() => ({ positions: [] }));
@@ -679,6 +686,9 @@ After executing, write a brief one-line result per position.
           notify: (text) => sendMessage(text),
         },
       });
+      if (config.spectateMode && tickRes?.wouldTrip && shouldSendAlert("spectate_breaker", 30 * 60_000)) {
+        await sendMessage(`⚠️ [SPECTATE] WOULD trigger SOL-crash breaker — ${tickRes.reason}. No action taken.`).catch(() => {});
+      }
     } catch (e) {
       log("cron_error", `SOL-crash guard tick failed: ${e.message}`);
     }
@@ -748,10 +758,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
       cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
     });
-    if (lossBreaker.triggered || solCrashGuard.isCoolingDown()) {
-      const reason = lossBreaker.triggered
-        ? formatLossCircuitBreakerReason(lossBreaker)
-        : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
+    if (lossBreaker.triggered || solCrashGuard.isCoolingDown() || config.spectateMode) {
+      const reason = config.spectateMode
+        ? "Spectate mode — screening/deploys paused"
+        : lossBreaker.triggered
+          ? formatLossCircuitBreakerReason(lossBreaker)
+          : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
       log("cron", `Screening paused by loss circuit breaker — ${reason}`);
       screenReport = `Screening paused — ${reason}.\nManagement stays active on existing positions.`;
       appendDecision({
@@ -1531,8 +1543,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
-            log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
-            runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            if (config.spectateMode) {
+              if (shouldSendAlert(`spectate_exit:${p.position}:${exit.reason || "exit"}`, 20 * 60_000)) {
+                await sendMessage(`👁 [SPECTATE] WOULD close ${p.pair} — ${exit.reason} (PnL ${p.pnl_pct ?? "?"}%). No action taken.`).catch(() => {});
+              }
+            } else {
+              log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
+              runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            }
           } else {
             log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
           }
@@ -1544,8 +1562,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
-            log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — triggering management`);
-            runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            if (config.spectateMode) {
+              if (shouldSendAlert(`spectate_exit:${p.position}:${closeRule.reason || "exit"}`, 20 * 60_000)) {
+                await sendMessage(`👁 [SPECTATE] WOULD close ${p.pair} — ${closeRule.reason} (PnL ${p.pnl_pct ?? "?"}%). No action taken.`).catch(() => {});
+              }
+            } else {
+              log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — triggering management`);
+              runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            }
           } else {
             log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
           }
@@ -2183,10 +2207,12 @@ async function runDeterministicScreen(limit = 5) {
     maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
     cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
   });
-  if (lossBreaker.triggered || solCrashGuard.isCoolingDown()) {
-    const reason = lossBreaker.triggered
-      ? formatLossCircuitBreakerReason(lossBreaker)
-      : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
+  if (lossBreaker.triggered || solCrashGuard.isCoolingDown() || config.spectateMode) {
+    const reason = config.spectateMode
+      ? "Spectate mode — screening/deploys paused"
+      : lossBreaker.triggered
+        ? formatLossCircuitBreakerReason(lossBreaker)
+        : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
     return `Screening paused — ${reason}.\nManagement stays active on existing positions.`;
   }
   const top = await getTopCandidates({ limit });
