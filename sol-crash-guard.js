@@ -99,6 +99,7 @@ export function defaultState() {
       solAtTrip: null,
       closedPositions: [],
       usdcParked: null,
+      parkComplete: false,
     },
   };
 }
@@ -123,6 +124,24 @@ export function saveState(state, path = STATE_FILE) {
   }
 }
 
+/**
+ * Trip the breaker on a confirmed dump: close all normal positions, park freed
+ * SOL into USDC, and start the cooldown.
+ *
+ * `usdcParked` is measured as the wallet's USDC balance DELTA across the whole
+ * trip (before close → after the breaker's own swap). This captures BOTH any
+ * executor auto-park-on-close AND the breaker's own SOL->USDC swap, while
+ * excluding any pre-existing operator USDC baseline. It does NOT rely on the
+ * swap dep's returned `usdcOut` (which may be ~0 when the executor already
+ * parked the freed SOL on close).
+ *
+ * Dep contract:
+ *   getNormalOpenPositions()     -> [{ position, pool_name }]
+ *   closePosition({ position_address, reason }) -> any  (may auto-park to USDC)
+ *   getUsdcBalance()             -> number  (current wallet USDC)
+ *   swapSolToUsdc()              -> any     (best-effort park; return value ignored)
+ *   notify(text)                 -> void
+ */
 export async function maybeTrip(state, { now = Date.now(), cfg, deps }) {
   if (!cfg.enabled || state.breaker.active) return state;
   const metrics = computeSolMetrics(state.priceHistory, now);
@@ -130,6 +149,8 @@ export async function maybeTrip(state, { now = Date.now(), cfg, deps }) {
   if (!dumping) return state;
 
   log("sol_guard", `TRIP: ${reason}. Closing normal positions.`);
+  const usdcBefore = Number(await deps.getUsdcBalance().catch(() => 0)) || 0;
+
   const positions = await deps.getNormalOpenPositions().catch(() => []);
   const closed = [];
   for (const p of positions) {
@@ -141,13 +162,16 @@ export async function maybeTrip(state, { now = Date.now(), cfg, deps }) {
     }
   }
 
-  let usdcParked = null;
+  let parkComplete = true;
   try {
-    const r = await deps.swapSolToUsdc();
-    usdcParked = r?.usdcOut ?? null;
+    await deps.swapSolToUsdc();
   } catch (e) {
-    log("sol_guard_warn", `SOL->USDC swap failed: ${e.message} (positions are out of LP; will retry)`);
+    parkComplete = false;
+    log("sol_guard_warn", `SOL->USDC swap failed: ${e.message} (will retry next cycle)`);
   }
+
+  const usdcAfter = Number(await deps.getUsdcBalance().catch(() => usdcBefore)) || usdcBefore;
+  const usdcParked = Math.max(0, usdcAfter - usdcBefore);
 
   state.breaker = {
     active: true,
@@ -157,6 +181,7 @@ export async function maybeTrip(state, { now = Date.now(), cfg, deps }) {
     solAtTrip: metrics.priceNow,
     closedPositions: closed,
     usdcParked,
+    parkComplete,
   };
 
   await deps.notify(
@@ -286,10 +311,13 @@ export async function backfillSolHistory(fetchFn = fetch, now = Date.now()) {
  * actual close/swap/positions/notify implementations from index.js.
  *
  * Swap dep contract:
- *   swapSolToUsdc()              -> { usdcOut }   (trip: park SOL into USDC)
+ *   getUsdcBalance()             -> number      (wallet USDC; used for the
+ *     before/after delta that measures how much was parked on trip / re-park)
+ *   swapSolToUsdc()              -> any          (trip: park SOL into USDC;
+ *     return value is ignored — parked amount is measured via the balance delta)
  *   swapUsdcToSol(parkedUsdc)    -> { solOut }    (re-entry: swap back ONLY the
- *     `parkedUsdc` the breaker recorded on trip — null if the trip swap failed —
- *     never sweeping unrelated operator USDC in the same wallet)
+ *     `parkedUsdc` the breaker recorded on trip — never sweeping unrelated
+ *     operator USDC in the same wallet)
  */
 let _ticking = false;
 export async function tick({ now = Date.now(), solPrice, deps }) {
@@ -300,6 +328,21 @@ export async function tick({ now = Date.now(), solPrice, deps }) {
     if (Number.isFinite(solPrice)) recordSolPrice(solPrice, now);
     const cfg = config.solCrashGuard;
     if (_state.breaker.active) {
+      // If a prior trip's park did not complete (SOL->USDC swap threw), retry it
+      // each cycle BEFORE attempting re-entry — otherwise the trip capital is
+      // stranded as SOL and re-entry would have nothing to swap back.
+      if (_state.breaker.parkComplete === false) {
+        try {
+          const usdcBefore = Number(await deps.getUsdcBalance().catch(() => 0)) || 0;
+          await deps.swapSolToUsdc();
+          const usdcAfter = Number(await deps.getUsdcBalance().catch(() => usdcBefore)) || usdcBefore;
+          _state.breaker.usdcParked = Math.max(0, (_state.breaker.usdcParked || 0) + (usdcAfter - usdcBefore));
+          _state.breaker.parkComplete = true;
+          log("sol_guard", `Re-park succeeded: ${_state.breaker.usdcParked.toFixed(2)} USDC parked total.`);
+        } catch (e) {
+          log("sol_guard_warn", `Re-park retry failed: ${e.message} (will retry next cycle)`);
+        }
+      }
       await tryReenter(_state, { now, cfg, deps });
     } else {
       await maybeTrip(_state, { now, cfg, deps });

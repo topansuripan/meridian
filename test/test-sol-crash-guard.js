@@ -108,19 +108,26 @@ test("loadState returns defaults when file missing", () => {
 
 import { maybeTrip } from "../sol-crash-guard.js";
 
+// Stateful deps: `wallet.usdc` is the mock wallet's USDC balance, mutated by the
+// swap/close mocks so the before/after delta accounting in maybeTrip works.
+// By default the breaker's own swapSolToUsdc parks 150 USDC.
 function mkDeps(overrides = {}) {
   const closed = [];
-  return {
+  const wallet = { usdc: 0 };
+  const deps = {
     closed,
+    wallet,
     getNormalOpenPositions: async () => [
       { position: "P1", pool_name: "AAA-SOL" },
       { position: "P2", pool_name: "BBB-SOL" },
     ],
     closePosition: async ({ position_address }) => { closed.push(position_address); return { ok: true }; },
-    swapSolToUsdc: async () => ({ usdcOut: 150 }),
+    getUsdcBalance: async () => wallet.usdc,
+    swapSolToUsdc: async () => { wallet.usdc += 150; return { usdcOut: 150 }; },
     notify: async () => {},
     ...overrides,
   };
+  return deps;
 }
 const CFG_FULL = { enabled: true, drop1hPct: 3, drawdown6hPct: 5, cooldownHours: 6, scope: "normal" };
 
@@ -128,13 +135,35 @@ test("maybeTrip closes normal positions and parks USDC when dumping", async () =
   const now = 10_000_000_000_000;
   const s = defaultState();
   s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now); // -4.56% 1h
-  const deps = mkDeps();
+  const deps = mkDeps(); // getUsdcBalance returns 0 before, 150 after the swap
   await maybeTrip(s, { now, cfg: CFG_FULL, deps });
   assert.equal(s.breaker.active, true);
   assert.deepEqual(deps.closed.sort(), ["P1", "P2"]);
-  assert.equal(s.breaker.usdcParked, 150);
+  assert.equal(s.breaker.usdcParked, 150); // measured via balance delta (0 -> 150)
+  assert.equal(s.breaker.parkComplete, true);
   assert.equal(s.breaker.cooldownUntil, now + 6 * 3600_000);
   assert.match(s.breaker.reason, /1h/);
+});
+
+test("REGRESSION: executor auto-parks on close — breaker's own swap moves ~nothing, usdcParked still captured via delta", async () => {
+  // The real bug: tools/executor.js parks freed SOL -> USDC on close_position
+  // (autoParkUsdcAfterClose). By the time the breaker's swapSolToUsdc runs there
+  // is almost no SOL left, so its usdcOut ~= 0. The fix measures usdcParked as the
+  // wallet USDC delta across the whole trip, which still sees the 0 -> 150 move.
+  const now = 10_000_000_000_000;
+  const s = defaultState();
+  s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now);
+  const deps = mkDeps({
+    // closing parks the freed SOL into USDC (simulating the executor auto-park)
+    closePosition: async function ({ position_address }) { this.closed.push(position_address); this.wallet.usdc = 150; return { ok: true }; },
+    // breaker's own swap finds almost no SOL left -> moves nothing
+    swapSolToUsdc: async () => ({ usdcOut: 0 }),
+  });
+  await maybeTrip(s, { now, cfg: CFG_FULL, deps });
+  assert.equal(s.breaker.active, true);
+  assert.deepEqual(deps.closed.sort(), ["P1", "P2"]);
+  assert.equal(s.breaker.usdcParked, 150, "delta (0 -> 150) captures the executor's auto-park even though the breaker swap returned ~0");
+  assert.equal(s.breaker.parkComplete, true);
 });
 
 test("maybeTrip is a no-op on a flat market", async () => {
@@ -178,7 +207,7 @@ function activeState(now, history) {
   const s = defaultState();
   s.priceHistory = history;
   s.breaker = { active: true, trippedAt: now - 6 * 3600_000, cooldownUntil: now, reason: "SOL -5% off 6h high",
-    solAtTrip: 65, closedPositions: ["P1"], usdcParked: 150 };
+    solAtTrip: 65, closedPositions: ["P1"], usdcParked: 150, parkComplete: true };
   return s;
 }
 const CFG_RE = { enabled: true, drop1hPct: 3, drawdown6hPct: 5, cooldownHours: 6, reentryRequiresStable: true };
@@ -285,12 +314,52 @@ test("maybeTrip keeps breaker active when SOL->USDC swap fails (positions alread
   const s = defaultState();
   s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now); // -4.56% 1h
   const deps = mkDeps({
+    closePosition: async function ({ position_address }) { this.closed.push(position_address); return { ok: true }; }, // no auto-park
     swapSolToUsdc: async () => { throw new Error("swap rpc failed"); },
   });
   await maybeTrip(s, { now, cfg: CFG_FULL, deps });
   assert.equal(s.breaker.active, true, "breaker must stay tripped even though parking failed");
-  assert.equal(s.breaker.usdcParked, null);
+  assert.equal(s.breaker.usdcParked, 0, "delta is 0 since nothing was parked (0 -> 0)");
+  assert.equal(s.breaker.parkComplete, false, "park did not complete — flagged for retry");
   assert.deepEqual(deps.closed.sort(), ["P1", "P2"], "positions still closed out of LP");
+});
+
+test("parkComplete retry: failed trip park is retried on next tick (active path)", async () => {
+  const { __resetStateForTests, tick } = await import("../sol-crash-guard.js");
+  const now = 10_000_000_000_000;
+
+  // 1) Trip with a throwing swap and a wallet that never gains USDC -> parkComplete=false, usdcParked=0
+  const s = defaultState();
+  s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now); // -4.56% 1h
+  let usdc = 0;
+  const tripDeps = mkDeps({
+    closePosition: async function ({ position_address }) { this.closed.push(position_address); return { ok: true }; },
+    getUsdcBalance: async () => usdc,
+    swapSolToUsdc: async () => { throw new Error("swap rpc failed"); },
+  });
+  await maybeTrip(s, { now, cfg: CFG_FULL, deps: tripDeps });
+  assert.equal(s.breaker.active, true);
+  assert.equal(s.breaker.parkComplete, false);
+  assert.equal(s.breaker.usdcParked, 0);
+
+  // 2) Drive the singleton via the active tick path; swap now succeeds, wallet 0 -> 150.
+  __resetStateForTests(s);
+  const tickNow = now + 60_000; // before cooldown elapses, so re-entry stays a no-op
+  const reparkDeps = {
+    getUsdcBalance: async () => usdc,
+    swapSolToUsdc: async () => { usdc = 150; return { usdcOut: 0 }; }, // delta does the accounting
+    swapUsdcToSol: async () => ({ solOut: 0 }),
+    getNormalOpenPositions: async () => [],
+    closePosition: async () => ({}),
+    notify: async () => {},
+  };
+  await tick({ now: tickNow, solPrice: 64.9, deps: reparkDeps });
+  const status = s.breaker;
+  assert.equal(status.parkComplete, true, "re-park retry marked complete");
+  assert.equal(status.usdcParked, 150, "re-park delta (0 -> 150) added to usdcParked");
+  assert.equal(status.active, true, "still parked — cooldown not yet elapsed");
+
+  __resetStateForTests(); // reset singleton for any later tests
 });
 
 test("tryReenter stays parked when USDC->SOL re-entry swap fails", async () => {

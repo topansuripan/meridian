@@ -653,6 +653,7 @@ After executing, write a brief one-line result per position.
             const live = await getMyPositions({ force: true, silent: true }).catch(() => ({ positions: [] }));
             return (live.positions || []).filter(p => getTrackedPosition(p.position)?.degen !== true);
           },
+          getUsdcBalance: async () => (await getWalletBalances()).usdc,
           closePosition: ({ position_address, reason }) =>
             executeTool("close_position", { position_address, reason }),
           swapSolToUsdc: async () => {
