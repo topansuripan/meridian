@@ -69,6 +69,7 @@ export function trackPosition({
   organic_score,
   initial_value_usd,
   signal_snapshot = null,
+  degen = false,
 }) {
   const state = load();
   state.positions[position] = {
@@ -88,6 +89,7 @@ export function trackPosition({
     organic_score,
     initial_value_usd,
     signal_snapshot: signal_snapshot || null,
+    degen,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
     last_claim_at: null,
@@ -313,6 +315,15 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   save(state);
   log("state", `Position ${position_address} rejected trailing drop after 15s recheck (pending current: ${pendingCurrent.toFixed(2)}%, current: ${currentPnlPct ?? "?"}%)`);
   return { confirmed: false, rejected: true };
+}
+
+/**
+ * Get all tracked positions (optionally filter open-only).
+ */
+export function getTrackedPositions(openOnly = false) {
+  const state = load();
+  const all = Object.values(state.positions);
+  return openOnly ? all.filter((p) => !p.closed) : all;
 }
 
 /**

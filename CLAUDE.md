@@ -83,7 +83,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | blockedLaunchpads | screening | [] |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
-| maxPositions | risk | 3 |
+| maxPositions | risk | 2 |
 | gasReserve | management | 0.2 |
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
@@ -111,7 +111,7 @@ Before `deploy_position` executes:
 - `bin_step` must be within `[minBinStep, maxBinStep]`
 - `volatility` must be a positive finite number when provided; fresh pool detail with volatility 0/null is rejected
 - Total range must be at least `max(35, minBinsBelow)` bins; 1-bin/tiny deploys are refused
-- Position count must be below `maxPositions` (force-fresh scan, no cache)
+- Position count must be below the per-type cap (force-fresh scan, no cache): degen deploys count only degen positions against `config.degen.maxPositions`; normal deploys count only normal positions against `config.risk.maxPositions`. The two caps are independent — e.g. `risk.maxPositions=2` + `degen.maxPositions=2` allows 2 normal + 2 degen simultaneously
 - No duplicate pool allowed (same pool_address)
 - No duplicate base token allowed (same base_mint in another pool)
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
@@ -222,7 +222,96 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ---
 
+## VPS Deployment
+
+- **Host**: `root@43.133.133.150`
+- **Path**: `/root/meridian`
+- **Branch**: `feature/degen-mode`
+- **Process manager**: PM2 (process name: `meridian`)
+- **Deploy workflow**: `git push origin feature/degen-mode` locally → `ssh root@43.133.133.150 "cd ~/meridian && git pull origin feature/degen-mode && npm install && pm2 restart meridian"`
+- **Logs**: `pm2 logs meridian --lines 50 --nostream`
+- **Config**: `/root/meridian/user-config.json` (not in git, edit directly on VPS)
+
+---
+
+## Operational Details
+
+- **Wallet**: `BeEGreU2nwr8bXmrsi1Tf8ALZbVWP9VomfeaEMDLmSYg`
+- **LLM Provider**: MiniMax-M2.7-highspeed via `https://ai.sumopod.com/v1`
+- **Agent Meridian API**: `https://api.agentmeridian.xyz/api` (relay for pool discovery, PnL, top LP, study)
+- **HiveMind URL**: `https://api.agentmeridian.xyz`
+- **Discord Signals**: enabled, mode `merge` (merges Discord signal candidates into screening pipeline)
+
+### VPS Config (user-config.json, not in git)
+
+Key non-default values on VPS:
+- `publicApiKey`: `"bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz"` (Agent Meridian relay key)
+- `agentMeridianApiUrl`: `"https://api.agentmeridian.xyz/api"`
+- `lpAgentRelayEnabled`: `true`
+- `hiveMindUrl`: `"https://api.agentmeridian.xyz"`
+- `hiveMindApiKey`: `"hm_8f3c7d1b4a6e92c5f0d8a3b7c1e4f9a2b6d7c8e1f3a5b9d2c4e6f8a1b3d5c7"`
+- `useDiscordSignals`: `true`
+- `discordSignalMode`: `"merge"`
+
+---
+
+## Safety Checks Added (May 2026)
+
+### Mint/Freeze Authority Check
+- `getTokenAudit(mint)` in `token.js` checks both top-level `mintAuthority`/`freezeAuthority` fields AND `audit.mintAuthorityDisabled`/`audit.freezeAuthorityDisabled`
+- Token-2022 tokens may omit `audit` sub-fields; top-level fields are always present when authority is active
+- Enforced in `executor.js runSafetyChecks()` — blocks deploy if token is mintable or freezable
+- Controlled by `config.screening.blockMintableTokens` (default: true)
+
+### Resolved Base Mint (CA vs Symbol Fix)
+- LLM sometimes passes token symbol (e.g. "ANDURIL") instead of actual CA in `args.base_mint`
+- `validateDeployPoolThresholds()` now extracts real CA from pool discovery data: `detail?.token_x?.address || detail?.base_token_address`
+- Returns `resolvedBaseMint` which is used by ALL downstream safety checks (mint/freeze, duplicate token, Saturday rule, cooldown)
+- `dlmm.js` deploy return now includes `base_mint: pool.lbPair.tokenXMint.toString()` for Telegram notifications
+
+### Deploy Failure Cooldown
+- `setDeployFailureCooldown()` in `pool-memory.js` sets 2-hour cooldown on both pool address AND base mint token when deploy is blocked
+- Prevents infinite re-screening of pools that fail safety checks
+- Screening already checks `isPoolOnCooldown()` and `isBaseMintOnCooldown()` before presenting candidates
+
+### Pool Detail API Consistency
+- `executor.js` now delegates to `getPoolDetail()` from `screening.js` instead of hitting raw Meteora API directly
+- This ensures pool data goes through the same relay path (Agent Meridian) as screening, avoiding data mismatches
+
+---
+
+## SOL-Crash Circuit Breaker (June 2026)
+
+**Why**: Single-sided SOL positions are SOL-denominated, so a SOL/USD crash trips per-position USD stop-losses across the entire book at once — token selection is irrelevant. Post-mortem of the Jun 25 drawdown: ~75% of the loss was SOL beta, not bad picks. This breaker hedges the whole normal book to USDC during a SOL dump.
+
+- **Module**: `sol-crash-guard.js` (self-contained; dependency-injected close/swap/positions/notify fns — no imports from `executor.js`/`dlmm.js`/`wallet.js`). State persists to `sol-crash-state.json` (gitignored).
+- **Trigger** (evaluated every management cycle — fires right after a normal stop-loss and as a catch-all): SOL is "dumping hard" when **≤ −3% in 1h OR ≤ −5% off its trailing 6h high**. Needs ≥ ~1h of price history first.
+- **Action on trip**: close ALL normal positions → swap freed SOL to USDC (keeping `keepGasReserveSol`) → pause normal deploys + normal screening. Degen positions are untouched (degen runs on its own existing breaker; `scope: "normal"`).
+- **Cooldown / re-entry**: `cooldownHours` (default 6h), then re-enter ONLY if SOL has stabilized (no longer dumping; `reentryRequiresStable`). Re-entry swaps back ONLY the parked USDC amount (`breaker.usdcParked`) — never operator-held USDC in the same wallet. If still dumping after cooldown, stays parked and re-checks each cycle.
+- **Startup**: best-effort CoinGecko backfill of ~24h hourly SOL/USD (`backfillSolHistory()`) so the breaker is armed on boot rather than waiting hours to fill organically.
+
+**Config (`config.solCrashGuard`, overridable via `user-config.json` under `solCrashGuard`)**:
+
+| Key | Default |
+|-----|---------|
+| `enabled` | true |
+| `drop1hPct` | 3 |
+| `drawdown6hPct` | 5 |
+| `cooldownHours` | 6 |
+| `reentryRequiresStable` | true |
+| `scope` | "normal" |
+| `keepGasReserveSol` | 0.2 (falls back to `gasReserve`) |
+| `backfillOnStart` | true |
+
+**Integration points**:
+- `index.js` `runManagementCycle()` — calls `solCrashGuard.tick({ solPrice, deps })` (samples price, then trips or re-enters); `backfillSolHistory()` runs once at boot.
+- `tools/executor.js` `runSafetyChecks()` — gates `deploy_position`: blocks NORMAL deploys with `{ pass: false, reason }` while `solGuardCoolingDown()` is true (degen unaffected).
+- `index.js` screening gates (`runScreeningCycle` and `runDeterministicScreen`) — pause normal screening alongside the existing `lossBreaker.triggered` check.
+
+---
+
 ## Known Issues / Tech Debt
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
 - `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
+- **MiniMax-M2.7 intermittent failures**: The model occasionally fails to make tool calls (returns text-only response) or rejects `system` role messages. This is a model-level issue, not a code bug. Manifests as "I couldn't complete that reliably because no tool call was made" in screening/management cycles. Frequency: ~30 occurrences on May 11, ~6 on May 12. No code fix needed — retries on next cron cycle.

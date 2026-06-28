@@ -24,7 +24,7 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown, recordPoolDeployStart } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -104,6 +104,7 @@ function shouldUseLpAgentRelayForDeploy() {
   // Zap-in relay is intentionally disabled; deploys use the local Meteora SDK path.
   return false;
 }
+
 
 function signSerializedTransaction(serialized, wallet) {
   const bytes = Buffer.from(serialized, "base64");
@@ -465,6 +466,7 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  degen = false,
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -512,6 +514,7 @@ export async function deployPosition({
     activeBinsBelow = Math.max(0, activeBin.binId - lowerBinId);
     activeBinsAbove = Math.max(0, upperBinId - activeBin.binId);
   }
+
 
   const strategyMap = {
     spot: StrategyType.Spot,
@@ -697,7 +700,9 @@ export async function deployPosition({
           amount_x: finalAmountX,
           active_bin: activeBin.binId,
           initial_value_usd,
+          degen,
         });
+        recordPoolDeployStart(pool_address, { pool_name, base_mint: pool.lbPair.tokenXMint.toString(), strategy: activeStrategy, volatility });
       }
 
       appendDecision({
@@ -730,6 +735,7 @@ export async function deployPosition({
         position: positionAddress,
         pool: pool_address,
         pool_name,
+        base_mint: pool.lbPair.tokenXMint.toString(),
         bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
         price_range: { min: minPrice, max: maxPrice },
         range_coverage: {
@@ -831,7 +837,9 @@ export async function deployPosition({
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd,
+      degen,
     });
+    recordPoolDeployStart(pool_address, { pool_name, base_mint: pool.lbPair.tokenXMint.toString(), strategy: activeStrategy, volatility });
 
     appendDecision({
       type: "deploy",
@@ -861,6 +869,7 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
+      base_mint: pool.lbPair.tokenXMint.toString(),
       bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
       price_range: { min: minPrice, max: maxPrice },
       range_coverage: {
@@ -1421,8 +1430,8 @@ export async function closePosition({ position_address, reason }) {
     if (shouldUseLpAgentRelay()) {
       let relaySubmitted = false;
       try {
-      const pool = await getPool(poolAddress);
-      const relayAllowedDebitMints = [
+        const pool = await getPool(poolAddress);
+        const relayAllowedDebitMints = [
         pool.lbPair.tokenXMint.toString(),
         pool.lbPair.tokenYMint.toString(),
         config.tokens.SOL,
@@ -1573,19 +1582,21 @@ export async function closePosition({ position_address, reason }) {
           minutes_in_range: minutesHeld - minutesOOR,
           minutes_held: minutesHeld,
           close_reason: reason || "agent decision",
+          degen: !!tracked.degen,
         });
+
 
         appendDecision({
           type: "close",
           actor: "MANAGER",
           pool: poolAddress,
-          pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+          pool_name: tracked?.pool_name || poolMeta.name || poolAddress.slice(0, 8),
           position: position_address,
           summary: `Relay closed at ${pnlPct.toFixed(2)}%`,
           reason: reason || "agent decision",
           risks: [
             minutesOOR > 0 ? `out of range ${minutesOOR}m` : null,
-            tracked.volatility != null ? `volatility ${tracked.volatility}` : null,
+            tracked?.volatility != null ? `volatility ${tracked.volatility}` : null,
           ].filter(Boolean),
           metrics: {
             pnl_usd: pnlUsd,
@@ -1601,7 +1612,7 @@ export async function closePosition({ position_address, reason }) {
           request_id: order.requestId,
           position: position_address,
           pool: poolAddress,
-          pool_name: tracked.pool_name || poolMeta.name || null,
+          pool_name: tracked?.pool_name || poolMeta.name || null,
           claim_txs: claimTxHashes,
           close_txs: closeTxHashes,
           txs: txHashes,
@@ -1848,6 +1859,7 @@ export async function closePosition({ position_address, reason }) {
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
+        degen: !!tracked.degen,
       });
 
       appendDecision({

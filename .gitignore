@@ -9,6 +9,7 @@ node_modules/
 
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
+gmgn-config.json
 
 # Runtime state (position tracking, lessons — user-specific)
 state.json
@@ -20,6 +21,7 @@ strategy-library.json
 decision-log.json
 hivemind-cache.json
 signal-weights.json
+sol-crash-state.json
 
 # Logs
 logs/
@@ -41,3 +43,6 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# Test files
+test-*.js

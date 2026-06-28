@@ -4,14 +4,20 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+const GMGN_CONFIG_PATH = path.join(__dirname, "gmgn-config.json");
 const DEFAULT_HIVEMIND_URL = "https://api.agentmeridian.xyz";
 const DEFAULT_AGENT_MERIDIAN_API_URL = "https://api.agentmeridian.xyz/api";
 const DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
 const DEFAULT_HIVEMIND_API_KEY = DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY;
 
-const u = fs.existsSync(USER_CONFIG_PATH)
-  ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
-  : {};
+function readJsonIfExists(filePath) {
+  return fs.existsSync(filePath)
+    ? JSON.parse(fs.readFileSync(filePath, "utf8"))
+    : {};
+}
+
+const u = readJsonIfExists(USER_CONFIG_PATH);
+const gmgnUserConfig = readJsonIfExists(GMGN_CONFIG_PATH);
 export const MIN_SAFE_BINS_BELOW = 35;
 
 function numericConfig(value) {
@@ -47,6 +53,9 @@ if (u.llmApiKey) {
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
+if (gmgnUserConfig.apiKey || u.gmgnApiKey) {
+  process.env.GMGN_API_KEY ||= gmgnUserConfig.apiKey || u.gmgnApiKey;
+}
 
 const indicatorUserConfig = u.chartIndicators ?? {};
 const DEFAULT_MINIMAX_MODEL = process.env.LLM_MODEL || "MiniMax-M2.7";
@@ -60,10 +69,20 @@ function nonEmptyString(...values) {
   return null;
 }
 
+function gmgnValue(key, legacyKey, fallback) {
+  return gmgnUserConfig[key] ?? u[legacyKey] ?? fallback;
+}
+
+function gmgnArray(key, legacyKey, fallback) {
+  if (Array.isArray(gmgnUserConfig[key])) return gmgnUserConfig[key];
+  if (Array.isArray(u[legacyKey])) return u[legacyKey];
+  return fallback;
+}
+
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
-    maxPositions:    u.maxPositions    ?? 3,
+    maxPositions:    u.maxPositions    ?? 2,
     maxDeployAmount: u.maxDeployAmount ?? 50,
     maxDailyLossUsd: u.maxDailyLossUsd ?? 80,
     maxConsecutiveLosses: u.maxConsecutiveLosses ?? 3,
@@ -73,8 +92,21 @@ export const config = {
     lossQuarantineMinPnlPct: u.lossQuarantineMinPnlPct ?? -8,
   },
 
+  // ─── SOL-Crash Circuit Breaker ───────────
+  solCrashGuard: {
+    enabled:               u.solCrashGuard?.enabled              ?? true,
+    drop1hPct:             u.solCrashGuard?.drop1hPct            ?? 3,
+    drawdown6hPct:         u.solCrashGuard?.drawdown6hPct        ?? 5,
+    cooldownHours:         u.solCrashGuard?.cooldownHours        ?? 6,
+    reentryRequiresStable: u.solCrashGuard?.reentryRequiresStable ?? true,
+    scope:                 u.solCrashGuard?.scope                ?? "normal",
+    keepGasReserveSol:     u.solCrashGuard?.keepGasReserveSol    ?? (u.gasReserve ?? 0.2),
+    backfillOnStart:       u.solCrashGuard?.backfillOnStart      ?? true,
+  },
+
   // ─── Pool Screening Thresholds ───────────
   screening: {
+    source:            u.screeningSource    ?? "meteora", // meteora | gmgn
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
     minTvl:            u.minTvl            ?? 10_000,
@@ -104,6 +136,61 @@ export const config = {
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
   },
 
+  gmgn: {
+    apiKey: nonEmptyString(gmgnUserConfig.apiKey, u.gmgnApiKey, process.env.GMGN_API_KEY),
+    baseUrl: nonEmptyString(gmgnUserConfig.baseUrl, u.gmgnBaseUrl, "https://openapi.gmgn.ai"),
+    interval: gmgnValue("interval", "gmgnInterval", "5m"),
+    orderBy: gmgnValue("orderBy", "gmgnOrderBy", "default"),
+    direction: gmgnValue("direction", "gmgnDirection", "desc"),
+    limit: gmgnValue("limit", "gmgnLimit", 100),
+    enrichLimit: gmgnValue("enrichLimit", "gmgnEnrichLimit", 20),
+    requestDelayMs: gmgnValue("requestDelayMs", "gmgnRequestDelayMs", 350),
+    maxRetries: gmgnValue("maxRetries", "gmgnMaxRetries", 2),
+    holdersLimit: gmgnValue("holdersLimit", "gmgnHoldersLimit", 100),
+    klineResolution: gmgnValue("klineResolution", "gmgnKlineResolution", "5m"),
+    klineLookbackMinutes: gmgnValue("klineLookbackMinutes", "gmgnKlineLookbackMinutes", 60),
+    filters: gmgnArray("filters", "gmgnFilters", ["renounced", "frozen", "not_wash_trading"]),
+    platforms: gmgnArray("platforms", "gmgnPlatforms", ["Pump.fun", "meteora_virtual_curve", "pool_meteora"]),
+    minMcap: gmgnValue("minMcap", "gmgnMinMcap", u.minMcap ?? 150_000),
+    maxMcap: gmgnValue("maxMcap", "gmgnMaxMcap", u.maxMcap ?? 10_000_000),
+    minTvl: gmgnValue("minTvl", "gmgnMinTvl", u.minTvl ?? 10_000),
+    minVolume: gmgnValue("minVolume", "gmgnMinVolume", 1000),
+    minHolders: gmgnValue("minHolders", "gmgnMinHolders", u.minHolders ?? 500),
+    minTokenAgeHours: gmgnValue("minTokenAgeHours", "gmgnMinTokenAgeHours", 2),
+    maxTokenAgeHours: gmgnValue("maxTokenAgeHours", "gmgnMaxTokenAgeHours", 24 * 7),
+    minSmartDegenCount: gmgnValue("minSmartDegenCount", "gmgnMinSmartDegenCount", 1),
+    requireKol: gmgnValue("requireKol", "gmgnRequireKol", true),
+    minKolCount: gmgnValue("minKolCount", "gmgnMinKolCount", 1),
+    maxRugRatio: gmgnValue("maxRugRatio", "gmgnMaxRugRatio", 0.3),
+    maxTop10HolderRate: gmgnValue("maxTop10HolderRate", "gmgnMaxTop10HolderRate", 0.5),
+    maxBundlerRate: gmgnValue("maxBundlerRate", "gmgnMaxBundlerRate", 0.5),
+    maxRatTraderRate: gmgnValue("maxRatTraderRate", "gmgnMaxRatTraderRate", 0.2),
+    maxFreshWalletRate: gmgnValue("maxFreshWalletRate", "gmgnMaxFreshWalletRate", 0.2),
+    maxDevTeamHoldRate: gmgnValue("maxDevTeamHoldRate", "gmgnMaxDevTeamHoldRate", 0.02),
+    preferredKolMinHoldPct: gmgnValue("preferredKolMinHoldPct", "gmgnPreferredKolMinHoldPct", 1),
+    dumpKolMinHoldPct: gmgnValue("dumpKolMinHoldPct", "gmgnDumpKolMinHoldPct", 0.5),
+    maxBotDegenRate: gmgnValue("maxBotDegenRate", "gmgnMaxBotDegenRate", 0.4),
+    maxSniperCount: gmgnValue("maxSniperCount", "gmgnMaxSniperCount", 20),
+    maxSniperHoldRate: gmgnValue("maxSniperHoldRate", "gmgnMaxSniperHoldRate", 0.3),
+    minTotalFeeSol: gmgnValue("minTotalFeeSol", "gmgnMinTotalFeeSol", 30),
+    athFilterPct: gmgnValue("athFilterPct", "gmgnAthFilterPct", null),
+    preferredKolNames: gmgnArray("preferredKolNames", "gmgnPreferredKolNames", []),
+    dumpKolNames: gmgnArray("dumpKolNames", "gmgnDumpKolNames", []),
+    indicatorFilter: gmgnValue("indicatorFilter", "gmgnIndicatorFilter", true),
+    indicatorInterval: gmgnValue("indicatorInterval", "gmgnIndicatorInterval", "15_MINUTE"),
+    indicatorRules: (() => {
+      const r = gmgnUserConfig.indicatorRules || {};
+      return {
+        requireBullishSupertrend: r.requireBullishSupertrend ?? true,
+        rejectAlreadyAtBottom:    r.rejectAlreadyAtBottom    ?? true,
+        requireAboveSupertrend:   r.requireAboveSupertrend   ?? false,
+        minRsi:                   r.minRsi                   ?? null,
+        maxRsi:                   r.maxRsi                   ?? null,
+        requireBbPosition:        r.requireBbPosition        ?? null,
+      };
+    })(),
+  },
+
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
@@ -127,7 +214,7 @@ export const config = {
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
-    deployAmountSol:       u.deployAmountSol       ?? 0.5,
+    deployAmountSol:       u.deployAmountSol       ?? 0.6,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
@@ -145,6 +232,39 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+  },
+
+  // ─── Degen Play Mode ───────────────────
+  degen: {
+    enabled:              u.degenEnabled              ?? false,
+    maxPositions:         u.degenMaxPositions         ?? 2,
+    managementIntervalMin: u.degenManagementIntervalMin ?? 1,
+    screeningIntervalMin: u.degenScreeningIntervalMin ?? 30,
+    // Screening overrides
+    timeframe:            u.degenTimeframe            ?? "1h",
+    category:             u.degenCategory             ?? "trending",
+    minVolume:            u.degenMinVolume            ?? 5_000,
+    aggregateMinVolume:   u.degenAggregateMinVolume   ?? 50_000,
+    minTvl:               u.degenMinTvl               ?? 5_000,
+    maxTvl:               u.degenMaxTvl               ?? 200_000,
+    minOrganic:           u.degenMinOrganic           ?? 40,
+    minQuoteOrganic:      u.degenMinQuoteOrganic      ?? 50,
+    minHolders:           u.degenMinHolders           ?? 800,
+    minMcap:              u.degenMinMcap              ?? 200_000,
+    maxMcap:              u.degenMaxMcap              ?? 10_000_000,
+    minBinStep:           u.degenMinBinStep           ?? 20,
+    maxBinStep:           u.degenMaxBinStep           ?? 200,
+    minFeeActiveTvlRatio: u.degenMinFeeActiveTvlRatio ?? 0.03,
+    minTokenAgeHours:     u.degenMinTokenAgeHours     ?? 0.5,
+    excludeHighSupplyConcentration: u.degenExcludeHighSupplyConcentration ?? false,
+    maxBundlePct:         u.degenMaxBundlePct         ?? 30,
+    maxBotHoldersPct:     u.degenMaxBotHoldersPct     ?? 40,
+    maxTop10Pct:          u.degenMaxTop10Pct          ?? 60,
+    maxDeployAmount:      u.degenMaxDeployAmount      ?? 0.4,
+    // Management overrides
+    stopLossPct:          u.degenStopLossPct          ?? -10,
+    takeProfitPct:        u.degenTakeProfitPct        ?? 3,
+    outOfRangeWaitMinutes: u.degenOutOfRangeWaitMinutes ?? 5,
   },
 
   // ─── Scheduling ─────────────────────────
@@ -205,7 +325,6 @@ export const config = {
   },
 
   jupiter: {
-    // Internal Jupiter Ultra settings; override by env only, do not expose in user-config.
     apiKey: process.env.JUPITER_API_KEY ?? "",
     referralAccount:
       process.env.JUPITER_REFERRAL_ACCOUNT ??
@@ -234,21 +353,27 @@ export const config = {
  * Compute the optimal deploy amount for a given wallet balance.
  * Scales position size with wallet growth (compounding).
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * When openPositions > 0, estimates the original total wallet by
+ * back-calculating how much SOL was already deployed, so each
+ * position is sized as pct% of the *original* wallet, not the remainder.
  *
- * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
- *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
- *   2.0 SOL wallet → 0.63 SOL deploy
- *   3.0 SOL wallet → 0.98 SOL deploy
- *   4.0 SOL wallet → 1.33 SOL deploy
+ * Formula: clamp(estimatedOriginal × pct, floor=deployAmountSol, ceil=maxDeployAmount)
+ *
+ * Example (gasReserve=0, positionSizePct=0.40, maxPositions=2):
+ *   2.0 SOL wallet, 0 open → deploy 0.80 SOL (40% of 2.0)
+ *   1.2 SOL wallet, 1 open → deploy 0.80 SOL (40% of estimated 2.0 original)
  */
-export function computeDeployAmount(walletSol) {
+export function computeDeployAmount(walletSol, openPositions = 0) {
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
   const floor    = config.management.deployAmountSol;
   const ceil     = config.risk.maxDeployAmount;
   const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
+  // Estimate original wallet: current balance is what's left after
+  // openPositions × pct% was already deployed from the original
+  const fractionRemaining = Math.max(0.1, 1 - openPositions * pct);
+  const estimatedOriginal = deployable / fractionRemaining;
+  const dynamic = estimatedOriginal * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
 }
@@ -260,9 +385,9 @@ export function computeDeployAmount(walletSol) {
  */
 export function reloadScreeningThresholds() {
   try {
-    if (!fs.existsSync(USER_CONFIG_PATH)) return;
-    const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+    const fresh = readJsonIfExists(USER_CONFIG_PATH);
     const s = config.screening;
+    if (fresh.screeningSource != null) s.source = fresh.screeningSource;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
     if (fresh.minTokenFeesSol  != null) s.minTokenFeesSol  = fresh.minTokenFeesSol;
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
@@ -299,5 +424,13 @@ export function reloadScreeningThresholds() {
       config.strategy.minBinsBelow,
       Math.min(config.strategy.maxBinsBelow, Math.round(defaultBinsBelow)),
     );
+  } catch { /* ignore */ }
+  try {
+    const freshGmgn = readJsonIfExists(GMGN_CONFIG_PATH);
+    const g = config.gmgn;
+    for (const [key, value] of Object.entries(freshGmgn)) {
+      if (key in g && key !== "apiKey") g[key] = value;
+    }
+    if (freshGmgn.apiKey) g.apiKey = freshGmgn.apiKey;
   } catch { /* ignore */ }
 }

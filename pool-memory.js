@@ -98,6 +98,40 @@ function setBaseMintCooldown(db, baseMint, hours, reason) {
  * @param {string} deployData.strategy
  * @param {number} deployData.volatility
  */
+/**
+ * Record that a deploy just happened (called at deploy time, before close).
+ * Increments total_deploys and sets last_deployed_at so the screener
+ * can see deployment history even for still-open positions.
+ */
+export function recordPoolDeployStart(poolAddress, { pool_name, base_mint, strategy, volatility } = {}) {
+  if (!poolAddress) return;
+  const db = load();
+
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: pool_name || poolAddress.slice(0, 8),
+      base_mint: base_mint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+
+  const entry = db[poolAddress];
+  entry.total_deploys = (entry.total_deploys || 0) + 1;
+  entry.last_deployed_at = new Date().toISOString();
+  if (base_mint && !entry.base_mint) entry.base_mint = base_mint;
+
+  save(db);
+  log("pool-memory", `Recorded deploy start for ${entry.name} (total: ${entry.total_deploys})`);
+}
+
 export function recordPoolDeploy(poolAddress, deployData) {
   if (!poolAddress) return;
 
@@ -232,6 +266,61 @@ export function isBaseMintOnCooldown(baseMint) {
     entry?.base_mint_cooldown_until &&
     new Date(entry.base_mint_cooldown_until) > now
   );
+}
+
+/**
+ * Check if a base_mint was deployed since a given cutoff date.
+ * Used for Saturday rule: block tokens that were deployed on Friday.
+ */
+export function wasBaseMintDeployedSince(baseMint, sinceDate) {
+  if (!baseMint) return false;
+  const cutoff = new Date(sinceDate);
+  const db = load();
+  for (const entry of Object.values(db)) {
+    if (entry?.base_mint !== baseMint) continue;
+    if (entry.last_deployed_at && new Date(entry.last_deployed_at) >= cutoff) return true;
+    for (const dep of entry.deploys || []) {
+      if (dep.deployed_at && new Date(dep.deployed_at) >= cutoff) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Set a cooldown after a deploy was blocked by safety checks.
+ * Prevents the screener from re-selecting the same pool/token next cycle.
+ */
+export function setDeployFailureCooldown(poolAddress, baseMint, reason, hours = 2) {
+  if (!poolAddress) return;
+  const db = load();
+
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: poolAddress.slice(0, 8),
+      base_mint: baseMint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+
+  const entry = db[poolAddress];
+  if (baseMint && !entry.base_mint) entry.base_mint = baseMint;
+  const cooldownUntil = setPoolCooldown(entry, hours, reason);
+  log("pool-memory", `Deploy-failure cooldown set for ${entry.name} until ${cooldownUntil} (${reason})`);
+
+  if (baseMint) {
+    setBaseMintCooldown(db, baseMint, hours, reason);
+    log("pool-memory", `Deploy-failure token cooldown set for ${baseMint.slice(0, 8)} (${reason})`);
+  }
+
+  save(db);
 }
 
 // ─── Read ──────────────────────────────────────────────────────

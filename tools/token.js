@@ -16,6 +16,30 @@ export async function getTokenNarrative({ mint }) {
 }
 
 /**
+ * Quick audit check for mint/freeze authority.
+ * Returns { mintable, freezable } — true means the authority is still active (dangerous).
+ */
+export async function getTokenAudit(mint) {
+  const res = await fetch(`${DATAPI_BASE}/assets/search?query=${encodeURIComponent(mint)}`);
+  if (!res.ok) throw new Error(`Token audit API error: ${res.status}`);
+  const data = await res.json();
+  const token = Array.isArray(data) ? data[0] : data;
+  const audit = token?.audit;
+  // Check both: top-level authority fields (always present) and audit flags (sometimes missing)
+  const hasMintAuthority = !!token?.mintAuthority;
+  const hasFreezeAuthority = !!token?.freezeAuthority;
+  const auditSaysMintable = audit?.mintAuthorityDisabled === false;
+  const auditSaysFreezable = audit?.freezeAuthorityDisabled === false;
+  return {
+    mint,
+    mintable: hasMintAuthority || auditSaysMintable,
+    freezable: hasFreezeAuthority || auditSaysFreezable,
+    mintAuthority: token?.mintAuthority || null,
+    freezeAuthority: token?.freezeAuthority || null,
+  };
+}
+
+/**
  * Search for token data by name, symbol, or mint address.
  * Returns condensed token info useful for confidence scoring.
  */
