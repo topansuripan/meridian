@@ -226,3 +226,25 @@ test("parseCoinGeckoPrices maps {prices:[[ms,usd]]} to history", () => {
   const h = parseCoinGeckoPrices(cg);
   assert.deepEqual(h, [[1000, 67.1], [2000, 66.9]]); // drops non-finite
 });
+
+test("REPLAY: Jun 25 SOL crash trips the breaker at the 21:00 WIB drop", async () => {
+  // Real hourly SOL/USD (WIB) for Jun 25 2026 from CoinGecko.
+  const prices = [66.42,64.90,65.81,65.96,67.67,67.75,67.70,67.89,67.71,67.79,
+                  67.58,67.53,68.05,68.96,69.35,69.29,69.00,68.85,68.25,67.98,
+                  68.34,65.21,66.34,65.89];
+  const start = 10_000_000_000_000;
+  const full = prices.map((p, i) => [start + i * 3600_000, p]);
+
+  // Walk hour by hour; the breaker should be flat until the 21:00 candle (index 21).
+  const cfg = { enabled: true, drop1hPct: 3, drawdown6hPct: 5, cooldownHours: 6, scope: "normal" };
+  let trippedAtIndex = -1;
+  for (let i = 6; i < full.length; i++) {
+    const s = defaultState();
+    s.priceHistory = full.slice(0, i + 1);
+    const now = full[i][0];
+    const deps = mkDeps();
+    await maybeTrip(s, { now, cfg, deps });
+    if (s.breaker.active) { trippedAtIndex = i; break; }
+  }
+  assert.equal(trippedAtIndex, 21, `expected trip at the 21:00 candle (-4.6%), got index ${trippedAtIndex}`);
+});
