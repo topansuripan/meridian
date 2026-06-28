@@ -105,3 +105,69 @@ test("loadState returns defaults when file missing", () => {
   const loaded = loadState("./test/.does-not-exist.json");
   assert.equal(loaded.breaker.active, false);
 });
+
+import { maybeTrip } from "../sol-crash-guard.js";
+
+function mkDeps(overrides = {}) {
+  const closed = [];
+  return {
+    closed,
+    getNormalOpenPositions: async () => [
+      { position: "P1", pool_name: "AAA-SOL" },
+      { position: "P2", pool_name: "BBB-SOL" },
+    ],
+    closePosition: async ({ position_address }) => { closed.push(position_address); return { ok: true }; },
+    swapSolToUsdc: async () => ({ usdcOut: 150 }),
+    notify: async () => {},
+    ...overrides,
+  };
+}
+const CFG_FULL = { enabled: true, drop1hPct: 3, drawdown6hPct: 5, cooldownHours: 6, scope: "normal" };
+
+test("maybeTrip closes normal positions and parks USDC when dumping", async () => {
+  const now = 10_000_000_000_000;
+  const s = defaultState();
+  s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now); // -4.56% 1h
+  const deps = mkDeps();
+  await maybeTrip(s, { now, cfg: CFG_FULL, deps });
+  assert.equal(s.breaker.active, true);
+  assert.deepEqual(deps.closed.sort(), ["P1", "P2"]);
+  assert.equal(s.breaker.usdcParked, 150);
+  assert.equal(s.breaker.cooldownUntil, now + 6 * 3600_000);
+  assert.match(s.breaker.reason, /1h/);
+});
+
+test("maybeTrip is a no-op on a flat market", async () => {
+  const now = 10_000_000_000_000;
+  const s = defaultState();
+  s.priceHistory = hist([67, 67, 67, 67, 67, 67, 67], now);
+  const deps = mkDeps();
+  await maybeTrip(s, { now, cfg: CFG_FULL, deps });
+  assert.equal(s.breaker.active, false);
+  assert.equal(deps.closed.length, 0);
+});
+
+test("maybeTrip is a no-op when already active", async () => {
+  const now = 10_000_000_000_000;
+  const s = defaultState();
+  s.breaker.active = true;
+  s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now);
+  const deps = mkDeps();
+  await maybeTrip(s, { now, cfg: CFG_FULL, deps });
+  assert.equal(deps.closed.length, 0, "must not double-close");
+});
+
+test("maybeTrip continues past a single close failure", async () => {
+  const now = 10_000_000_000_000;
+  const s = defaultState();
+  s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now);
+  const deps = mkDeps({
+    closePosition: async ({ position_address }) => {
+      if (position_address === "P1") throw new Error("tx failed");
+      return { ok: true };
+    },
+  });
+  await maybeTrip(s, { now, cfg: CFG_FULL, deps });
+  assert.equal(s.breaker.active, true, "still trips");
+  assert.ok(s.breaker.closedPositions.includes("P2"));
+});

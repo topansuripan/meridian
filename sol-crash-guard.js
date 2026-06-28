@@ -113,3 +113,49 @@ export function saveState(state, path = STATE_FILE) {
     log("sol_guard_warn", `saveState failed: ${e.message}`);
   }
 }
+
+export async function maybeTrip(state, { now = Date.now(), cfg, deps }) {
+  if (!cfg.enabled || state.breaker.active) return state;
+  const metrics = computeSolMetrics(state.priceHistory, now);
+  const { dumping, reason } = isDumping(metrics, cfg);
+  if (!dumping) return state;
+
+  log("sol_guard", `TRIP: ${reason}. Closing normal positions.`);
+  const positions = await deps.getNormalOpenPositions().catch(() => []);
+  const closed = [];
+  for (const p of positions) {
+    try {
+      await deps.closePosition({ position_address: p.position, reason: `SOL-crash breaker: ${reason}` });
+      closed.push(p.position);
+    } catch (e) {
+      log("sol_guard_warn", `close failed for ${p.pool_name || p.position}: ${e.message}`);
+    }
+  }
+
+  let usdcParked = null;
+  try {
+    const r = await deps.swapSolToUsdc();
+    usdcParked = r?.usdcOut ?? null;
+  } catch (e) {
+    log("sol_guard_warn", `SOL->USDC swap failed: ${e.message} (positions are out of LP; will retry)`);
+  }
+
+  state.breaker = {
+    active: true,
+    trippedAt: now,
+    cooldownUntil: now + cfg.cooldownHours * HOUR,
+    reason,
+    solAtTrip: metrics.priceNow,
+    closedPositions: closed,
+    usdcParked,
+  };
+
+  await deps.notify(
+    `🛑 SOL-crash breaker TRIPPED — ${reason}. ` +
+    `Closed ${closed.length}/${positions.length} normal positions` +
+    (usdcParked != null ? `, parked $${usdcParked.toFixed(2)} USDC` : "") +
+    `. Cooldown ${cfg.cooldownHours}h.`
+  ).catch(() => {});
+
+  return state;
+}
