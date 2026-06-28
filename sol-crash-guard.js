@@ -15,14 +15,22 @@ import { config } from "./config.js";
 
 const HOUR = 3600_000;
 const MIN_HISTORY_MS = 55 * 60_000; // need ~1h before the 1h test is valid
+const DRAWDOWN_WINDOW_MS = 6 * HOUR; // lookback window for the 6h-high drawdown
+const PRICE_MATCH_TOLERANCE_MS = 30 * 60_000; // max |t - target| for a sample to count as "at" target
 
-/** Price at the sample closest to (now - HOUR), or null if none old enough. */
+/**
+ * Price at the sample closest to targetMs, or null if the closest sample is
+ * more than PRICE_MATCH_TOLERANCE_MS away. The tolerance prevents a
+ * multi-hour gap (CoinGecko backfill, cron outage) from being reported as a
+ * "1h" move — if nothing landed near targetMs, there is no honest reading.
+ */
 function priceAround(priceHistory, targetMs) {
   let best = null, bestDist = Infinity;
   for (const [ms, price] of priceHistory) {
     const dist = Math.abs(ms - targetMs);
     if (dist < bestDist) { bestDist = dist; best = price; }
   }
+  if (bestDist > PRICE_MATCH_TOLERANCE_MS) return null;
   return best;
 }
 
@@ -33,7 +41,7 @@ function priceAround(priceHistory, targetMs) {
  *          drop1h / drawdown6h are signed percentages (negative = falling)
  */
 export function computeSolMetrics(priceHistory, now = Date.now()) {
-  const pts = (priceHistory || []).filter(p => Array.isArray(p) && Number.isFinite(p[1]));
+  const pts = (priceHistory || []).filter(p => Array.isArray(p) && Number.isFinite(p[1]) && p[1] > 0);
   if (pts.length < 2) {
     return { drop1h: 0, drawdown6h: 0, hasEnoughHistory: false, priceNow: pts[0]?.[1] ?? null };
   }
@@ -42,9 +50,9 @@ export function computeSolMetrics(priceHistory, now = Date.now()) {
   const hasEnoughHistory = (now - oldest) >= MIN_HISTORY_MS;
 
   const price1hAgo = priceAround(pts, now - HOUR);
-  const drop1h = price1hAgo ? (priceNow / price1hAgo - 1) * 100 : 0;
+  const drop1h = price1hAgo != null ? (priceNow / price1hAgo - 1) * 100 : 0;
 
-  const window6h = pts.filter(([ms]) => ms >= now - 6 * HOUR);
+  const window6h = pts.filter(([ms]) => ms >= now - DRAWDOWN_WINDOW_MS);
   const high6h = Math.max(priceNow, ...window6h.map(p => p[1]));
   const drawdown6h = high6h > 0 ? (priceNow / high6h - 1) * 100 : 0;
 
@@ -161,6 +169,11 @@ export async function maybeTrip(state, { now = Date.now(), cfg, deps }) {
   return state;
 }
 
+// Keys off `breaker.active` only — that is the single source of truth for
+// "are we parked / pausing normal deploys". `now` is accepted for a uniform
+// signature with the other state fns but is intentionally unused: re-entry
+// (tryReenter) is what clears `active` once the cooldown has elapsed, so once
+// active is false there is nothing time-based left to gate on.
 export function isCoolingDownState(state, now = Date.now()) {
   return !!(state.breaker.active);
 }
@@ -210,7 +223,11 @@ export function isCoolingDown(now = Date.now()) {
 }
 
 export function getBreakerStatus() {
-  return { ..._state.breaker, samples: _state.priceHistory.length };
+  return {
+    ..._state.breaker,
+    closedPositions: [...(_state.breaker.closedPositions || [])],
+    samples: _state.priceHistory.length,
+  };
 }
 
 export function parseCoinGeckoPrices(cg) {
@@ -226,7 +243,7 @@ export function parseCoinGeckoPrices(cg) {
 export async function backfillSolHistory(fetchFn = fetch, now = Date.now()) {
   if (!config.solCrashGuard.enabled || !config.solCrashGuard.backfillOnStart) return;
   const oldest = _state.priceHistory[0]?.[0] ?? now;
-  if (now - oldest >= 6 * HOUR) return; // already have enough
+  if (now - oldest >= DRAWDOWN_WINDOW_MS) return; // already have enough
   try {
     const from = Math.floor((now - 24 * HOUR) / 1000);
     const to = Math.floor(now / 1000);
@@ -235,9 +252,13 @@ export async function backfillSolHistory(fetchFn = fetch, now = Date.now()) {
     if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
     const cg = await res.json();
     const fetched = parseCoinGeckoPrices(cg);
-    // merge: keep within 7h window, dedupe by ms, sort
-    const merged = [..._state.priceHistory, ...fetched]
-      .filter(([ms]) => ms >= now - 7 * HOUR)
+    // merge: dedupe by ms (last-write-wins), keep within the max-age window, sort ascending
+    const byMs = new Map();
+    for (const [ms, price] of [..._state.priceHistory, ...fetched]) {
+      if (ms >= now - DEFAULT_MAX_AGE_MS) byMs.set(ms, price);
+    }
+    const merged = [...byMs.entries()]
+      .map(([ms, price]) => [ms, price])
       .sort((a, b) => a[0] - b[0]);
     _state.priceHistory = merged;
     saveState(_state);

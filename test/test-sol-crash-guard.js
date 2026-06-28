@@ -248,3 +248,42 @@ test("REPLAY: Jun 25 SOL crash trips the breaker at the 21:00 WIB drop", async (
   }
   assert.equal(trippedAtIndex, 21, `expected trip at the 21:00 candle (-4.6%), got index ${trippedAtIndex}`);
 });
+
+test("computeSolMetrics: all-zero prices never yield NaN/Infinity and never dump", () => {
+  const end = 10_000_000_000_000;
+  const h = hist([0, 0, 0, 0, 0, 0, 0], end); // zero prices are filtered (fix #1) -> empty/insufficient path
+  const m = computeSolMetrics(h, end);
+  assert.ok(Number.isFinite(m.drop1h), `drop1h=${m.drop1h}`);
+  assert.ok(Number.isFinite(m.drawdown6h), `drawdown6h=${m.drawdown6h}`);
+  assert.equal(m.drawdown6h, 0);
+  assert.equal(isDumping(m, CFG).dumping, false);
+});
+
+test("isCoolingDownState is false when breaker is not active", () => {
+  const s = defaultState();
+  assert.equal(s.breaker.active, false);
+  assert.equal(isCoolingDownState(s), false);
+});
+
+test("maybeTrip keeps breaker active when SOL->USDC swap fails (positions already out of LP)", async () => {
+  const now = 10_000_000_000_000;
+  const s = defaultState();
+  s.priceHistory = hist([68, 68, 68, 68, 68, 68, 64.9], now); // -4.56% 1h
+  const deps = mkDeps({
+    swapSolToUsdc: async () => { throw new Error("swap rpc failed"); },
+  });
+  await maybeTrip(s, { now, cfg: CFG_FULL, deps });
+  assert.equal(s.breaker.active, true, "breaker must stay tripped even though parking failed");
+  assert.equal(s.breaker.usdcParked, null);
+  assert.deepEqual(deps.closed.sort(), ["P1", "P2"], "positions still closed out of LP");
+});
+
+test("tryReenter stays parked when USDC->SOL re-entry swap fails", async () => {
+  const now = 10_000_000_000_000;
+  const s = activeState(now, hist([66, 66, 66, 66, 66, 66, 66], now)); // stabilized, past cooldown
+  await tryReenter(s, { now, cfg: CFG_RE, deps: {
+    swapUsdcToSol: async () => { throw new Error("swap rpc failed"); },
+    notify: async () => {},
+  } });
+  assert.equal(s.breaker.active, true, "must not clear the breaker on a failed re-entry swap");
+});
