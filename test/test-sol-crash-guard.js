@@ -61,3 +61,20 @@ test("computeSolMetrics: insufficient history never dumps", () => {
   assert.equal(m.hasEnoughHistory, false);
   assert.equal(isDumping(m, CFG).dumping, false);
 });
+
+import { pushPrice } from "../sol-crash-guard.js";
+
+test("pushPrice appends, sorts, and trims to maxAge", () => {
+  const now = 10_000_000_000_000;
+  const maxAge = 7 * 3600_000;
+  let h = [];
+  h = pushPrice(h, 67, now - 8 * 3600_000, maxAge); // older than maxAge -> trimmed on next push
+  h = pushPrice(h, 66, now - 1 * 3600_000, maxAge);
+  h = pushPrice(h, 65, now, maxAge);
+  assert.equal(h.length, 2, "stale 8h-old sample dropped");
+  assert.deepEqual(h.map(p => p[1]), [66, 65]);
+  // ignores non-finite price
+  const before = h.length;
+  h = pushPrice(h, NaN, now + 1000, maxAge);
+  assert.equal(h.length, before);
+});

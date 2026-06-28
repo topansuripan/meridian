@@ -62,3 +62,14 @@ export function isDumping(metrics, cfg) {
   }
   return { dumping: false, reason: null };
 }
+
+const DEFAULT_MAX_AGE_MS = 7 * HOUR;
+
+/** Append a sample, drop anything older than maxAgeMs, keep oldest-first. Pure. */
+export function pushPrice(priceHistory, price, now = Date.now(), maxAgeMs = DEFAULT_MAX_AGE_MS) {
+  if (!Number.isFinite(price) || price <= 0) return priceHistory;
+  const next = [...priceHistory, [now, price]]
+    .filter(([ms]) => ms >= now - maxAgeMs)
+    .sort((a, b) => a[0] - b[0]);
+  return next;
+}
