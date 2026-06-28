@@ -218,3 +218,11 @@ test("tryReenter no-op before cooldown elapses", async () => {
   assert.equal(swapped, false);
   assert.equal(s.breaker.active, true);
 });
+
+import { parseCoinGeckoPrices } from "../sol-crash-guard.js";
+
+test("parseCoinGeckoPrices maps {prices:[[ms,usd]]} to history", () => {
+  const cg = { prices: [[1000, 67.1], [2000, 66.9], [3000, "bad"]] };
+  const h = parseCoinGeckoPrices(cg);
+  assert.deepEqual(h, [[1000, 67.1], [2000, 66.9]]); // drops non-finite
+});

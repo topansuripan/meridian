@@ -11,6 +11,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const HOUR = 3600_000;
 const MIN_HISTORY_MS = 55 * 60_000; // need ~1h before the 1h test is valid
@@ -196,3 +197,79 @@ export async function tryReenter(state, { now = Date.now(), cfg, deps }) {
   state.breaker = defaultState().breaker; // clear (active=false, cooldownUntil=null)
   return state;
 }
+
+let _state = loadState();
+
+export function recordSolPrice(price, now = Date.now()) {
+  _state.priceHistory = pushPrice(_state.priceHistory, price, now);
+}
+
+export function isCoolingDown(now = Date.now()) {
+  if (!config.solCrashGuard.enabled) return false;
+  return isCoolingDownState(_state, now);
+}
+
+export function getBreakerStatus() {
+  return { ..._state.breaker, samples: _state.priceHistory.length };
+}
+
+export function parseCoinGeckoPrices(cg) {
+  return (cg?.prices ?? [])
+    .filter(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]))
+    .map(p => [p[0], p[1]]);
+}
+
+/**
+ * Best-effort startup backfill of ~24h hourly SOL/USD from CoinGecko.
+ * @param {(url:string)=>Promise<Response>} fetchFn  defaults to global fetch
+ */
+export async function backfillSolHistory(fetchFn = fetch, now = Date.now()) {
+  if (!config.solCrashGuard.enabled || !config.solCrashGuard.backfillOnStart) return;
+  const oldest = _state.priceHistory[0]?.[0] ?? now;
+  if (now - oldest >= 6 * HOUR) return; // already have enough
+  try {
+    const from = Math.floor((now - 24 * HOUR) / 1000);
+    const to = Math.floor(now / 1000);
+    const url = `https://api.coingecko.com/api/v3/coins/solana/market_chart/range?vs_currency=usd&from=${from}&to=${to}`;
+    const res = await fetchFn(url);
+    if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
+    const cg = await res.json();
+    const fetched = parseCoinGeckoPrices(cg);
+    // merge: keep within 7h window, dedupe by ms, sort
+    const merged = [..._state.priceHistory, ...fetched]
+      .filter(([ms]) => ms >= now - 7 * HOUR)
+      .sort((a, b) => a[0] - b[0]);
+    _state.priceHistory = merged;
+    saveState(_state);
+    log("sol_guard", `Backfilled ${fetched.length} SOL price points from CoinGecko.`);
+  } catch (e) {
+    log("sol_guard_warn", `Backfill failed (will fill organically): ${e.message}`);
+  }
+}
+
+/**
+ * Per-management-cycle entry point. Records the latest SOL price, then either
+ * attempts re-entry (if parked) or evaluates a trip. Injected deps wire the
+ * actual close/swap/positions/notify implementations from index.js.
+ */
+let _ticking = false;
+export async function tick({ now = Date.now(), solPrice, deps }) {
+  if (!config.solCrashGuard.enabled) return;
+  if (_ticking) return; // guard against overlapping cycles
+  _ticking = true;
+  try {
+    if (Number.isFinite(solPrice)) recordSolPrice(solPrice, now);
+    const cfg = config.solCrashGuard;
+    if (_state.breaker.active) {
+      await tryReenter(_state, { now, cfg, deps });
+    } else {
+      await maybeTrip(_state, { now, cfg, deps });
+    }
+    saveState(_state);
+  } finally {
+    _ticking = false;
+  }
+}
+
+// Test-only: reset the singleton between tests.
+export function __resetStateForTests(s = defaultState()) { _state = s; }
