@@ -80,6 +80,9 @@ function gmgnArray(key, legacyKey, fallback) {
 }
 
 export const config = {
+  // ─── Spectate (watch-only) Mode ──────────
+  spectateMode: u.spectateMode ?? false,
+
   // ─── Risk Limits ─────────────────────────
   risk: {
     maxPositions:    u.maxPositions    ?? 2,
@@ -376,6 +379,21 @@ export function computeDeployAmount(walletSol, openPositions = 0) {
   const dynamic = estimatedOriginal * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
+}
+
+/**
+ * Toggle spectate (watch-only) mode: mutate the live config and persist to
+ * user-config.json (preserving all other keys). `configPath` override is for tests.
+ */
+export function setSpectateMode(on, configPath = USER_CONFIG_PATH) {
+  config.spectateMode = !!on;
+  let uc = {};
+  try { if (fs.existsSync(configPath)) uc = JSON.parse(fs.readFileSync(configPath, "utf8")); }
+  catch { /* start from empty on parse error */ }
+  uc.spectateMode = !!on;
+  try { fs.writeFileSync(configPath, JSON.stringify(uc, null, 2)); }
+  catch (e) { /* live flag still applied */ }
+  return config.spectateMode;
 }
 
 /**
