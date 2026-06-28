@@ -209,6 +209,21 @@ test("tryReenter re-enters once SOL stabilized", async () => {
   assert.equal(s.breaker.cooldownUntil, null);
 });
 
+test("tryReenter swaps back ONLY the parked amount, not the full wallet USDC", async () => {
+  const now = 10_000_000_000_000;
+  const s = activeState(now, hist([66, 66, 66, 66, 66, 66, 66], now)); // flat, past cooldown
+  const parkedBefore = s.breaker.usdcParked;
+  assert.equal(parkedBefore, 150); // sanity: activeState parks 150
+  let calledWith = "uncalled";
+  await tryReenter(s, { now, cfg: CFG_RE, deps: {
+    swapUsdcToSol: async (parkedUsdc) => { calledWith = parkedUsdc; return { solOut: 2.3 }; },
+    notify: async () => {},
+  } });
+  assert.equal(calledWith, parkedBefore, "must pass the recorded parked amount as the swap cap");
+  assert.equal(calledWith, 150);
+  assert.equal(s.breaker.active, false); // breaker cleared (usdcParked reset to null) on success
+});
+
 test("tryReenter no-op before cooldown elapses", async () => {
   const now = 10_000_000_000_000;
   const s = activeState(now, hist([66, 66, 66, 66, 66, 66, 66], now));

@@ -178,6 +178,18 @@ export function isCoolingDownState(state, now = Date.now()) {
   return !!(state.breaker.active);
 }
 
+/**
+ * Re-enter once the cooldown has elapsed and (if required) SOL has stabilized.
+ * No-op before the cooldown; stays parked while still dumping; stays active if
+ * the re-entry swap throws.
+ *
+ * Dep contract:
+ *   swapUsdcToSol(parkedUsdc) -> { solOut }
+ *     where `parkedUsdc` is the USDC amount the breaker parked on trip
+ *     (`state.breaker.usdcParked`, null if the trip's SOL->USDC swap had failed).
+ *     The dep MUST cap the swap at this amount so operator-held USDC in the same
+ *     wallet is never swept back into SOL.
+ */
 export async function tryReenter(state, { now = Date.now(), cfg, deps }) {
   if (!state.breaker.active) return state;
   if (now < (state.breaker.cooldownUntil ?? 0)) return state; // cooldown not elapsed
@@ -192,7 +204,7 @@ export async function tryReenter(state, { now = Date.now(), cfg, deps }) {
 
   let solOut = null;
   try {
-    const r = await deps.swapUsdcToSol();
+    const r = await deps.swapUsdcToSol(state.breaker.usdcParked);
     solOut = r?.solOut ?? null;
   } catch (e) {
     log("sol_guard_warn", `USDC->SOL re-entry swap failed: ${e.message} (staying parked, will retry)`);
@@ -272,6 +284,12 @@ export async function backfillSolHistory(fetchFn = fetch, now = Date.now()) {
  * Per-management-cycle entry point. Records the latest SOL price, then either
  * attempts re-entry (if parked) or evaluates a trip. Injected deps wire the
  * actual close/swap/positions/notify implementations from index.js.
+ *
+ * Swap dep contract:
+ *   swapSolToUsdc()              -> { usdcOut }   (trip: park SOL into USDC)
+ *   swapUsdcToSol(parkedUsdc)    -> { solOut }    (re-entry: swap back ONLY the
+ *     `parkedUsdc` the breaker recorded on trip — null if the trip swap failed —
+ *     never sweeping unrelated operator USDC in the same wallet)
  */
 let _ticking = false;
 export async function tick({ now = Date.now(), solPrice, deps }) {

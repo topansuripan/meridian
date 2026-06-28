@@ -664,11 +664,14 @@ After executing, write a brief one-line result per position.
             const after = (await getWalletBalances()).usdc;
             return { usdcOut: Math.max(0, after - before) };
           },
-          swapUsdcToSol: async () => {
+          swapUsdcToSol: async (parkedUsdc) => {
             const b = await getWalletBalances();
-            if (b.usdc <= 1) return { solOut: 0 };
-            const before = (await getWalletBalances()).sol;
-            await swapToken({ input_mint: config.tokens.USDC, output_mint: "SOL", amount: b.usdc });
+            // Only swap back what the breaker parked — never sweep unrelated operator USDC.
+            // If parkedUsdc is null/0 (e.g. the trip's SOL->USDC swap had failed), swap nothing.
+            const cap = Number.isFinite(parkedUsdc) && parkedUsdc > 0 ? Math.min(b.usdc, parkedUsdc) : 0;
+            if (cap <= 1) return { solOut: 0 };
+            const before = b.sol;
+            await swapToken({ input_mint: config.tokens.USDC, output_mint: "SOL", amount: cap });
             const after = (await getWalletBalances()).sol;
             return { solOut: Math.max(0, after - before) };
           },
