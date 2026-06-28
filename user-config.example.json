@@ -5,6 +5,7 @@
   "llmApiKey": "",
   "llmModel": "minimax/minimax-m2.7",
   "dryRun": true,
+  "spectateMode": false,
 
   "deployAmountSol": 0.5,
   "maxPositions": 3,

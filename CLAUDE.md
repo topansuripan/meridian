@@ -144,6 +144,7 @@ Handled directly in `index.js` (bypass LLM):
 | `/positions` | List open positions with progress bar |
 | `/close <n>` | Close position by list index |
 | `/set <n> <note>` | Set note on position by list index |
+| `/spectate on\|off` | Toggle watch-only mode (cycles keep running, no actions); bare `/spectate` reports state |
 
 Progress bar format: `[████████░░░░░░░░░░░░] 40%` (no bin numbers, no arrows)
 
@@ -307,6 +308,32 @@ Key non-default values on VPS:
 - `index.js` `runManagementCycle()` — calls `solCrashGuard.tick({ solPrice, deps })` (samples price, then trips or re-enters); `backfillSolHistory()` runs once at boot.
 - `tools/executor.js` `runSafetyChecks()` — gates `deploy_position`: blocks NORMAL deploys with `{ pass: false, reason }` while `solGuardCoolingDown()` is true (degen unaffected).
 - `index.js` screening gates (`runScreeningCycle` and `runDeterministicScreen`) — pause normal screening alongside the existing `lossBreaker.triggered` check.
+
+---
+
+## Spectate Mode (June 2026)
+
+A global watch-only mode. Cron cycles keep running and monitoring continues, but the agent takes **no** fund/position action — instead it emits "WOULD …" Telegram alerts so the operator acts manually.
+
+**What it suppresses (when `config.spectateMode` is true):**
+- **ALL write tools** via the `executeTool` chokepoint — `deploy_position`, `close_position`, `claim_fees`, `swap_token` return `{ blocked: true, reason: "Spectate mode — …" }` without executing (no SL/TP/close, no deploys, no claims/swaps). This is the hard enforcement layer; everything below is decision-site short-circuiting for cleaner behavior/alerts.
+- **Screening + deploys** — both screening gates (`runScreeningCycle`, `runDeterministicScreen`) pause, same as the loss/SOL-crash breakers.
+- **SOL-crash breaker stands down** — `solCrashGuard.tick()` runs with `observeOnly: true` (records price, reports `wouldTrip`, takes no action); a throttled `⚠️ [SPECTATE] WOULD trigger SOL-crash breaker` alert fires instead.
+- **MANAGER LLM step** is skipped (monitoring only).
+- **Deterministic close/claim loop** in `runManagementCycle` is skipped entirely (logs once: `Deterministic close/claim loop skipped (spectate mode).`) — avoids per-cycle "failed (Spectate mode…)" noise from the chokepoint.
+
+**What continues:** position fetch, PnL, OOR detection, pool-memory snapshots, and `👁 [SPECTATE] WOULD close …` alerts from the 30s PnL poll exit/close-rule sites.
+
+**Differs from `/pause`:** `/pause` stops the cron cycles entirely; spectate keeps cycles running (monitoring + alerts) and only suppresses actions.
+
+**Toggle:** `/spectate on|off` Telegram command (bare `/spectate` reports current state + open-position count). Persists via `setSpectateMode(on)` in `config.js`.
+
+**Config key:** `spectateMode` (top-level in `user-config.json`, default `false`).
+
+**Integration points:**
+- `config.js` — `spectateMode` flag + `setSpectateMode(on, configPath?)` (mutates live config, persists to `user-config.json`).
+- `tools/executor.js` — `spectateWouldBlock(name)` predicate + the chokepoint in `executeTool` (blocks `WRITE_TOOLS` while spectating).
+- `index.js` — guards in `runManagementCycle` (SOL-crash observe-only tick, MANAGER LLM skip, deterministic loop skip), the 30s PnL poll (WOULD-close alerts), the screening gates, and the `/spectate` command handler.
 
 ---
 
