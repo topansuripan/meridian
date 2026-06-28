@@ -320,13 +320,21 @@ export async function backfillSolHistory(fetchFn = fetch, now = Date.now()) {
  *     operator USDC in the same wallet)
  */
 let _ticking = false;
-export async function tick({ now = Date.now(), solPrice, deps }) {
+export async function tick({ now = Date.now(), solPrice, deps, observeOnly = false }) {
   if (!config.solCrashGuard.enabled) return;
   if (_ticking) return; // guard against overlapping cycles
   _ticking = true;
   try {
     if (Number.isFinite(solPrice)) recordSolPrice(solPrice, now);
     const cfg = config.solCrashGuard;
+
+    if (observeOnly) {
+      const metrics = computeSolMetrics(_state.priceHistory, now);
+      const { dumping, reason } = isDumping(metrics, cfg);
+      saveState(_state);
+      return { wouldTrip: dumping && !_state.breaker.active, reason };
+    }
+
     if (_state.breaker.active) {
       // If a prior trip's park did not complete (SOL->USDC swap threw), retry it
       // each cycle BEFORE attempting re-entry — otherwise the trip capital is
