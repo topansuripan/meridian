@@ -6,7 +6,8 @@ import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
-import { getWalletBalances } from "./tools/wallet.js";
+import { getWalletBalances, swapToken } from "./tools/wallet.js";
+import * as solCrashGuard from "./sol-crash-guard.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -50,6 +51,8 @@ if (isMain) {
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
+  // Best-effort one-time SOL price-history backfill for the crash circuit breaker
+  solCrashGuard.backfillSolHistory().catch(() => {});
 }
 
 const TP_PCT = config.management.takeProfitPct;
@@ -637,6 +640,43 @@ After executing, write a brief one-line result per position.
     if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+    }
+
+    // ─── SOL-crash circuit breaker ──────────────────────────────
+    // Wrapped in its own try/catch so a guard failure can never break management.
+    try {
+      const bal = await getWalletBalances();
+      await solCrashGuard.tick({
+        solPrice: bal.sol_price,
+        deps: {
+          getNormalOpenPositions: async () => {
+            const live = await getMyPositions({ force: true, silent: true }).catch(() => ({ positions: [] }));
+            return (live.positions || []).filter(p => getTrackedPosition(p.position)?.degen !== true);
+          },
+          closePosition: ({ position_address, reason }) =>
+            executeTool("close_position", { position_address, reason }),
+          swapSolToUsdc: async () => {
+            const b = await getWalletBalances();
+            const swappable = Math.max(0, b.sol - config.solCrashGuard.keepGasReserveSol);
+            if (swappable <= 0) return { usdcOut: 0 };
+            const before = (await getWalletBalances()).usdc;
+            await swapToken({ input_mint: "SOL", output_mint: config.tokens.USDC, amount: swappable });
+            const after = (await getWalletBalances()).usdc;
+            return { usdcOut: Math.max(0, after - before) };
+          },
+          swapUsdcToSol: async () => {
+            const b = await getWalletBalances();
+            if (b.usdc <= 1) return { solOut: 0 };
+            const before = (await getWalletBalances()).sol;
+            await swapToken({ input_mint: config.tokens.USDC, output_mint: "SOL", amount: b.usdc });
+            const after = (await getWalletBalances()).sol;
+            return { solOut: Math.max(0, after - before) };
+          },
+          notify: (text) => sendMessage(text),
+        },
+      });
+    } catch (e) {
+      log("cron_error", `SOL-crash guard tick failed: ${e.message}`);
     }
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
