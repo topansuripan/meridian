@@ -747,8 +747,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
       maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
       cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
     });
-    if (lossBreaker.triggered) {
-      const reason = formatLossCircuitBreakerReason(lossBreaker);
+    if (lossBreaker.triggered || solCrashGuard.isCoolingDown()) {
+      const reason = lossBreaker.triggered
+        ? formatLossCircuitBreakerReason(lossBreaker)
+        : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
       log("cron", `Screening paused by loss circuit breaker — ${reason}`);
       screenReport = `Screening paused — ${reason}.\nManagement stays active on existing positions.`;
       appendDecision({
@@ -2180,8 +2182,11 @@ async function runDeterministicScreen(limit = 5) {
     maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
     cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
   });
-  if (lossBreaker.triggered) {
-    return `Screening paused — ${formatLossCircuitBreakerReason(lossBreaker)}.\nManagement stays active on existing positions.`;
+  if (lossBreaker.triggered || solCrashGuard.isCoolingDown()) {
+    const reason = lossBreaker.triggered
+      ? formatLossCircuitBreakerReason(lossBreaker)
+      : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
+    return `Screening paused — ${reason}.\nManagement stays active on existing positions.`;
   }
   const top = await getTopCandidates({ limit });
   const candidates = (top?.candidates || top?.pools || []).slice(0, limit);

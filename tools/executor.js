@@ -21,6 +21,7 @@ import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative, getTokenAudit } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { isCoolingDown as solGuardCoolingDown } from "../sol-crash-guard.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -1055,6 +1056,12 @@ async function runSafetyChecks(name, args) {
 
       // Reject pools with bin_step out of configured range
       const isDegen = !!args.degen;
+
+      // SOL-crash breaker: block NORMAL deploys while parked (degen unaffected)
+      if (!isDegen && solGuardCoolingDown()) {
+        return { pass: false, reason: "SOL-crash circuit breaker active — normal deploys paused until SOL stabilizes." };
+      }
+
       const minStep = isDegen ? (config.degen?.minBinStep ?? 20) : config.screening.minBinStep;
       const maxStep = isDegen ? (config.degen?.maxBinStep ?? 200) : config.screening.maxBinStep;
       if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
