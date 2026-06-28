@@ -840,6 +840,11 @@ const PROTECTED_TOOLS = new Set([
   "self_update",
 ]);
 
+/** True when spectate mode is active AND this tool would touch funds/positions. */
+export function spectateWouldBlock(name) {
+  return !!config.spectateMode && WRITE_TOOLS.has(name);
+}
+
 /**
  * Execute a tool call with safety checks and logging.
  */
@@ -855,6 +860,12 @@ export async function executeTool(name, args) {
     const error = `Unknown tool: ${name}`;
     log("error", error);
     return { error };
+  }
+
+  // ─── Spectate mode: suppress all fund/position actions ───
+  if (spectateWouldBlock(name)) {
+    log("spectate_block", `${name} suppressed (spectate mode)`);
+    return { blocked: true, reason: "Spectate mode — action suppressed (no SL/TP/deploy/claim/swap). Use /spectate off to resume." };
   }
 
   // ─── Pre-execution safety checks ──────────

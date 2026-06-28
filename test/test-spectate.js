@@ -21,3 +21,25 @@ test("setSpectateMode flips the live flag and persists, preserving other keys", 
   assert.equal(JSON.parse(fs.readFileSync(tmp, "utf8")).spectateMode, false);
   fs.unlinkSync(tmp);
 });
+
+import { spectateWouldBlock, executeTool } from "../tools/executor.js";
+
+test("spectateWouldBlock: true only for write tools when spectating", () => {
+  config.spectateMode = true;
+  for (const t of ["deploy_position", "close_position", "claim_fees", "swap_token"]) {
+    assert.equal(spectateWouldBlock(t), true, `${t} should block`);
+  }
+  assert.equal(spectateWouldBlock("get_position_pnl"), false, "read tool not blocked");
+  config.spectateMode = false;
+  assert.equal(spectateWouldBlock("close_position"), false, "off → not blocked");
+});
+
+test("executeTool returns a blocked result for write tools while spectating (no execution)", async () => {
+  config.spectateMode = true;
+  for (const t of ["deploy_position", "close_position", "claim_fees", "swap_token"]) {
+    const r = await executeTool(t, { position_address: "x", pool_address: "y" });
+    assert.equal(r.blocked, true, `${t} blocked`);
+    assert.match(r.reason, /spectate/i);
+  }
+  config.spectateMode = false;
+});
