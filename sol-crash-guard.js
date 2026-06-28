@@ -9,6 +9,9 @@
  * See docs/plans/2026-06-28-sol-crash-circuit-breaker-design.md
  */
 
+import fs from "fs";
+import { log } from "./logger.js";
+
 const HOUR = 3600_000;
 const MIN_HISTORY_MS = 55 * 60_000; // need ~1h before the 1h test is valid
 
@@ -72,4 +75,41 @@ export function pushPrice(priceHistory, price, now = Date.now(), maxAgeMs = DEFA
     .filter(([ms]) => ms >= now - maxAgeMs)
     .sort((a, b) => a[0] - b[0]);
   return next;
+}
+
+const STATE_FILE = "./sol-crash-state.json";
+
+export function defaultState() {
+  return {
+    priceHistory: [],
+    breaker: {
+      active: false,
+      trippedAt: null,
+      cooldownUntil: null,
+      reason: null,
+      solAtTrip: null,
+      closedPositions: [],
+      usdcParked: null,
+    },
+  };
+}
+
+export function loadState(path = STATE_FILE) {
+  try {
+    if (!fs.existsSync(path)) return defaultState();
+    const raw = JSON.parse(fs.readFileSync(path, "utf8"));
+    const d = defaultState();
+    return { priceHistory: raw.priceHistory ?? [], breaker: { ...d.breaker, ...(raw.breaker ?? {}) } };
+  } catch (e) {
+    log("sol_guard_warn", `loadState failed: ${e.message}`);
+    return defaultState();
+  }
+}
+
+export function saveState(state, path = STATE_FILE) {
+  try {
+    fs.writeFileSync(path, JSON.stringify(state, null, 2));
+  } catch (e) {
+    log("sol_guard_warn", `saveState failed: ${e.message}`);
+  }
 }

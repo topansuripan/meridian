@@ -78,3 +78,30 @@ test("pushPrice appends, sorts, and trims to maxAge", () => {
   h = pushPrice(h, NaN, now + 1000, maxAge);
   assert.equal(h.length, before);
 });
+
+import { defaultState, loadState, saveState } from "../sol-crash-guard.js";
+import fs from "node:fs";
+
+test("defaultState shape", () => {
+  const s = defaultState();
+  assert.deepEqual(s.priceHistory, []);
+  assert.equal(s.breaker.active, false);
+  assert.equal(s.breaker.cooldownUntil, null);
+});
+
+test("saveState/loadState round-trip with explicit path", () => {
+  const p = "./test/.tmp-sol-state.json";
+  const s = defaultState();
+  s.breaker.active = true;
+  s.breaker.reason = "test";
+  saveState(s, p);
+  const loaded = loadState(p);
+  assert.equal(loaded.breaker.active, true);
+  assert.equal(loaded.breaker.reason, "test");
+  fs.unlinkSync(p);
+});
+
+test("loadState returns defaults when file missing", () => {
+  const loaded = loadState("./test/.does-not-exist.json");
+  assert.equal(loaded.breaker.active, false);
+});
