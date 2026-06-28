@@ -92,6 +92,18 @@ export const config = {
     lossQuarantineMinPnlPct: u.lossQuarantineMinPnlPct ?? -8,
   },
 
+  // ─── SOL-Crash Circuit Breaker ───────────
+  solCrashGuard: {
+    enabled:               u.solCrashGuard?.enabled              ?? true,
+    drop1hPct:             u.solCrashGuard?.drop1hPct            ?? 3,
+    drawdown6hPct:         u.solCrashGuard?.drawdown6hPct        ?? 5,
+    cooldownHours:         u.solCrashGuard?.cooldownHours        ?? 6,
+    reentryRequiresStable: u.solCrashGuard?.reentryRequiresStable ?? true,
+    scope:                 u.solCrashGuard?.scope                ?? "normal",
+    keepGasReserveSol:     u.solCrashGuard?.keepGasReserveSol    ?? (u.gasReserve ?? 0.2),
+    backfillOnStart:       u.solCrashGuard?.backfillOnStart      ?? true,
+  },
+
   // ─── Pool Screening Thresholds ───────────
   screening: {
     source:            u.screeningSource    ?? "meteora", // meteora | gmgn
