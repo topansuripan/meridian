@@ -280,6 +280,36 @@ Key non-default values on VPS:
 
 ---
 
+## SOL-Crash Circuit Breaker (June 2026)
+
+**Why**: Single-sided SOL positions are SOL-denominated, so a SOL/USD crash trips per-position USD stop-losses across the entire book at once — token selection is irrelevant. Post-mortem of the Jun 25 drawdown: ~75% of the loss was SOL beta, not bad picks. This breaker hedges the whole normal book to USDC during a SOL dump.
+
+- **Module**: `sol-crash-guard.js` (self-contained; dependency-injected close/swap/positions/notify fns — no imports from `executor.js`/`dlmm.js`/`wallet.js`). State persists to `sol-crash-state.json` (gitignored).
+- **Trigger** (evaluated every management cycle — fires right after a normal stop-loss and as a catch-all): SOL is "dumping hard" when **≤ −3% in 1h OR ≤ −5% off its trailing 6h high**. Needs ≥ ~1h of price history first.
+- **Action on trip**: close ALL normal positions → swap freed SOL to USDC (keeping `keepGasReserveSol`) → pause normal deploys + normal screening. Degen positions are untouched (degen runs on its own existing breaker; `scope: "normal"`).
+- **Cooldown / re-entry**: `cooldownHours` (default 6h), then re-enter ONLY if SOL has stabilized (no longer dumping; `reentryRequiresStable`). Re-entry swaps back ONLY the parked USDC amount (`breaker.usdcParked`) — never operator-held USDC in the same wallet. If still dumping after cooldown, stays parked and re-checks each cycle.
+- **Startup**: best-effort CoinGecko backfill of ~24h hourly SOL/USD (`backfillSolHistory()`) so the breaker is armed on boot rather than waiting hours to fill organically.
+
+**Config (`config.solCrashGuard`, overridable via `user-config.json` under `solCrashGuard`)**:
+
+| Key | Default |
+|-----|---------|
+| `enabled` | true |
+| `drop1hPct` | 3 |
+| `drawdown6hPct` | 5 |
+| `cooldownHours` | 6 |
+| `reentryRequiresStable` | true |
+| `scope` | "normal" |
+| `keepGasReserveSol` | 0.2 (falls back to `gasReserve`) |
+| `backfillOnStart` | true |
+
+**Integration points**:
+- `index.js` `runManagementCycle()` — calls `solCrashGuard.tick({ solPrice, deps })` (samples price, then trips or re-enters); `backfillSolHistory()` runs once at boot.
+- `tools/executor.js` `runSafetyChecks()` — gates `deploy_position`: blocks NORMAL deploys with `{ pass: false, reason }` while `solGuardCoolingDown()` is true (degen unaffected).
+- `index.js` screening gates (`runScreeningCycle` and `runDeterministicScreen`) — pause normal screening alongside the existing `lossBreaker.triggered` check.
+
+---
+
 ## Known Issues / Tech Debt
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.

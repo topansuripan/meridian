@@ -19,6 +19,17 @@
   "gasReserve": 0.2,
   "positionSizePct": 0.35,
 
+  "solCrashGuard": {
+    "enabled": true,
+    "drop1hPct": 3,
+    "drawdown6hPct": 5,
+    "cooldownHours": 6,
+    "reentryRequiresStable": true,
+    "scope": "normal",
+    "keepGasReserveSol": 0.2,
+    "backfillOnStart": true
+  },
+
   "strategy": "bid_ask",
   "minBinsBelow": 35,
   "maxBinsBelow": 69,
