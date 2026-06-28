@@ -159,3 +159,40 @@ export async function maybeTrip(state, { now = Date.now(), cfg, deps }) {
 
   return state;
 }
+
+export function isCoolingDownState(state, now = Date.now()) {
+  return !!(state.breaker.active);
+}
+
+export async function tryReenter(state, { now = Date.now(), cfg, deps }) {
+  if (!state.breaker.active) return state;
+  if (now < (state.breaker.cooldownUntil ?? 0)) return state; // cooldown not elapsed
+
+  if (cfg.reentryRequiresStable) {
+    const metrics = computeSolMetrics(state.priceHistory, now);
+    if (isDumping(metrics, cfg).dumping) {
+      log("sol_guard", "Cooldown elapsed but SOL still dumping — staying parked.");
+      return state; // re-check next cycle
+    }
+  }
+
+  let solOut = null;
+  try {
+    const r = await deps.swapUsdcToSol();
+    solOut = r?.solOut ?? null;
+  } catch (e) {
+    log("sol_guard_warn", `USDC->SOL re-entry swap failed: ${e.message} (staying parked, will retry)`);
+    return state; // stay active; retry next cycle
+  }
+
+  const priceNow = computeSolMetrics(state.priceHistory, now).priceNow;
+  await deps.notify(
+    `✅ SOL-crash breaker CLEARED — SOL stabilized` +
+    (priceNow ? ` at $${priceNow.toFixed(2)}` : "") +
+    (solOut != null ? `. Swapped USDC→${solOut.toFixed(3)} SOL` : "") +
+    `. Resuming normal deploys.`
+  ).catch(() => {});
+
+  state.breaker = defaultState().breaker; // clear (active=false, cooldownUntil=null)
+  return state;
+}

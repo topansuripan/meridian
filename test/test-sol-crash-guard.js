@@ -171,3 +171,50 @@ test("maybeTrip continues past a single close failure", async () => {
   assert.equal(s.breaker.active, true, "still trips");
   assert.ok(s.breaker.closedPositions.includes("P2"));
 });
+
+import { tryReenter, isCoolingDownState } from "../sol-crash-guard.js";
+
+function activeState(now, history) {
+  const s = defaultState();
+  s.priceHistory = history;
+  s.breaker = { active: true, trippedAt: now - 6 * 3600_000, cooldownUntil: now, reason: "SOL -5% off 6h high",
+    solAtTrip: 65, closedPositions: ["P1"], usdcParked: 150 };
+  return s;
+}
+const CFG_RE = { enabled: true, drop1hPct: 3, drawdown6hPct: 5, cooldownHours: 6, reentryRequiresStable: true };
+
+test("isCoolingDownState true while active and before cooldownUntil", () => {
+  const now = 10_000_000_000_000;
+  const s = activeState(now, []);
+  s.breaker.cooldownUntil = now + 3600_000;
+  assert.equal(isCoolingDownState(s, now), true);
+});
+
+test("tryReenter stays parked while still dumping after cooldown", async () => {
+  const now = 10_000_000_000_000;
+  const s = activeState(now, hist([68, 68, 68, 68, 68, 68, 64.9], now)); // still -4.56%/1h
+  let swapped = false;
+  await tryReenter(s, { now, cfg: CFG_RE, deps: { swapUsdcToSol: async () => { swapped = true; return { solOut: 2 }; }, notify: async () => {} } });
+  assert.equal(s.breaker.active, true);
+  assert.equal(swapped, false);
+});
+
+test("tryReenter re-enters once SOL stabilized", async () => {
+  const now = 10_000_000_000_000;
+  const s = activeState(now, hist([66, 66, 66, 66, 66, 66, 66], now)); // flat
+  let swapped = false;
+  await tryReenter(s, { now, cfg: CFG_RE, deps: { swapUsdcToSol: async () => { swapped = true; return { solOut: 2.3 }; }, notify: async () => {} } });
+  assert.equal(swapped, true);
+  assert.equal(s.breaker.active, false);
+  assert.equal(s.breaker.cooldownUntil, null);
+});
+
+test("tryReenter no-op before cooldown elapses", async () => {
+  const now = 10_000_000_000_000;
+  const s = activeState(now, hist([66, 66, 66, 66, 66, 66, 66], now));
+  s.breaker.cooldownUntil = now + 3600_000; // 1h left
+  let swapped = false;
+  await tryReenter(s, { now, cfg: CFG_RE, deps: { swapUsdcToSol: async () => { swapped = true; return { solOut: 2 }; }, notify: async () => {} } });
+  assert.equal(swapped, false);
+  assert.equal(s.breaker.active, true);
+});
