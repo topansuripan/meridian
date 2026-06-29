@@ -137,6 +137,10 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    // Pump entry guard — reject entries after a sharp recent pump (wash/parabolic tell). null = off.
+    maxPump5mPct:       u.maxPump5mPct        ?? 20,  // reject if any single 5m candle in lookback rose >= this %
+    maxPump15mPct:      u.maxPump15mPct       ?? 30,  // reject if any rolling 15m (3-candle) window rose >= this %
+    pumpLookbackHours:  u.pumpLookbackHours   ?? 2,   // trailing window of 5m candles to scan
   },
 
   gmgn: {
@@ -427,6 +431,9 @@ export function reloadScreeningThresholds() {
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
+    if (fresh.maxPump5mPct      !== undefined) s.maxPump5mPct     = fresh.maxPump5mPct;
+    if (fresh.maxPump15mPct     !== undefined) s.maxPump15mPct    = fresh.maxPump15mPct;
+    if (fresh.pumpLookbackHours !== undefined) s.pumpLookbackHours = fresh.pumpLookbackHours;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;

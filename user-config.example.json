@@ -63,6 +63,9 @@
   "minTokenAgeHours": null,
   "maxTokenAgeHours": null,
   "athFilterPct": null,
+  "maxPump5mPct": 20,
+  "maxPump15mPct": 30,
+  "pumpLookbackHours": 2,
   "screeningSource": "meteora",
 
   "minClaimAmount": 5,
