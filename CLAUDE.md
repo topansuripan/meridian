@@ -75,6 +75,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minHolders | screening | 500 |
 | minMcap / maxMcap | screening | 150k / 10M |
 | minBinStep / maxBinStep | screening | 80 / 125 |
+| maxPump5mPct / maxPump15mPct / pumpLookbackHours | screening | 20 / 30 / 2 |
 | timeframe | screening | "5m" |
 | category | screening | "trending" |
 | minTokenFeesSol | screening | 30 |
@@ -117,6 +118,7 @@ Before `deploy_position` executes:
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
+- Recent-pump guard (NORMAL only): refuses deploy if the pool's last `pumpLookbackHours` (2h) of 5m candles contain a single candle that rose ≥ `maxPump5mPct` (20%) or a 15m (3-candle) window that rose ≥ `maxPump15mPct` (30%). Data: Meteora 5m OHLCV (`fetchPoolOhlcv`/`detectRecentPump` in screening.js). Wash/parabolic tell — calibrated to the ALON loss (2026-06-29: +24.5% 5m candle one bar before entry → −7.53% stop). Degen exempt; missing data never blocks. Enforced at the deploy gate (executor.js) and as a screening filter in `getTopCandidates` (degen opts out via `buildDegenScreeningOverrides`).
 
 ---
 
