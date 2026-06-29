@@ -12,7 +12,7 @@ test("config.screening has pump-guard defaults", () => {
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { detectRecentPump } from "../tools/screening.js";
+import { detectRecentPump, resolvePumpThreshold } from "../tools/screening.js";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const load = (f) => JSON.parse(readFileSync(join(__dir, "fixtures", f), "utf8")).data;
@@ -42,5 +42,26 @@ test("detectRecentPump: empty/insufficient candles never pumps", () => {
 
 test("detectRecentPump: disabled thresholds (null) never pump", () => {
   const r = detectRecentPump(load("alon-pre-entry-5m.json"), { maxSingle5mPct: null, max15mPct: null });
+  assert.equal(r.pumped, false);
+});
+
+test("resolvePumpThreshold: null/undefined disable the guard (return null)", () => {
+  assert.equal(resolvePumpThreshold(null), null);
+  assert.equal(resolvePumpThreshold(undefined), null);
+});
+
+test("resolvePumpThreshold: numbers pass through; 0 is a real threshold; strings coerce", () => {
+  assert.equal(resolvePumpThreshold(20), 20);
+  assert.equal(resolvePumpThreshold(0), 0);
+  assert.equal(resolvePumpThreshold("30"), 30);
+  assert.equal(resolvePumpThreshold(NaN), null);
+});
+
+test("resolvePumpThreshold: degen-disabled path does NOT flag a pumped pool", () => {
+  // Reproduces the degen screening path: overrides set the keys to null → must resolve to null
+  // → detectRecentPump must NOT drop the candidate (guard disabled), even on the ALON pump window.
+  const single = resolvePumpThreshold(null);
+  const fifteen = resolvePumpThreshold(null);
+  const r = detectRecentPump(load("alon-pre-entry-5m.json"), { maxSingle5mPct: single, max15mPct: fifteen });
   assert.equal(r.pumped, false);
 });

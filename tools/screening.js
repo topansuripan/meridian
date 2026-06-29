@@ -48,6 +48,12 @@ function numeric(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Resolve a pump-guard threshold: null/undefined means "guard disabled" (must stay null,
+// NOT coerce to 0 like numeric() would). Otherwise coerce to a finite number or null.
+export function resolvePumpThreshold(raw) {
+  return raw == null ? null : numeric(raw);
+}
+
 function isUsableVolatility(value) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0;
@@ -779,12 +785,12 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
   // Pump entry guard — drop candidates that pumped sharply in the recent window (normal screens only).
   // Degen passes screeningOverrides with these set to null, so it is exempt.
   const pumpSingle = (screeningOverrides && "maxPump5mPct" in screeningOverrides)
-    ? numeric(screeningOverrides.maxPump5mPct)
-    : numeric(config.screening.maxPump5mPct);
+    ? resolvePumpThreshold(screeningOverrides.maxPump5mPct)
+    : resolvePumpThreshold(config.screening.maxPump5mPct);
   const pump15m = (screeningOverrides && "maxPump15mPct" in screeningOverrides)
-    ? numeric(screeningOverrides.maxPump15mPct)
-    : numeric(config.screening.maxPump15mPct);
-  const pumpLookback = numeric(config.screening.pumpLookbackHours) ?? 2;
+    ? resolvePumpThreshold(screeningOverrides.maxPump15mPct)
+    : resolvePumpThreshold(config.screening.maxPump15mPct);
+  const pumpLookback = resolvePumpThreshold(config.screening.pumpLookbackHours) ?? 2;
   if ((pumpSingle != null || pump15m != null) && eligible.length > 0) {
     const pumpResults = await Promise.allSettled(
       eligible.map((p) => fetchPoolOhlcv(p.pool, { lookbackHours: pumpLookback })),

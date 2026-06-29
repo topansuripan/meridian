@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates, detectRecentPump, fetchPoolOhlcv } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, detectRecentPump, fetchPoolOhlcv, resolvePumpThreshold } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -1076,18 +1076,17 @@ async function runSafetyChecks(name, args) {
       // Pump entry guard: refuse NORMAL deploys when the token pumped sharply in the recent window
       // (wash/parabolic tell — see ALON loss 2026-06-29). Degen is exempt; missing data never blocks.
       if (!isDegen) {
-        const maxSingle5mPct = numberOrNull(config.screening.maxPump5mPct);
-        const max15mPct = numberOrNull(config.screening.maxPump15mPct);
+        const maxSingle5mPct = resolvePumpThreshold(config.screening.maxPump5mPct);
+        const max15mPct = resolvePumpThreshold(config.screening.maxPump15mPct);
         if (maxSingle5mPct != null || max15mPct != null) {
           try {
-            const candles = await fetchPoolOhlcv(args.pool_address, {
-              lookbackHours: numberOrNull(config.screening.pumpLookbackHours) ?? 2,
-            });
+            const lookbackHours = resolvePumpThreshold(config.screening.pumpLookbackHours) ?? 2;
+            const candles = await fetchPoolOhlcv(args.pool_address, { lookbackHours });
             const pump = detectRecentPump(candles, { maxSingle5mPct, max15mPct });
             if (pump?.pumped) {
               return {
                 pass: false,
-                reason: `Recent pump: +${pump.maxSingle5mPct}% single 5m candle / +${pump.max15mPct}% in 15m (at ${pump.at ?? "recent"}) within ${config.screening.pumpLookbackHours ?? 2}h — likely wash/parabolic. Refusing entry.`,
+                reason: `Recent pump: +${pump.maxSingle5mPct}% single 5m candle / +${pump.max15mPct}% in 15m (at ${pump.at ?? "recent"}) within ${lookbackHours}h — likely wash/parabolic. Refusing entry.`,
               };
             }
           } catch (e) {
