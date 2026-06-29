@@ -1204,6 +1204,8 @@ function buildDegenScreeningOverrides() {
     minFeeActiveTvlRatio: d.minFeeActiveTvlRatio,
     minTokenAgeHours:     d.minTokenAgeHours,
     excludeHighSupplyConcentration: d.excludeHighSupplyConcentration,
+    maxPump5mPct:         null,  // degen chases pumps — pump guard disabled
+    maxPump15mPct:        null,
   };
 }
 

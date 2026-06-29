@@ -776,6 +776,37 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
     }
   }
 
+  // Pump entry guard — drop candidates that pumped sharply in the recent window (normal screens only).
+  // Degen passes screeningOverrides with these set to null, so it is exempt.
+  const pumpSingle = (screeningOverrides && "maxPump5mPct" in screeningOverrides)
+    ? numeric(screeningOverrides.maxPump5mPct)
+    : numeric(config.screening.maxPump5mPct);
+  const pump15m = (screeningOverrides && "maxPump15mPct" in screeningOverrides)
+    ? numeric(screeningOverrides.maxPump15mPct)
+    : numeric(config.screening.maxPump15mPct);
+  const pumpLookback = numeric(config.screening.pumpLookbackHours) ?? 2;
+  if ((pumpSingle != null || pump15m != null) && eligible.length > 0) {
+    const pumpResults = await Promise.allSettled(
+      eligible.map((p) => fetchPoolOhlcv(p.pool, { lookbackHours: pumpLookback })),
+    );
+    const before = eligible.length;
+    const kept = [];
+    for (let i = 0; i < eligible.length; i++) {
+      const p = eligible[i];
+      const candles = pumpResults[i].status === "fulfilled" ? pumpResults[i].value : null;
+      const pump = detectRecentPump(candles, { maxSingle5mPct: pumpSingle, max15mPct: pump15m });
+      if (pump) p.recent_pump_5m_pct = pump.maxSingle5mPct; // surface to LLM as context
+      if (pump?.pumped) {
+        log("screening", `Pump guard: dropped ${p.name} — +${pump.maxSingle5mPct}% 5m / +${pump.max15mPct}% 15m at ${pump.at ?? "recent"}`);
+        pushFilteredReason(filteredOut, p, `recent pump +${pump.maxSingle5mPct}% 5m / +${pump.max15mPct}% 15m`);
+        continue;
+      }
+      kept.push(p);
+    }
+    eligible.splice(0, eligible.length, ...kept);
+    if (eligible.length < before) log("screening", `Pump guard removed ${before - eligible.length} candidate(s)`);
+  }
+
   return {
     candidates: eligible,
     total_screened: discovery.total ?? pools.length,
