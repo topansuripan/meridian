@@ -10,6 +10,7 @@ import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const METEORA_OHLCV_BASE = "https://dlmm.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
@@ -782,6 +783,60 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
     filtered_examples: filteredOut.slice(0, 3),
     stage_counts: discovery.stage_counts ? { ranked: discovery.total, ...discovery.stage_counts } : null,
     all_filtered: filteredOut,
+  };
+}
+
+/**
+ * Fetch a pool's 5m OHLCV candles over a trailing window.
+ * The window math (start/end) assumes 5m candles — the detector downstream is 5m-only.
+ * Passing an explicit start/end returns the full ~24 candles for 2h; the no-param API
+ * default would cap at ~10, which is why we always send the window.
+ * Returns the candle array (oldest→newest) or null on failure / no data.
+ */
+export async function fetchPoolOhlcv(poolAddress, { timeframe = "5m", lookbackHours = 2, now = null } = {}) {
+  if (!poolAddress) return null;
+  const end = Number.isFinite(now) ? Math.floor(now) : Math.floor(Date.now() / 1000);
+  const start = end - Math.round(lookbackHours * 3600);
+  const url = `${METEORA_OHLCV_BASE}/pools/${poolAddress}/ohlcv?timeframe=${encodeURIComponent(timeframe)}&start_time=${start}&end_time=${end}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`OHLCV ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.data) ? data.data : null;
+}
+
+/**
+ * Pure pump detector. Scans 5m candles for the largest single-candle rise (close/open)
+ * and the largest rolling 15m (3-candle) rise. Returns null when there is no usable data
+ * (caller treats null as "allow"). Only price rises count: drops and candles with a
+ * non-positive open/close are never treated as pumps. Volume is not inspected.
+ */
+export function detectRecentPump(candles, { maxSingle5mPct, max15mPct } = {}) {
+  if (!Array.isArray(candles) || candles.length === 0) return null;
+
+  let maxSingle = 0, maxSingleAt = null;
+  for (const c of candles) {
+    const o = Number(c?.open), cl = Number(c?.close);
+    if (!(o > 0) || !(cl > 0)) continue;
+    const rise = (cl / o - 1) * 100;
+    if (rise > maxSingle) { maxSingle = rise; maxSingleAt = c.timestamp_str || c.timestamp || null; }
+  }
+
+  let max15m = 0, max15mAt = null;
+  for (let i = 2; i < candles.length; i++) {
+    const base = Number(candles[i - 2]?.open), top = Number(candles[i]?.close);
+    if (!(base > 0) || !(top > 0)) continue;
+    const rise = (top / base - 1) * 100;
+    if (rise > max15m) { max15m = rise; max15mAt = candles[i].timestamp_str || candles[i].timestamp || null; }
+  }
+
+  const single = Number.isFinite(maxSingle5mPct) && maxSingle5mPct != null && maxSingle >= maxSingle5mPct;
+  const fifteen = Number.isFinite(max15mPct) && max15mPct != null && max15m >= max15mPct;
+
+  return {
+    pumped: single || fifteen,
+    maxSingle5mPct: Number(maxSingle.toFixed(1)),
+    max15mPct: Number(max15m.toFixed(1)),
+    at: single ? maxSingleAt : (fifteen ? max15mAt : null),
   };
 }
 
