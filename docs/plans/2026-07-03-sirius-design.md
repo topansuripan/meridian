@@ -140,6 +140,16 @@ No close. Operator decides.
   volume, not token 24h volume. To be resolved in the implementation plan (GMGN field vs. candidate
   payload field).
 
+## Phase 7.2 resolution (2026-07-03)
+
+Investigated the two open data questions. **Decision: relay/Meteora screening source, operator vets Part-1 manually** (entry is manual, so the full Dexscreener/GMGN checklist is the operator's pre-deploy step, not the agent's).
+
+- **24h token volume (≥1M):** only exists on the GMGN path (`gmgn.minVolume` filters `token.volume`, the real token 24h USD volume — `tools/gmgn.js:180`). The Meteora/relay path has **no token-level 24h volume field** — only pool 24h volume (`screening.minVolume`, `tools/screening.js:384`). Not auto-enforced on the relay source; **operator's manual gate.**
+- **Insiders (<10%):** only on the GMGN path — `gmgn.maxRatTraderRate` (raw `rat_trader_amount_rate`, labeled "insider" in `tools/gmgn.js:195,224`, exposed as `gmgn_insider_pct`). Set to 0.1 if GMGN source is ever adopted. Not auto-enforced on the relay source; **operator's manual gate.**
+- **Top10 (<30%):** `screening.maxTop10Pct` set to 30 (relay path). `gmgnMaxTop10HolderRate` set to 0.3 as well (inert while on relay source, correct if GMGN is adopted later).
+
+**Known auto-filter gap (accepted):** on the relay source, Sirius does NOT enforce 1M-token-volume or insiders<10%. Those stay in the operator's manual Dexscreener/GMGN vetting before a manual deploy. If faithful automation is wanted later, switch `screeningSource` to `gmgn` and supply a GMGN OpenAPI key.
+
 ## Out of scope (v1)
 
 - Auto-deploy / auto-entry (entry stays manual by design).
