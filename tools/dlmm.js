@@ -1118,15 +1118,24 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
           agentId: getAgentIdForRequests(),
         });
         const normalizedPositions = Array.isArray(result.positions) ? result.positions : [];
-        syncOpenPositions(normalizedPositions.map((p) => p.position));
-        _positionsCache = {
-          wallet: walletAddress,
-          total_positions: Number(result.total_positions || 0),
-          positions: normalizedPositions,
-          request_id: result.requestId || null,
-        };
-        _positionsCacheAt = Date.now();
-        return _positionsCache;
+        if (normalizedPositions.length === 0) {
+          // Deploys use the local Meteora SDK path (shouldUseLpAgentRelayForDeploy === false),
+          // so a freshly-deployed position may not be indexed by the relay yet. Do NOT trust an
+          // empty relay result — fall through to the Meteora portfolio API (on-chain discovery)
+          // before concluding "no positions". Otherwise management is blind to positions it just
+          // opened locally.
+          if (!silent) log("positions_warn", "Agent Meridian relay returned 0 positions — verifying against Meteora portfolio API (on-chain) before concluding empty");
+        } else {
+          syncOpenPositions(normalizedPositions.map((p) => p.position));
+          _positionsCache = {
+            wallet: walletAddress,
+            total_positions: Number(result.total_positions || 0),
+            positions: normalizedPositions,
+            request_id: result.requestId || null,
+          };
+          _positionsCacheAt = Date.now();
+          return _positionsCache;
+        }
       } catch (error) {
         log("positions_warn", `Agent Meridian relay failed; falling back to Meteora/local positions path: ${error.message}`);
       }

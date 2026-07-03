@@ -27,7 +27,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, shouldSendAlert } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, shouldSendAlert } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
@@ -447,7 +447,15 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const livePositions = await getMyPositions({ force: true }).catch((e) => ({ error: e?.message || String(e) }));
+
+    // Surface fetch/wallet errors instead of silently masking them as "no positions".
+    if (livePositions?.error) {
+      log("cron_error", `Management cycle: could not read positions (${livePositions.error}) — skipping this cycle (no screening triggered)`);
+      mgmtReport = `Management cycle skipped: could not read positions (${livePositions.error}).`;
+      return mgmtReport;
+    }
+
     const allPositions = livePositions?.positions || [];
 
     // Skip degen-tagged positions — they're managed by the degen management cycle
@@ -456,7 +464,17 @@ export async function runManagementCycle({ silent = false } = {}) {
       : allPositions;
 
     if (positions.length === 0) {
-      log("cron", "No open positions — triggering screening cycle");
+      // Explain WHY there is nothing to manage. If state tracks open positions but the live
+      // source returned none, that's a fetch/indexing problem — not an empty wallet.
+      const trackedOpen = getTrackedPositions(true).length;
+      const degenFiltered = allPositions.length - positions.length;
+      log("cron", `No open positions to manage — source returned ${allPositions.length} (${degenFiltered} degen-filtered), state tracks ${trackedOpen} open`);
+      if (trackedOpen > 0 && allPositions.length === 0) {
+        log("cron_error", `State tracks ${trackedOpen} open position(s) but the positions source returned 0 — likely a relay/indexing or fetch issue, NOT an empty wallet. Skipping screening to avoid over-deploying.`);
+        mgmtReport = `No positions from source, but state tracks ${trackedOpen} open — suspected fetch/relay issue. Screening skipped.`;
+        return mgmtReport;
+      }
+      log("cron", "Triggering screening cycle");
       mgmtReport = "No open positions. Triggering screening cycle.";
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       return mgmtReport;
@@ -1233,7 +1251,11 @@ export async function runDegenManagementCycle() {
   let report = null;
 
   try {
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const livePositions = await getMyPositions({ force: true }).catch((e) => ({ error: e?.message || String(e) }));
+    if (livePositions?.error) {
+      log("degen", `Degen management: could not read positions (${livePositions.error}) — skipping this cycle`);
+      return null;
+    }
     const positions = livePositions?.positions || [];
 
     // Only manage positions tagged as degen
