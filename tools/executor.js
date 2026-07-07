@@ -9,7 +9,8 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken, waitForWalletTokenBalance } from "./wallet.js";
+import { getWalletBalances, swapToken, waitForWalletTokenBalance, getWalletTokenBalance } from "./wallet.js";
+import { addPendingSwap, recordSwapAttempt, removePendingSwap, getPendingSwaps } from "../pending-swaps.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction, getTrackedPosition } from "../state.js";
@@ -187,6 +188,26 @@ function getTargetSolReserve(balance) {
   return Math.max(gasReserve, reserveFromUsd);
 }
 
+/**
+ * Verify the wallet is actually clear of a token after a swap. A swap can
+ * report success while tokens remain: partial fill, or position/fee tokens
+ * arriving after the balance was sampled.
+ */
+async function verifyWalletClearOfToken(mint, { minUsd = 0.01, settleMs = 4000 } = {}) {
+  if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+  const balance = await getWalletTokenBalance(mint);
+  const amount = Number(balance?.balance || 0);
+  if (amount <= 0) return { clear: true, balance: 0 };
+
+  const balances = await getWalletBalances({});
+  const token = balances.tokens?.find((entry) => entry.mint === mint);
+  const usdValue = Number(token?.usd);
+  if (Number.isFinite(usdValue) && usdValue < minUsd) {
+    return { clear: true, balance: amount, usd: usdValue, dust: true };
+  }
+  return { clear: false, balance: amount, usd: Number.isFinite(usdValue) ? usdValue : null, symbol: token?.symbol };
+}
+
 async function autoSwapToSol(baseMint, { minUsd = 0.01, attempts = 8, delayMs = 4000 } = {}) {
   if (!baseMint || baseMint === config.tokens.SOL || baseMint === "SOL") {
     return { skipped: true, reason: "already SOL" };
@@ -194,6 +215,8 @@ async function autoSwapToSol(baseMint, { minUsd = 0.01, attempts = 8, delayMs = 
 
   let latestSymbol = String(baseMint).slice(0, 8);
   let latestAmount = 0;
+  let lastError = null;
+  let balanceEverSeen = false;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
@@ -204,6 +227,7 @@ async function autoSwapToSol(baseMint, { minUsd = 0.01, attempts = 8, delayMs = 
         if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, delayMs));
         continue;
       }
+      balanceEverSeen = true;
 
       const balances = await getWalletBalances({});
       const token = balances.tokens?.find((entry) => entry.mint === baseMint);
@@ -224,31 +248,113 @@ async function autoSwapToSol(baseMint, { minUsd = 0.01, attempts = 8, delayMs = 
         output_mint: "SOL",
         amount: latestAmount,
       });
-      return {
-        ...swapResult,
-        success: swapResult?.success !== false && !swapResult?.error,
-        symbol: latestSymbol,
-        amount: latestAmount,
-      };
-    } catch (error) {
-      if (attempt === attempts - 1) {
+      if (swapResult?.dry_run) {
+        return { ...swapResult, success: true, symbol: latestSymbol, amount: latestAmount };
+      }
+      if (swapResult?.success === false || swapResult?.error) {
+        // Failed swap — keep retrying instead of giving up on the first attempt.
+        lastError = swapResult?.error || "swap failed";
+        log("executor_warn", `Swap-back attempt ${attempt + 1}/${attempts} for ${latestSymbol} failed: ${lastError}`);
+        if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+
+      // Swap confirmed — but verify the wallet is actually clear before
+      // declaring success (partial fills / late-arriving tokens).
+      const leftover = await verifyWalletClearOfToken(baseMint, { minUsd });
+      if (leftover.clear) {
         return {
-          success: false,
-          error: error.message,
+          ...swapResult,
+          success: true,
+          verified: true,
           symbol: latestSymbol,
           amount: latestAmount,
         };
       }
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      lastError = `post-swap check: ${leftover.balance} ${latestSymbol} ($${leftover.usd ?? "?"}) still in wallet`;
+      log("executor_warn", `${lastError} — retrying swap-back`);
+      // Loop again: next iteration re-reads the balance and swaps the remainder.
+    } catch (error) {
+      lastError = error.message;
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
     }
   }
 
   return {
     success: false,
-    error: "Token balance not detected after close",
+    error: lastError || "Token balance not detected after close",
+    not_detected: !balanceEverSeen && !lastError,
     symbol: latestSymbol,
     amount: latestAmount,
   };
+}
+
+/**
+ * Retry queue for swap-backs that failed or were left partial. Called every
+ * management cycle from index.js — an unswapped token never sits in the
+ * wallet longer than one cycle without a retry.
+ */
+let _pendingSwapsBusy = false;
+export async function processPendingSwaps() {
+  const pending = getPendingSwaps();
+  if (!pending.length) return { processed: 0 };
+  if (_pendingSwapsBusy) return { processed: 0, skipped: "busy" };
+  if (config.spectateMode) return { processed: 0, skipped: "spectate" };
+  if (process.env.DRY_RUN === "true") return { processed: 0, skipped: "dry_run" };
+
+  _pendingSwapsBusy = true;
+  const minUsd = config.management.pendingSwapMinUsd ?? 0.10;
+  let swapped = 0;
+  let cleared = 0;
+
+  try {
+    for (const entry of pending) {
+      try {
+        const balance = await getWalletTokenBalance(entry.mint);
+        const amount = Number(balance?.balance || 0);
+        if (amount <= 0) {
+          removePendingSwap(entry.mint, "wallet clear");
+          cleared++;
+          continue;
+        }
+
+        const balances = await getWalletBalances({});
+        const token = balances.tokens?.find((t) => t.mint === entry.mint);
+        const usdValue = Number(token?.usd);
+        if (Number.isFinite(usdValue) && usdValue < minUsd) {
+          removePendingSwap(entry.mint, `dust ($${usdValue.toFixed(2)})`);
+          cleared++;
+          continue;
+        }
+
+        const symbol = token?.symbol || entry.symbol;
+        log("executor", `Retrying pending swap-back: ${amount} ${symbol} → SOL (attempt ${(entry.attempts || 0) + 1})`);
+        const swapResult = await swapToken({ input_mint: entry.mint, output_mint: "SOL", amount });
+        if (swapResult?.success) {
+          const leftover = await verifyWalletClearOfToken(entry.mint, { minUsd });
+          if (leftover.clear) {
+            removePendingSwap(entry.mint, "swapped to SOL");
+            swapped++;
+            notifySwapBack({ symbol, amount, tx: swapResult.tx, status: "success" }).catch(() => {});
+            continue;
+          }
+          recordSwapAttempt(entry.mint, { error: `partial: ${leftover.balance} ${symbol} still in wallet` });
+        } else {
+          recordSwapAttempt(entry.mint, { error: swapResult?.error || "swap failed" });
+          log("executor_warn", `Pending swap-back for ${symbol} failed: ${swapResult?.error || "unknown error"}`);
+        }
+      } catch (error) {
+        recordSwapAttempt(entry.mint, { error: error.message });
+        log("executor_warn", `Pending swap-back for ${entry.symbol} errored: ${error.message}`);
+      }
+    }
+  } finally {
+    _pendingSwapsBusy = false;
+  }
+
+  return { processed: pending.length, swapped, cleared };
 }
 
 async function parkExcessSolToUsdc({ minUsd = 1, attempts = 4, delayMs = 3000 } = {}) {
@@ -578,6 +684,7 @@ const toolMap = {
       trailingTriggerPct: ["management", "trailingTriggerPct"],
       trailingDropPct: ["management", "trailingDropPct"],
       pnlSanityMaxDiffPct: ["management", "pnlSanityMaxDiffPct"],
+      pendingSwapMinUsd: ["management", "pendingSwapMinUsd"],
       solMode: ["management", "solMode"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
@@ -950,8 +1057,14 @@ export async function executeTool(name, args) {
             if (swapBack?.amount_out) result.sol_received = swapBack.amount_out;
             notifySwapBack({ symbol: swapBack.symbol, amount: swapBack.amount, tx: swapBack.tx, status: "success" }).catch(() => {});
           } else if (!swapBack?.skipped) {
-            log("executor_warn", `Auto-swap after close failed: ${swapBack?.error || "unknown error"}`);
-            notifySwapBack({ symbol: swapBack?.symbol || result.base_mint.slice(0, 8), amount: swapBack?.amount, status: "failed", error: swapBack?.error || "Swap back failed" }).catch(() => {});
+            log("executor_warn", `Auto-swap after close failed: ${swapBack?.error || "unknown error"} — queued for retry`);
+            addPendingSwap({
+              mint: result.base_mint,
+              symbol: swapBack?.symbol,
+              source: "close",
+              reason: swapBack?.error || "swap back failed",
+            });
+            notifySwapBack({ symbol: swapBack?.symbol || result.base_mint.slice(0, 8), amount: swapBack?.amount, status: "failed", error: `${swapBack?.error || "Swap back failed"} — queued for auto-retry next cycle` }).catch(() => {});
           }
         }
         if (!args.skip_swap) {
@@ -977,10 +1090,20 @@ export async function executeTool(name, args) {
           const token = balances.tokens?.find(t => t.mint === result.base_mint);
           if (token && token.usd >= 0.10) {
             log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+            const claimSwap = await autoSwapToSol(result.base_mint, { minUsd: 0.10, attempts: 3 });
+            if (!claimSwap?.success && !claimSwap?.skipped) {
+              log("executor_warn", `Auto-swap after claim failed: ${claimSwap?.error || "unknown error"} — queued for retry`);
+              addPendingSwap({
+                mint: result.base_mint,
+                symbol: claimSwap?.symbol || token.symbol,
+                source: "claim",
+                reason: claimSwap?.error || "swap after claim failed",
+              });
+            }
           }
         } catch (e) {
-          log("executor_warn", `Auto-swap after claim failed: ${e.message}`);
+          log("executor_warn", `Auto-swap after claim failed: ${e.message} — queued for retry`);
+          addPendingSwap({ mint: result.base_mint, source: "claim", reason: e.message });
         }
       }
     }

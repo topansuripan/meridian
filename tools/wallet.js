@@ -199,6 +199,37 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+/**
+ * Poll the RPC until a transaction signature is confirmed/finalized on-chain.
+ * Jupiter's execute response alone has reported success for transactions that
+ * never landed — every swap must pass this check before being trusted.
+ */
+async function confirmSignature(signature, { attempts = 15, delayMs = 3000 } = {}) {
+  const connection = getConnection();
+  let lastReason = "no status returned";
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const { value } = await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      });
+      const status = value?.[0];
+      if (status) {
+        if (status.err) {
+          return { confirmed: false, reason: `on-chain error: ${JSON.stringify(status.err)}` };
+        }
+        if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") {
+          return { confirmed: true, status: status.confirmationStatus };
+        }
+        lastReason = `status=${status.confirmationStatus}`;
+      }
+    } catch (error) {
+      lastReason = error.message;
+    }
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return { confirmed: false, reason: `not confirmed after ${attempts} checks (${lastReason})` };
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
@@ -280,8 +311,17 @@ export async function swapToken({
     if (result.status === "Failed") {
       throw new Error(`Swap failed on-chain: code=${result.code}`);
     }
+    if (!result.signature) {
+      throw new Error(`Swap V2 execute returned no signature (status=${result.status ?? "unknown"})`);
+    }
 
-    log("swap", `SUCCESS tx: ${result.signature}`);
+    // Never trust Jupiter's response alone — require on-chain confirmation.
+    const confirmation = await confirmSignature(result.signature);
+    if (!confirmation.confirmed) {
+      throw new Error(`Swap tx ${result.signature} did not confirm on-chain: ${confirmation.reason}`);
+    }
+
+    log("swap", `SUCCESS tx: ${result.signature} (${confirmation.status})`);
     if (referralParams && order.feeBps !== referralParams.referralFee) {
       log(
         "swap_warn",

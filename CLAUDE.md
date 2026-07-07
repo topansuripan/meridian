@@ -89,6 +89,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
+| pendingSwapMinUsd | management | 0.10 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | management=`MiniMax-M2.7`, screening=`MiniMax-M2.7`, general=`MiniMax-M2.7` |
@@ -336,6 +337,22 @@ A global watch-only mode. Cron cycles keep running and monitoring continues, but
 - `config.js` — `spectateMode` flag + `setSpectateMode(on, configPath?)` (mutates live config, persists to `user-config.json`).
 - `tools/executor.js` — `spectateWouldBlock(name)` predicate + the chokepoint in `executeTool` (blocks `WRITE_TOOLS` while spectating).
 - `index.js` — guards in `runManagementCycle` (SOL-crash observe-only tick, MANAGER LLM skip, deterministic loop skip), the 30s PnL poll (WOULD-close alerts), the screening gates, and the `/spectate` command handler.
+
+---
+
+## Swap Verification & Pending-Swap Retry Queue (July 2026)
+
+**Why**: After closing a position, the base token sometimes stayed unswapped in the wallet and bled value. Three holes: (1) `swapToken` trusted Jupiter's execute response without confirming the tx landed on-chain, (2) nothing verified the wallet was actually clear of the token after a "successful" swap (partial fills / late-arriving tokens), (3) a failed swap-back was only logged once — never retried.
+
+**Three layers of defense:**
+
+1. **On-chain confirmation** (`tools/wallet.js`): `swapToken` now polls `getSignatureStatuses` (up to 15 × 3s, `searchTransactionHistory: true`) after Jupiter's execute and returns `success: false` unless the tx reaches confirmed/finalized with no error. A missing signature is also a failure.
+2. **Post-swap wallet verification** (`tools/executor.js`): `autoSwapToSol` retries failed swaps within its attempt loop (instead of returning on first failure), and after a confirmed swap calls `verifyWalletClearOfToken()` — if the token balance is still above dust (`pendingSwapMinUsd`), it loops and swaps the remainder. Only returns `success: true` when the wallet is verifiably clear. The `claim_fees` auto-swap path routes through `autoSwapToSol` too.
+3. **Persistent retry queue** (`pending-swaps.js`, state in gitignored `pending-swaps.json`): any swap-back that still fails after all attempts is queued via `addPendingSwap()`. `processPendingSwaps()` (executor.js) runs at the start of every management cycle — before the early returns, so it fires even with zero open positions — and retries each queued mint: wallet clear or dust → entry removed; swap succeeds + verified clear → removed + Telegram notify; still failing → attempt recorded, retried next cycle forever. Skipped in spectate mode and DRY_RUN. SOL/USDC can never be queued.
+
+**Config**: `pendingSwapMinUsd` (management, default 0.10) — leftover token value below this is treated as dust and dropped from the queue.
+
+**Tests**: `test-pending-swaps.js` (node:test, gitignored per convention) covers the registry: queue/dedupe, attempt history, SOL/USDC refusal, removal, corrupt-file recovery.
 
 ---
 

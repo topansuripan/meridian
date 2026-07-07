@@ -202,6 +202,7 @@ export const config = {
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    pendingSwapMinUsd:     u.pendingSwapMinUsd     ?? 0.10, // below this, a leftover token is dust — drop from retry queue
     autoParkUsdcAfterClose: u.autoParkUsdcAfterClose ?? true,
     autoFundSolFromUsdc:    u.autoFundSolFromUsdc    ?? true,
     solUsdReserve:          u.solUsdReserve          ?? 8,

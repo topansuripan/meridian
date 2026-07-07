@@ -12,7 +12,7 @@ import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount, setSpectateMode } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getLossCircuitBreakerStatus } from "./lessons.js";
-import { executeTool, registerCronRestarter } from "./tools/executor.js";
+import { executeTool, registerCronRestarter, processPendingSwaps } from "./tools/executor.js";
 import {
   startPolling,
   stopPolling,
@@ -444,6 +444,16 @@ export async function runManagementCycle({ silent = false } = {}) {
   const screeningCooldownMs = 5 * 60 * 1000;
 
   try {
+    // Retry any swap-backs that previously failed or were partial — a token
+    // from a closed position must never sit in the wallet losing value.
+    // Runs before the early returns below so it fires even when there are
+    // no open positions or the position source is down.
+    processPendingSwaps()
+      .then((r) => {
+        if (r?.swapped || r?.cleared) log("cron", `Pending swap retry: ${r.swapped || 0} swapped, ${r.cleared || 0} cleared, ${r.processed} checked`);
+      })
+      .catch((e) => log("cron_error", `Pending swap retry failed: ${e.message}`));
+
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }

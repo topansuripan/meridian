@@ -22,6 +22,7 @@ decision-log.json
 hivemind-cache.json
 signal-weights.json
 sol-crash-state.json
+pending-swaps.json
 
 # Logs
 logs/
