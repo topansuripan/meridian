@@ -75,6 +75,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minHolders | screening | 500 |
 | minMcap / maxMcap | screening | 150k / 10M |
 | minBinStep / maxBinStep | screening | 80 / 125 |
+| minVolatility / maxVolatility | screening | null / null |
 | maxPump5mPct / maxPump15mPct / pumpLookbackHours | screening | 20 / 30 / 2 |
 | timeframe | screening | "5m" |
 | category | screening | "trending" |

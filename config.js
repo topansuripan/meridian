@@ -122,6 +122,8 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    minVolatility:     u.minVolatility     ?? null,  // reject candidates below this vol (null = no gate). Data: <1 = dead PnL
+    maxVolatility:     u.maxVolatility     ?? null,  // reject candidates at/above this vol (exclusive). Data: >=6 = ~0 PnL, concentrated SL risk
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
