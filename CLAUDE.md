@@ -283,6 +283,11 @@ Key non-default values on VPS:
 - `executor.js` now delegates to `getPoolDetail()` from `screening.js` instead of hitting raw Meteora API directly
 - This ensures pool data goes through the same relay path (Agent Meridian) as screening, avoiding data mismatches
 
+### Pool Detail 404 Fallback (July 2026)
+- **Why**: the relay's `/discovery/pools/{addr}` only serves pools currently in its discovery set, so it 404s for a valid pool that has rotated out (or is inconsistently cached — observed: a pool returned detail at 16:49, 404'd 90s later). `getPoolDetail` had no fallback, so a single 404 hard-blocked `deploy_position` via `validateDeployPoolThresholds` and set a 2h cooldown on both pool and token. Recurring: ~2–4×/day.
+- **Fix**: `fetchPoolDiscoveryDetail` (screening.js) keeps the relay as primary (data consistency) but on a 404 / empty body falls back to the direct Meteora universal endpoint (`pool-discovery-api.datapi.meteora.ag/pools?filter_by=pool_address=…`), which serves any pool by address. Non-404 relay errors (5xx/etc.) still propagate — those are genuine failures, not a missing pool.
+- Orchestration lives in `pool-detail-resolver.js` (`resolvePoolDetail({ primary, fallback })`, pure/injectable, unit-tested in `test-pool-detail-resolver.js`). The direct endpoint returns the same field shape (`tvl`, `fee_active_tvl_ratio`, `dlmm_params.bin_step`, `volatility`, `token_x`), and the volatility check reads from the 30m re-fetch (also routed through the fallback), so thresholds verify on real data.
+
 ---
 
 ## SOL-Crash Circuit Breaker (June 2026)

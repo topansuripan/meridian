@@ -6,6 +6,7 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { discoverGmgnPools } from "./gmgn.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { resolvePoolDetail } from "../pool-detail-resolver.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -192,27 +193,40 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
   return res.json();
 }
 
-async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
-  const useServerDiscovery = !!config.api.publicApiKey;
-  const url = useServerDiscovery
-    ? `${config.api.url}/discovery/pools/${poolAddress}?timeframe=${encodeURIComponent(timeframe)}`
-    : `${POOL_DISCOVERY_BASE}/pools?` +
-      `page_size=1` +
-      `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
-      `&timeframe=${timeframe}`;
-
-  const res = await fetch(url, {
-    headers: useServerDiscovery && config.api.publicApiKey
-      ? { "x-api-key": config.api.publicApiKey }
-      : {},
-  });
-
+// Direct Meteora universal pools endpoint — serves any pool by address, not
+// just those in the relay's current discovery set. Used as the primary source
+// when no relay key is configured, and as the fallback when the relay 404s.
+async function fetchPoolDetailDirect({ poolAddress, timeframe }) {
+  const url =
+    `${POOL_DISCOVERY_BASE}/pools?` +
+    `page_size=1` +
+    `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
+    `&timeframe=${timeframe}`;
+  const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
   }
-
   const data = await res.json();
-  return useServerDiscovery ? data : (data.data || [])[0] ?? null;
+  return (data.data || [])[0] ?? null;
+}
+
+async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
+  const useServerDiscovery = !!config.api.publicApiKey;
+  if (!useServerDiscovery) {
+    return fetchPoolDetailDirect({ poolAddress, timeframe });
+  }
+
+  const relayUrl = `${config.api.url}/discovery/pools/${poolAddress}?timeframe=${encodeURIComponent(timeframe)}`;
+  return resolvePoolDetail({
+    primary: async () => {
+      const res = await fetch(relayUrl, { headers: { "x-api-key": config.api.publicApiKey } });
+      return { status: res.status, statusText: res.statusText, pool: res.ok ? await res.json() : null };
+    },
+    fallback: async () => {
+      log("screening_warn", `Relay has no detail for pool ${poolAddress.slice(0, 8)} — falling back to direct Meteora`);
+      return fetchPoolDetailDirect({ poolAddress, timeframe });
+    },
+  });
 }
 
 async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
