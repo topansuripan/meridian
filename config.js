@@ -204,6 +204,7 @@ export const config = {
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
     pendingSwapMinUsd:     u.pendingSwapMinUsd     ?? 0.10, // below this, a leftover token is dust — drop from retry queue
     autoParkUsdcAfterClose: u.autoParkUsdcAfterClose ?? true,
+    autoReconcileWallet:   u.autoReconcileWallet   ?? true, // per-cycle safety-net sweep of stray tokens → SOL
     autoFundSolFromUsdc:    u.autoFundSolFromUsdc    ?? true,
     solUsdReserve:          u.solUsdReserve          ?? 8,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,

@@ -11,6 +11,7 @@ import {
 } from "./dlmm.js";
 import { getWalletBalances, swapToken, waitForWalletTokenBalance, getWalletTokenBalance } from "./wallet.js";
 import { addPendingSwap, recordSwapAttempt, removePendingSwap, getPendingSwaps } from "../pending-swaps.js";
+import { shouldRunPostCloseSweep, reconcileWalletToSol } from "../wallet-reconcile.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction, getTrackedPosition } from "../state.js";
@@ -355,6 +356,36 @@ export async function processPendingSwaps() {
   }
 
   return { processed: pending.length, swapped, cleared };
+}
+
+/**
+ * Safety-net wallet sweep. Swaps any stray non-SOL/USDC token above the dust
+ * threshold back to SOL — backstop for every orphan path (close-verification
+ * lag, relay-zap fallback, late-arriving tokens, process restarts). Called each
+ * management cycle from index.js. Skipped in spectate mode and DRY_RUN.
+ */
+let _reconcileBusy = false;
+export async function reconcileWallet() {
+  if (config.spectateMode) return { skipped: "spectate" };
+  if (process.env.DRY_RUN === "true") return { skipped: "dry_run" };
+  if (config.management.autoReconcileWallet === false) return { skipped: "disabled" };
+  if (_reconcileBusy) return { skipped: "busy" };
+
+  _reconcileBusy = true;
+  try {
+    return await reconcileWalletToSol({
+      getWalletBalances: () => getWalletBalances({}),
+      getOpenPositions: async () => (await getMyPositions({ force: true }))?.positions || [],
+      autoSwapToSol,
+      addPendingSwap,
+      log,
+      minUsd: config.management.pendingSwapMinUsd ?? 0.1,
+      solMint: config.tokens.SOL,
+      usdcMint: config.tokens.USDC,
+    });
+  } finally {
+    _reconcileBusy = false;
+  }
 }
 
 async function parkExcessSolToUsdc({ minUsd = 1, attempts = 4, delayMs = 3000 } = {}) {
@@ -1035,12 +1066,19 @@ export async function executeTool(name, args) {
       success,
     });
 
-      if (success) {
+      // A close whose txs confirmed on-chain but whose position-record recheck
+      // timed out must STILL run the post-close swap-back — the base token is
+      // already in the wallet. Gating it behind strict success stranded tokens.
+      const runCloseSweep = name === "close_position" && shouldRunPostCloseSweep(result);
+      if (success || runCloseSweep) {
         if (name === "swap_token" && result.tx) {
           notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee, baseMint: result.base_mint || args.base_mint }).catch(() => {});
       } else if (name === "close_position") {
+        if (!success && result.verification_timeout) {
+          log("executor_warn", `Close verification timed out for ${result.pool_name || args.position_address?.slice(0, 8)} but close txs confirmed — running post-close swap-back anyway`);
+        }
         const closeTx = result.close_txs?.[result.close_txs.length - 1] ?? result.txs?.[result.txs.length - 1] ?? result.tx ?? null;
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0, tx: closeTx, baseMint: result.base_mint }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying

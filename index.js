@@ -12,7 +12,7 @@ import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount, setSpectateMode } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getLossCircuitBreakerStatus } from "./lessons.js";
-import { executeTool, registerCronRestarter, processPendingSwaps } from "./tools/executor.js";
+import { executeTool, registerCronRestarter, processPendingSwaps, reconcileWallet } from "./tools/executor.js";
 import {
   startPolling,
   stopPolling,
@@ -454,6 +454,15 @@ export async function runManagementCycle({ silent = false } = {}) {
       })
       .catch((e) => log("cron_error", `Pending swap retry failed: ${e.message}`));
 
+    // Safety-net: sweep any stray non-SOL/USDC token left in the wallet back to
+    // SOL — backstop for close-verification lag, relay-zap fallback, and
+    // late-arriving tokens that the close-time swap-back missed.
+    reconcileWallet()
+      .then((r) => {
+        if (r?.swept || r?.queued) log("cron", `Wallet reconcile: ${r.swept || 0} swept, ${r.queued || 0} queued (${r.strays} stray)`);
+      })
+      .catch((e) => log("cron_error", `Wallet reconcile failed: ${e.message}`));
+
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
@@ -605,7 +614,11 @@ export async function runManagementCycle({ silent = false } = {}) {
           : { position_address: p.position };
         await liveMessage?.toolStart(toolName);
         const result = await executeTool(toolName, toolArgs);
-        const success = result?.success !== false && !result?.error && !result?.blocked;
+        // A close whose txs confirmed on-chain but whose position-record recheck
+        // timed out is a successful close (the base token was swept back to SOL);
+        // don't report it as a failure.
+        const success = (result?.success !== false && !result?.error && !result?.blocked)
+          || (toolName === "close_position" && result?.verification_timeout && !result?.blocked);
         await liveMessage?.toolFinish(toolName, result, success);
         if (success) {
           deterministicResults.push(`${act.action} ${p.pair} — ok${act.reason ? ` (${act.reason})` : ""}`);

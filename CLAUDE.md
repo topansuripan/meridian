@@ -90,6 +90,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
 | pendingSwapMinUsd | management | 0.10 |
+| autoReconcileWallet | management | true |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | management=`MiniMax-M2.7`, screening=`MiniMax-M2.7`, general=`MiniMax-M2.7` |
@@ -353,6 +354,23 @@ A global watch-only mode. Cron cycles keep running and monitoring continues, but
 **Config**: `pendingSwapMinUsd` (management, default 0.10) — leftover token value below this is treated as dust and dropped from the queue.
 
 **Tests**: `test-pending-swaps.js` (node:test, gitignored per convention) covers the registry: queue/dedupe, attempt history, SOL/USDC refusal, removal, corrupt-file recovery.
+
+---
+
+## Close-Verification Fix + Wallet Reconcile Sweep (July 2026)
+
+**Why**: A stop-loss close of traindog (`2kcdBw85…`) confirmed its claim + remove-liquidity/close txs on-chain, but the relay lagged so `close_position`'s 4-attempt/~14s position-record recheck (`dlmm.js`) still saw the position and returned `{ success: false, error: "…still appears open after verification window" }`. `executor.js` gated the *entire* post-close pipeline — auto-swap-to-SOL, the retry-queue, and Telegram notifications — behind `if (success)`, so the base token the close had already delivered to the wallet was never swapped, never queued, and never reported. The position closed moments later (`auto-closed — missing from on-chain data`), leaving the token orphaned until the operator swapped it manually. The swap engine itself was fine — a position-record lag was suppressing the sweep.
+
+**Module**: `wallet-reconcile.js` (pure/dependency-injected; no heavy imports so it unit-tests without a wallet).
+
+**Two layers:**
+
+1. **Root fix — decouple the sweep from position-record verification.** `close_position`'s verification-timeout return now carries `verification_timeout: true` + `base_mint` (the close txs are confirmed; only the recheck lagged). `shouldRunPostCloseSweep(result)` returns true for a real success OR for a `verification_timeout` with landed `close_txs`/`txs` + `base_mint`. `executor.js` runs the post-close pipeline when `success || runCloseSweep`, so the base token is swept back to SOL (and queued on failure) even on the lag. `index.js`'s deterministic close loop also treats `verification_timeout` as a successful close so it isn't reported as "failed".
+2. **Safety-net sweep.** `reconcileWalletToSol()` swaps any stray non-SOL/USDC token above `pendingSwapMinUsd` back to SOL — backstop for every orphan path (verification lag, relay-zap fallback, late-arriving tokens, process restarts). Open-position `base_mint`s are protected from sweeping; sub-dust and no-liquidity (non-finite USD) tokens are left alone. Exposed as `reconcileWallet()` in `executor.js` (skips spectate/DRY_RUN, gated by `config.management.autoReconcileWallet`), called each management cycle from `index.js` right after `processPendingSwaps()`.
+
+**Config**: `autoReconcileWallet` (management, default true) — per-cycle safety-net sweep of stray tokens → SOL.
+
+**Tests**: `test-wallet-reconcile.js` (node:test, gitignored per convention) — `shouldRunPostCloseSweep` truth table (success / blocked / genuine failure / verification-timeout with & without base_mint & txs) and `reconcileWalletToSol` (sweeps strays, skips SOL/USDC/dust, protects open positions, queues on swap failure).
 
 ---
 

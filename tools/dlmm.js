@@ -1758,14 +1758,20 @@ export async function closePosition({ position_address, reason }) {
     }
 
     if (!closedConfirmed) {
+      // The close txs confirmed on-chain — only the position-record recheck
+      // lagged (relay/RPC propagation). The base token is already in the
+      // wallet, so flag this as a verification timeout (not a hard failure) and
+      // surface base_mint so the caller can still swap it back to SOL.
       return {
         success: false,
+        verification_timeout: true,
         error: "Close transactions sent but position still appears open after verification window",
         position: position_address,
         pool: poolAddress,
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
         txs: txHashes,
+        base_mint: pool.lbPair.tokenXMint.toString(),
       };
     }
 
