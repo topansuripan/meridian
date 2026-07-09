@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.z.ai)",
+      "WebSearch",
+      "WebFetch(domain:gmgn.ai)",
+      "WebFetch(domain:app.meteora.ag)",
+      "WebFetch(domain:api.geckoterminal.com)",
+      "WebFetch(domain:dlmm-api.meteora.ag)",
+      "WebFetch(domain:pool-discovery-api.datapi.meteora.ag)"
+    ]
+  }
+}
