@@ -184,16 +184,14 @@ export async function getWalletBalances() {
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-// Normalize any SOL-like address to the correct wrapped SOL mint
+// Normalize explicit SOL aliases to the canonical wrapped SOL mint.
+// IMPORTANT: only well-known aliases are coerced. A real SPL token whose
+// mint merely *starts with* "So1" must be left untouched — coercing it to
+// wSOL causes inputMint === outputMint swap-back loops (Jupiter 400).
 export function normalizeMint(mint) {
   if (!mint) return mint;
   const SOL_MINT = "So11111111111111111111111111111111111111112";
-  if (
-    mint === "SOL" || 
-    mint === "native" || 
-    /^So1+$/.test(mint) || 
-    (mint.length >= 32 && mint.length <= 44 && mint.startsWith("So1") && mint !== SOL_MINT)
-  ) {
+  if (mint === "SOL" || mint === "native" || mint === SOL_MINT) {
     return SOL_MINT;
   }
   return mint;
@@ -237,6 +235,19 @@ export async function swapToken({
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
+
+  // A swap where both sides resolve to the same mint is a no-op that Jupiter
+  // rejects with a 400. Short-circuit so a mis-detected stray token cannot get
+  // re-queued into an endless swap-back loop.
+  if (input_mint === output_mint) {
+    return {
+      success: true,
+      skipped: true,
+      reason: "input and output mint identical after normalization",
+      input_mint,
+      output_mint,
+    };
+  }
 
   if (process.env.DRY_RUN === "true") {
     return {

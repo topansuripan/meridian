@@ -928,6 +928,16 @@ async function fetchLpAgentOpenPositions(walletAddress) {
   }
 }
 
+// ─── Tolerant closed-PnL entry matcher ─────────────────────────
+// The Meteora datapi is inconsistent about the position identifier field
+// (positionAddress / address / position) and the container key
+// (positions / data). Match all shapes so closed PnL is never silently 0.
+export function findClosedPnlEntry(data, positionAddress) {
+  return (data?.positions || data?.data || []).find(
+    (p) => (p.positionAddress || p.address || p.position) === positionAddress,
+  );
+}
+
 // ─── Fetch DLMM PnL API for all positions in a pool ────────────
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
@@ -1557,7 +1567,7 @@ export async function closePosition({ position_address, reason }) {
             const res = await fetch(closedUrl);
             if (res.ok) {
               const data = await res.json();
-              const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
+              const posEntry = findClosedPnlEntry(data, position_address);
               if (posEntry) {
                 pnlUsd = parseFloat(posEntry.pnlUsd || 0);
                 pnlPct = parseFloat(posEntry.pnlPctChange || 0);
@@ -1571,6 +1581,27 @@ export async function closePosition({ position_address, reason }) {
           }
         } catch (e) {
           log("close_warn", `Relay closed PnL fetch failed: ${e.message}`);
+        }
+
+        // Fallback to pre-close cache snapshot if the closed API had no data.
+        // The relay path is the prod path (lpAgentRelayEnabled) and previously
+        // had no fallback, so an unsettled/mismatched record left pnl at 0.
+        if (finalValueUsd === 0) {
+          const cachedPos = _positionsCache?.positions?.find((p) => p.position === position_address);
+          if (cachedPos) {
+            pnlUsd     = cachedPos.pnl_true_usd ?? cachedPos.pnl_usd ?? 0;
+            pnlPct     = cachedPos.pnl_pct ?? 0;
+            feesUsd    = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
+            initialUsd = tracked.initial_value_usd || 0;
+            if (initialUsd > 0) {
+              finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
+              pnlPct = (pnlUsd / initialUsd) * 100;
+            } else {
+              finalValueUsd = cachedPos.total_value_true_usd ?? cachedPos.total_value_usd ?? 0;
+              initialUsd = Math.max(0, finalValueUsd + feesUsd - pnlUsd);
+            }
+            log("close_warn", `Using cached pnl fallback for relay close because closed API has not settled yet`);
+          }
         }
 
         await recordPerformance({
@@ -1808,7 +1839,7 @@ export async function closePosition({ position_address, reason }) {
           const res = await fetch(closedUrl);
           if (res.ok) {
             const data = await res.json();
-            const posEntry = (data.positions || []).find(p => p.positionAddress === position_address);
+            const posEntry = findClosedPnlEntry(data, position_address);
             if (posEntry) {
               const nextPnlUsd = parseFloat(posEntry.pnlUsd || 0);
               const nextPnlPct = parseFloat(posEntry.pnlPctChange || 0);

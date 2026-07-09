@@ -8,6 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { shouldRunPostCloseSweep, reconcileWalletToSol } from "./wallet-reconcile.js";
+import { normalizeMint, swapToken } from "./tools/wallet.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -70,6 +71,35 @@ test("does NOT run on verification timeout when no txs landed", () => {
     }),
     false,
   );
+});
+
+// ── normalizeMint / swapToken same-mint guard (stuck swap-back loop) ────────
+
+// A real SPL token mint (44 chars, valid length range) that happens to start
+// with "So1" but is NOT wSOL. The old greedy normalizeMint coerced exactly this.
+const SO1_LOOKALIKE = "So1eFakeTokenMintNotWrappedSo1234567aBCDEFGh";
+
+test("normalizeMint coerces explicit SOL aliases to wSOL", () => {
+  assert.equal(normalizeMint("SOL"), SOL_MINT);
+  assert.equal(normalizeMint("native"), SOL_MINT);
+  assert.equal(normalizeMint(SOL_MINT), SOL_MINT);
+});
+
+test("normalizeMint does NOT coerce a 'So1'-prefixed non-wSOL token to wSOL", () => {
+  // Regression: the old greedy startsWith('So1') / /^So1+$/ logic turned this
+  // real token into wSOL, collapsing inputMint === outputMint on swap-back.
+  assert.equal(normalizeMint(SO1_LOOKALIKE), SO1_LOOKALIKE);
+  assert.notEqual(normalizeMint(SO1_LOOKALIKE), SOL_MINT);
+  // The lookalike and real SOL must stay distinct so a swap-back is a real swap.
+  assert.notEqual(normalizeMint(SO1_LOOKALIKE), normalizeMint(SOL_MINT));
+});
+
+test("swapToken short-circuits when input and output normalize to the same mint", async () => {
+  const res = await swapToken({ input_mint: SOL_MINT, output_mint: "SOL", amount: 0.5 });
+  assert.equal(res.skipped, true);
+  assert.equal(res.success, true);
+  assert.equal(res.input_mint, SOL_MINT);
+  assert.equal(res.output_mint, SOL_MINT);
 });
 
 // ── reconcileWalletToSol ───────────────────────────────────────────────────
