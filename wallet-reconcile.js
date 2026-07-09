@@ -47,7 +47,16 @@ export async function reconcileWalletToSol({
   const balances = await getWalletBalances();
   const tokens = Array.isArray(balances?.tokens) ? balances.tokens : [];
 
-  const protectedMints = new Set([solMint, usdcMint, "SOL", "USDC"]);
+  const protectedMints = new Set([
+    solMint,
+    usdcMint,
+    "SOL",
+    "USDC",
+    // Helius returns native SOL balance with this non-canonical mint
+    // (44 × '1', no trailing '2'). Without it, every reconcile cycle tries
+    // to swap the wallet's own SOL back to SOL.
+    "So11111111111111111111111111111111111111111",
+  ]);
   try {
     const positions = (await getOpenPositions?.()) || [];
     for (const p of positions) {

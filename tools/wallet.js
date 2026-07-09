@@ -191,7 +191,7 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 export function normalizeMint(mint) {
   if (!mint) return mint;
   const SOL_MINT = "So11111111111111111111111111111111111111112";
-  if (mint === "SOL" || mint === "native" || mint === SOL_MINT) {
+  if (mint === "SOL" || mint === "native" || mint === SOL_MINT || mint === "So11111111111111111111111111111111111111111") {
     return SOL_MINT;
   }
   return mint;
