@@ -252,6 +252,13 @@ async function autoSwapToSol(baseMint, { minUsd = 0.01, attempts = 8, delayMs = 
       if (swapResult?.dry_run) {
         return { ...swapResult, success: true, symbol: latestSymbol, amount: latestAmount };
       }
+      if (swapResult?.skipped) {
+        return {
+          ...swapResult,
+          symbol: latestSymbol,
+          amount: latestAmount,
+        };
+      }
       if (swapResult?.success === false || swapResult?.error) {
         // Failed swap — keep retrying instead of giving up on the first attempt.
         lastError = swapResult?.error || "swap failed";
@@ -333,6 +340,11 @@ export async function processPendingSwaps() {
         const symbol = token?.symbol || entry.symbol;
         log("executor", `Retrying pending swap-back: ${amount} ${symbol} → SOL (attempt ${(entry.attempts || 0) + 1})`);
         const swapResult = await swapToken({ input_mint: entry.mint, output_mint: "SOL", amount });
+        if (swapResult?.skipped) {
+          removePendingSwap(entry.mint, swapResult.reason || "swap skipped (same-mint or dust)");
+          cleared++;
+          continue;
+        }
         if (swapResult?.success) {
           const leftover = await verifyWalletClearOfToken(entry.mint, { minUsd });
           if (leftover.clear) {
