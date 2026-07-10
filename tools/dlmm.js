@@ -1407,6 +1407,21 @@ export async function claimFees({ position_address }) {
     const pool = await getPool(poolAddress);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
+
+    // Snapshot the unclaimed fee USD *before* claiming — this is the value
+    // actually being collected by claimSwapFee, so it's what recordClaim
+    // should attribute to this claim event.
+    let feesUsd = 0;
+    try {
+      const livePositions = await getMyPositions({ silent: true });
+      const livePosition = livePositions?.positions?.find((p) => p.position === position_address);
+      if (livePosition) {
+        feesUsd = livePosition.unclaimed_fees_true_usd ?? livePosition.unclaimed_fees_usd ?? 0;
+      }
+    } catch (e) {
+      log("claim_warn", `Could not read unclaimed fee USD before claim: ${e.message}`);
+    }
+
     const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
       position: positionData,
@@ -1423,7 +1438,7 @@ export async function claimFees({ position_address }) {
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
+    recordClaim(position_address, feesUsd);
 
     return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
   } catch (error) {
@@ -1443,6 +1458,18 @@ export async function closePosition({ position_address, reason }) {
 
   try {
     log("close", `Closing position: ${position_address}`);
+
+    // Pre-close liveness check: if the position account no longer exists on-chain
+    // (or is no longer owned by the DLMM program), it was already closed. Record
+    // the close, force fresh discovery, and short-circuit before sending a relay order.
+    const DLMM_PROGRAM_ID = getDlmmProgramId();
+    const info = await getConnection().getAccountInfo(new PublicKey(position_address), "confirmed");
+    if (!info || !info.owner.equals(DLMM_PROGRAM_ID)) {
+      recordClose(position_address, reason || "already closed on-chain");
+      _positionsCacheAt = 0; // force fresh discovery next time
+      return { success: true, already_closed: true, position: position_address };
+    }
+
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
@@ -1457,6 +1484,19 @@ export async function closePosition({ position_address, reason }) {
       ];
       const livePositions = await getMyPositions({ force: true, silent: true });
       const livePosition = livePositions?.positions?.find((position) => position.position === position_address);
+      // Snapshot live PnL BEFORE the close-confirmation loop trashes _positionsCache.
+      // Used as the fallback if the closed-PnL API hasn't settled after the close.
+      const snapshotPnl = livePosition
+        ? {
+            pnl_true_usd: livePosition.pnl_true_usd,
+            pnl_usd: livePosition.pnl_usd,
+            pnl_pct: livePosition.pnl_pct,
+            total_value_true_usd: livePosition.total_value_true_usd,
+            total_value_usd: livePosition.total_value_usd,
+            collected_fees_true_usd: livePosition.collected_fees_true_usd,
+            unclaimed_fees_true_usd: livePosition.unclaimed_fees_true_usd,
+          }
+        : null;
       const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
       const closeToBinId = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
       const closeOutput = "allToken1";
@@ -1587,20 +1627,22 @@ export async function closePosition({ position_address, reason }) {
         // The relay path is the prod path (lpAgentRelayEnabled) and previously
         // had no fallback, so an unsettled/mismatched record left pnl at 0.
         if (finalValueUsd === 0) {
-          const cachedPos = _positionsCache?.positions?.find((p) => p.position === position_address);
-          if (cachedPos) {
-            pnlUsd     = cachedPos.pnl_true_usd ?? cachedPos.pnl_usd ?? 0;
-            pnlPct     = cachedPos.pnl_pct ?? 0;
-            feesUsd    = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
+          // Use the pre-close snapshot captured before the confirmation loop, NOT
+          // _positionsCache — the loop's force-refresh drops the now-closed position
+          // from the cache, so re-reading it here would find nothing.
+          if (snapshotPnl) {
+            pnlUsd     = snapshotPnl.pnl_true_usd ?? snapshotPnl.pnl_usd ?? 0;
+            pnlPct     = snapshotPnl.pnl_pct ?? 0;
+            feesUsd    = (snapshotPnl.collected_fees_true_usd || 0) + (snapshotPnl.unclaimed_fees_true_usd || 0);
             initialUsd = tracked.initial_value_usd || 0;
             if (initialUsd > 0) {
               finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
               pnlPct = (pnlUsd / initialUsd) * 100;
             } else {
-              finalValueUsd = cachedPos.total_value_true_usd ?? cachedPos.total_value_usd ?? 0;
+              finalValueUsd = snapshotPnl.total_value_true_usd ?? snapshotPnl.total_value_usd ?? 0;
               initialUsd = Math.max(0, finalValueUsd + feesUsd - pnlUsd);
             }
-            log("close_warn", `Using cached pnl fallback for relay close because closed API has not settled yet`);
+            log("close_warn", `Using pre-close pnl snapshot for relay close because closed API has not settled yet`);
           }
         }
 

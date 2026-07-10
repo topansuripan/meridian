@@ -2336,7 +2336,8 @@ async function deployLatestCandidate(index) {
     volatility: candidate.volatility,
     fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
     organic_score: candidate.organic_score,
-    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+    // Actual deposit value at open time (deployed SOL × SOL price), NOT pool TVL.
+    initial_value_usd: walletBal?.sol_price > 0 ? deployAmount * walletBal.sol_price : null,
   });
   if (result?.success === false || result?.error) {
     throw new Error(result.error || "Deploy failed");
