@@ -91,6 +91,32 @@ function getVolatilityTimeframe(sourceTimeframe) {
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
 }
 
+/**
+ * Deploy-gate min-token-age check. Pure — pass nowMs for testability
+ * (see test-token-age-gate.js).
+ *
+ * Screening already filters young tokens when minTokenAgeHours is set, but the
+ * deploy gate never rechecked age — stale/side-channel candidates could slip
+ * through (2026-07-12/13: HOME and Bison were both <24h-old tokens that rugged).
+ * Missing created_at never blocks (matches the pump-guard policy); strict when
+ * data is present. Accepts epoch ms, epoch seconds, or ISO strings.
+ *
+ * @returns {string|null} block reason, or null to allow
+ */
+export function getTokenAgeGateReason(detail, s, nowMs = Date.now()) {
+  const minAgeHours = s?.minTokenAgeHours;
+  if (minAgeHours == null || !(minAgeHours > 0)) return null;
+  const raw = detail?.token_x?.created_at ?? detail?.base_token_created_at ?? null;
+  let createdAt = typeof raw === "string" && !/^\d+$/.test(raw.trim()) ? Date.parse(raw) : numeric(raw);
+  if (createdAt == null || !Number.isFinite(createdAt) || createdAt <= 0) return null; // missing data never blocks
+  if (createdAt < 1e12) createdAt *= 1000; // seconds epoch → ms
+  const ageHours = (nowMs - createdAt) / 3_600_000;
+  if (ageHours < minAgeHours) {
+    return `Token age ${ageHours.toFixed(1)}h is below minTokenAgeHours ${minAgeHours}h — young tokens are rug-prone.`;
+  }
+  return null;
+}
+
 function getRawPoolScreeningRejectReason(pool, s) {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};

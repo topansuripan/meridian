@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates, detectRecentPump, fetchPoolOhlcv, resolvePumpThreshold } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, detectRecentPump, fetchPoolOhlcv, resolvePumpThreshold, getTokenAgeGateReason } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -1244,6 +1244,14 @@ async function runSafetyChecks(name, args) {
       // SOL-crash breaker: block NORMAL deploys while parked (degen unaffected)
       if (!isDegen && solGuardCoolingDown()) {
         return { pass: false, reason: "SOL-crash circuit breaker active — normal deploys paused until SOL stabilizes." };
+      }
+
+      // Min token age gate (NORMAL only, degen exempt): young tokens are rug-prone.
+      // Rechecked here because stale/side-channel candidates can bypass the screening
+      // filter (2026-07-12/13: HOME and Bison were both <24h-old tokens that rugged).
+      if (!isDegen) {
+        const ageReason = getTokenAgeGateReason(poolThresholds.detail, config.screening);
+        if (ageReason) return { pass: false, reason: ageReason };
       }
 
       // Pump entry guard: refuse NORMAL deploys when the token pumped sharply in the recent window

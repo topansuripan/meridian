@@ -380,6 +380,16 @@ A global watch-only mode. Cron cycles keep running and monitoring continues, but
 
 ---
 
+## Loss Quarantine + Min-Token-Age Deploy Gate (July 2026)
+
+**Why**: Post-mortem of the record 2-day drawdown (Jul 11–12: −$21, all of it from 3 stop-loss closes). Two holes: (1) the `risk.lossQuarantine*` config keys existed in config.js / `update_config` / the `/status` line but were read by **nothing** — after a stop-loss the agent could immediately revenge-redeploy into the same token (observed: HOME-SOL deployed **5x in ~4h** on Jul 12, final leg gapped −17.42% in one 30s poll window, −$11). (2) The deploy gate never rechecked token age — HOME and Bison were both <24h-old tokens that rugged; screening's `minTokenAgeHours` filter can be bypassed by stale/side-channel candidates.
+
+- **Loss quarantine (now enforced)**: `evaluateLossQuarantine(deploys, config.risk)` in `pool-memory.js` (pure, unit-tested in `test-pool-memory-loss-cooldown.js`), called from `recordPoolDeploy()`. A deploy is a *qualifying loss* if its close reason matches stop-loss (reason match catches fee-offset PnL above the pct threshold) OR `pnl_pct <= lossQuarantineMinPnlPct`; range events (OOR / "pumped far above range") are exempt — the OOR cooldown handles those. When the last `lossQuarantineTriggerCount` deploys all qualify, both the pool and the base mint get a `lossQuarantineHours` cooldown (screening already filters via `isPoolOnCooldown`/`isBaseMintOnCooldown`). Defaults: 2x / 24h / −8%. VPS runs 1x / 24h / −5%.
+- **Min-token-age deploy gate**: `getTokenAgeGateReason(detail, config.screening)` in `screening.js` (pure, unit-tested in `test-token-age-gate.js`), enforced in `runSafetyChecks()` for NORMAL deploys (degen exempt, same as the pump guard). Missing `created_at` never blocks; accepts ms/seconds epoch or ISO strings. VPS: `minTokenAgeHours` raised 6 → 48.
+- **Loss breaker retuned**: `maxDailyLossUsd` 80 → 10 on the VPS (80 allowed a −67% day on a ~$120 book before pausing; Jul 12 bled −$15.8 without tripping). The breaker itself was verified live (`getLossCircuitBreakerStatus` in lessons.js, gates both screening paths).
+
+---
+
 ## Known Issues / Tech Debt
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
