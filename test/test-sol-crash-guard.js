@@ -371,3 +371,17 @@ test("tryReenter stays parked when USDC->SOL re-entry swap fails", async () => {
   } });
   assert.equal(s.breaker.active, true, "must not clear the breaker on a failed re-entry swap");
 });
+
+test("tick observeOnly records price + reports wouldTrip without acting", async () => {
+  const now = 10_000_000_000_000;
+  // seed 6 prior hours flat at 68, then a -4.6% drop to 64.9 "now"
+  const g = await import("../sol-crash-guard.js");
+  g.__resetStateForTests();
+  for (let i = 6; i >= 1; i--) g.recordSolPrice(68, now - i * 3600_000);
+  const deps = mkDeps();
+  const res = await g.tick({ now, solPrice: 64.9, observeOnly: true, deps });
+  assert.equal(res.wouldTrip, true, "reports it would trip");
+  assert.match(res.reason, /1h/);
+  assert.equal(deps.closed.length, 0, "observeOnly must NOT close anything");
+  assert.equal(g.isCoolingDown(now), false, "breaker not activated in observe mode");
+});

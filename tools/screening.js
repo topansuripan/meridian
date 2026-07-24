@@ -6,10 +6,12 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { discoverGmgnPools } from "./gmgn.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { resolvePoolDetail } from "../pool-detail-resolver.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const METEORA_OHLCV_BASE = "https://dlmm.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
@@ -45,6 +47,12 @@ function scoreCandidate(pool) {
 function numeric(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+// Resolve a pump-guard threshold: null/undefined means "guard disabled" (must stay null,
+// NOT coerce to 0 like numeric() would). Otherwise coerce to a finite number or null.
+export function resolvePumpThreshold(raw) {
+  return raw == null ? null : numeric(raw);
 }
 
 function isUsableVolatility(value) {
@@ -83,6 +91,32 @@ function getVolatilityTimeframe(sourceTimeframe) {
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
 }
 
+/**
+ * Deploy-gate min-token-age check. Pure — pass nowMs for testability
+ * (see test-token-age-gate.js).
+ *
+ * Screening already filters young tokens when minTokenAgeHours is set, but the
+ * deploy gate never rechecked age — stale/side-channel candidates could slip
+ * through (2026-07-12/13: HOME and Bison were both <24h-old tokens that rugged).
+ * Missing created_at never blocks (matches the pump-guard policy); strict when
+ * data is present. Accepts epoch ms, epoch seconds, or ISO strings.
+ *
+ * @returns {string|null} block reason, or null to allow
+ */
+export function getTokenAgeGateReason(detail, s, nowMs = Date.now()) {
+  const minAgeHours = s?.minTokenAgeHours;
+  if (minAgeHours == null || !(minAgeHours > 0)) return null;
+  const raw = detail?.token_x?.created_at ?? detail?.base_token_created_at ?? null;
+  let createdAt = typeof raw === "string" && !/^\d+$/.test(raw.trim()) ? Date.parse(raw) : numeric(raw);
+  if (createdAt == null || !Number.isFinite(createdAt) || createdAt <= 0) return null; // missing data never blocks
+  if (createdAt < 1e12) createdAt *= 1000; // seconds epoch → ms
+  const ageHours = (nowMs - createdAt) / 3_600_000;
+  if (ageHours < minAgeHours) {
+    return `Token age ${ageHours.toFixed(1)}h is below minTokenAgeHours ${minAgeHours}h — young tokens are rug-prone.`;
+  }
+  return null;
+}
+
 function getRawPoolScreeningRejectReason(pool, s) {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
@@ -119,6 +153,12 @@ function getRawPoolScreeningRejectReason(pool, s) {
   }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
+  }
+  if (s.minVolatility != null && volatility < s.minVolatility) {
+    return `volatility ${volatility} below minVolatility ${s.minVolatility}`;
+  }
+  if (s.maxVolatility != null && volatility >= s.maxVolatility) {
+    return `volatility ${volatility} at/above maxVolatility ${s.maxVolatility}`;
   }
   if (baseOrganic == null || baseOrganic < s.minOrganic) {
     return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
@@ -185,27 +225,40 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
   return res.json();
 }
 
-async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
-  const useServerDiscovery = !!config.api.publicApiKey;
-  const url = useServerDiscovery
-    ? `${config.api.url}/discovery/pools/${poolAddress}?timeframe=${encodeURIComponent(timeframe)}`
-    : `${POOL_DISCOVERY_BASE}/pools?` +
-      `page_size=1` +
-      `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
-      `&timeframe=${timeframe}`;
-
-  const res = await fetch(url, {
-    headers: useServerDiscovery && config.api.publicApiKey
-      ? { "x-api-key": config.api.publicApiKey }
-      : {},
-  });
-
+// Direct Meteora universal pools endpoint — serves any pool by address, not
+// just those in the relay's current discovery set. Used as the primary source
+// when no relay key is configured, and as the fallback when the relay 404s.
+async function fetchPoolDetailDirect({ poolAddress, timeframe }) {
+  const url =
+    `${POOL_DISCOVERY_BASE}/pools?` +
+    `page_size=1` +
+    `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
+    `&timeframe=${timeframe}`;
+  const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
   }
-
   const data = await res.json();
-  return useServerDiscovery ? data : (data.data || [])[0] ?? null;
+  return (data.data || [])[0] ?? null;
+}
+
+async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
+  const useServerDiscovery = !!config.api.publicApiKey;
+  if (!useServerDiscovery) {
+    return fetchPoolDetailDirect({ poolAddress, timeframe });
+  }
+
+  const relayUrl = `${config.api.url}/discovery/pools/${poolAddress}?timeframe=${encodeURIComponent(timeframe)}`;
+  return resolvePoolDetail({
+    primary: async () => {
+      const res = await fetch(relayUrl, { headers: { "x-api-key": config.api.publicApiKey } });
+      return { status: res.status, statusText: res.statusText, pool: res.ok ? await res.json() : null };
+    },
+    fallback: async () => {
+      log("screening_warn", `Relay has no detail for pool ${poolAddress.slice(0, 8)} — falling back to direct Meteora`);
+      return fetchPoolDetailDirect({ poolAddress, timeframe });
+    },
+  });
 }
 
 async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
@@ -775,6 +828,37 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
     }
   }
 
+  // Pump entry guard — drop candidates that pumped sharply in the recent window (normal screens only).
+  // Degen passes screeningOverrides with these set to null, so it is exempt.
+  const pumpSingle = (screeningOverrides && "maxPump5mPct" in screeningOverrides)
+    ? resolvePumpThreshold(screeningOverrides.maxPump5mPct)
+    : resolvePumpThreshold(config.screening.maxPump5mPct);
+  const pump15m = (screeningOverrides && "maxPump15mPct" in screeningOverrides)
+    ? resolvePumpThreshold(screeningOverrides.maxPump15mPct)
+    : resolvePumpThreshold(config.screening.maxPump15mPct);
+  const pumpLookback = resolvePumpThreshold(config.screening.pumpLookbackHours) ?? 2;
+  if ((pumpSingle != null || pump15m != null) && eligible.length > 0) {
+    const pumpResults = await Promise.allSettled(
+      eligible.map((p) => fetchPoolOhlcv(p.pool, { lookbackHours: pumpLookback })),
+    );
+    const before = eligible.length;
+    const kept = [];
+    for (let i = 0; i < eligible.length; i++) {
+      const p = eligible[i];
+      const candles = pumpResults[i].status === "fulfilled" ? pumpResults[i].value : null;
+      const pump = detectRecentPump(candles, { maxSingle5mPct: pumpSingle, max15mPct: pump15m });
+      if (pump) p.recent_pump_5m_pct = pump.maxSingle5mPct; // surface to LLM as context
+      if (pump?.pumped) {
+        log("screening", `Pump guard: dropped ${p.name} — +${pump.maxSingle5mPct}% 5m / +${pump.max15mPct}% 15m at ${pump.at ?? "recent"}`);
+        pushFilteredReason(filteredOut, p, `recent pump +${pump.maxSingle5mPct}% 5m / +${pump.max15mPct}% 15m`);
+        continue;
+      }
+      kept.push(p);
+    }
+    eligible.splice(0, eligible.length, ...kept);
+    if (eligible.length < before) log("screening", `Pump guard removed ${before - eligible.length} candidate(s)`);
+  }
+
   return {
     candidates: eligible,
     total_screened: discovery.total ?? pools.length,
@@ -782,6 +866,60 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
     filtered_examples: filteredOut.slice(0, 3),
     stage_counts: discovery.stage_counts ? { ranked: discovery.total, ...discovery.stage_counts } : null,
     all_filtered: filteredOut,
+  };
+}
+
+/**
+ * Fetch a pool's 5m OHLCV candles over a trailing window.
+ * The window math (start/end) assumes 5m candles — the detector downstream is 5m-only.
+ * Passing an explicit start/end returns the full ~24 candles for 2h; the no-param API
+ * default would cap at ~10, which is why we always send the window.
+ * Returns the candle array (oldest→newest) or null on failure / no data.
+ */
+export async function fetchPoolOhlcv(poolAddress, { timeframe = "5m", lookbackHours = 2, now = null } = {}) {
+  if (!poolAddress) return null;
+  const end = Number.isFinite(now) ? Math.floor(now) : Math.floor(Date.now() / 1000);
+  const start = end - Math.round(lookbackHours * 3600);
+  const url = `${METEORA_OHLCV_BASE}/pools/${poolAddress}/ohlcv?timeframe=${encodeURIComponent(timeframe)}&start_time=${start}&end_time=${end}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`OHLCV ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.data) ? data.data : null;
+}
+
+/**
+ * Pure pump detector. Scans 5m candles for the largest single-candle rise (close/open)
+ * and the largest rolling 15m (3-candle) rise. Returns null when there is no usable data
+ * (caller treats null as "allow"). Only price rises count: drops and candles with a
+ * non-positive open/close are never treated as pumps. Volume is not inspected.
+ */
+export function detectRecentPump(candles, { maxSingle5mPct, max15mPct } = {}) {
+  if (!Array.isArray(candles) || candles.length === 0) return null;
+
+  let maxSingle = 0, maxSingleAt = null;
+  for (const c of candles) {
+    const o = Number(c?.open), cl = Number(c?.close);
+    if (!(o > 0) || !(cl > 0)) continue;
+    const rise = (cl / o - 1) * 100;
+    if (rise > maxSingle) { maxSingle = rise; maxSingleAt = c.timestamp_str || c.timestamp || null; }
+  }
+
+  let max15m = 0, max15mAt = null;
+  for (let i = 2; i < candles.length; i++) {
+    const base = Number(candles[i - 2]?.open), top = Number(candles[i]?.close);
+    if (!(base > 0) || !(top > 0)) continue;
+    const rise = (top / base - 1) * 100;
+    if (rise > max15m) { max15m = rise; max15mAt = candles[i].timestamp_str || candles[i].timestamp || null; }
+  }
+
+  const single = Number.isFinite(maxSingle5mPct) && maxSingle5mPct != null && maxSingle >= maxSingle5mPct;
+  const fifteen = Number.isFinite(max15mPct) && max15mPct != null && max15m >= max15mPct;
+
+  return {
+    pumped: single || fifteen,
+    maxSingle5mPct: Number(maxSingle.toFixed(1)),
+    max15mPct: Number(max15m.toFixed(1)),
+    at: single ? maxSingleAt : (fifteen ? max15mAt : null),
   };
 }
 

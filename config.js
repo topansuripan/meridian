@@ -80,6 +80,9 @@ function gmgnArray(key, legacyKey, fallback) {
 }
 
 export const config = {
+  // ─── Spectate (watch-only) Mode ──────────
+  spectateMode: u.spectateMode ?? false,
+
   // ─── Risk Limits ─────────────────────────
   risk: {
     maxPositions:    u.maxPositions    ?? 2,
@@ -119,6 +122,8 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    minVolatility:     u.minVolatility     ?? null,  // reject candidates below this vol (null = no gate). Data: <1 = dead PnL
+    maxVolatility:     u.maxVolatility     ?? null,  // reject candidates at/above this vol (exclusive). Data: >=6 = ~0 PnL, concentrated SL risk
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
@@ -134,6 +139,10 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    // Pump entry guard — reject entries after a sharp recent pump (wash/parabolic tell). null = off.
+    maxPump5mPct:       u.maxPump5mPct        ?? 20,  // reject if any single 5m candle in lookback rose >= this %
+    maxPump15mPct:      u.maxPump15mPct       ?? 30,  // reject if any rolling 15m (3-candle) window rose >= this %
+    pumpLookbackHours:  u.pumpLookbackHours   ?? 2,   // trailing window of 5m candles to scan
   },
 
   gmgn: {
@@ -195,7 +204,9 @@ export const config = {
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    pendingSwapMinUsd:     u.pendingSwapMinUsd     ?? 0.10, // below this, a leftover token is dust — drop from retry queue
     autoParkUsdcAfterClose: u.autoParkUsdcAfterClose ?? true,
+    autoReconcileWallet:   u.autoReconcileWallet   ?? true, // per-cycle safety-net sweep of stray tokens → SOL
     autoFundSolFromUsdc:    u.autoFundSolFromUsdc    ?? true,
     solUsdReserve:          u.solUsdReserve          ?? 8,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
@@ -379,6 +390,21 @@ export function computeDeployAmount(walletSol, openPositions = 0) {
 }
 
 /**
+ * Toggle spectate (watch-only) mode: mutate the live config and persist to
+ * user-config.json (preserving all other keys). `configPath` override is for tests.
+ */
+export function setSpectateMode(on, configPath = USER_CONFIG_PATH) {
+  config.spectateMode = !!on;
+  let uc = {};
+  try { if (fs.existsSync(configPath)) uc = JSON.parse(fs.readFileSync(configPath, "utf8")); }
+  catch { /* start from empty on parse error */ }
+  uc.spectateMode = !!on;
+  try { fs.writeFileSync(configPath, JSON.stringify(uc, null, 2)); }
+  catch (e) { /* live flag still applied */ }
+  return config.spectateMode;
+}
+
+/**
  * Reload user-config.json and apply updated screening thresholds to the
  * in-memory config object. Called after threshold evolution so the next
  * agent cycle uses the evolved values without a restart.
@@ -409,6 +435,9 @@ export function reloadScreeningThresholds() {
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
+    if (fresh.maxPump5mPct      !== undefined) s.maxPump5mPct     = fresh.maxPump5mPct;
+    if (fresh.maxPump15mPct     !== undefined) s.maxPump15mPct    = fresh.maxPump15mPct;
+    if (fresh.pumpLookbackHours !== undefined) s.pumpLookbackHours = fresh.pumpLookbackHours;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;

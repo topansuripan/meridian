@@ -5,6 +5,7 @@
   "llmApiKey": "",
   "llmModel": "minimax/minimax-m2.7",
   "dryRun": true,
+  "spectateMode": false,
 
   "deployAmountSol": 0.5,
   "maxPositions": 3,
@@ -62,6 +63,9 @@
   "minTokenAgeHours": null,
   "maxTokenAgeHours": null,
   "athFilterPct": null,
+  "maxPump5mPct": 20,
+  "maxPump15mPct": 30,
+  "pumpLookbackHours": 2,
   "screeningSource": "meteora",
 
   "minClaimAmount": 5,

@@ -10,9 +10,9 @@ import { getWalletBalances, swapToken } from "./tools/wallet.js";
 import * as solCrashGuard from "./sol-crash-guard.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, setSpectateMode } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getLossCircuitBreakerStatus } from "./lessons.js";
-import { executeTool, registerCronRestarter } from "./tools/executor.js";
+import { executeTool, registerCronRestarter, processPendingSwaps, reconcileWallet } from "./tools/executor.js";
 import {
   startPolling,
   stopPolling,
@@ -27,7 +27,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, shouldSendAlert } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
@@ -444,10 +444,37 @@ export async function runManagementCycle({ silent = false } = {}) {
   const screeningCooldownMs = 5 * 60 * 1000;
 
   try {
+    // Retry any swap-backs that previously failed or were partial — a token
+    // from a closed position must never sit in the wallet losing value.
+    // Runs before the early returns below so it fires even when there are
+    // no open positions or the position source is down.
+    processPendingSwaps()
+      .then((r) => {
+        if (r?.swapped || r?.cleared) log("cron", `Pending swap retry: ${r.swapped || 0} swapped, ${r.cleared || 0} cleared, ${r.processed} checked`);
+      })
+      .catch((e) => log("cron_error", `Pending swap retry failed: ${e.message}`));
+
+    // Safety-net: sweep any stray non-SOL/USDC token left in the wallet back to
+    // SOL — backstop for close-verification lag, relay-zap fallback, and
+    // late-arriving tokens that the close-time swap-back missed.
+    reconcileWallet()
+      .then((r) => {
+        if (r?.swept || r?.queued) log("cron", `Wallet reconcile: ${r.swept || 0} swept, ${r.queued || 0} queued (${r.strays} stray)`);
+      })
+      .catch((e) => log("cron_error", `Wallet reconcile failed: ${e.message}`));
+
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const livePositions = await getMyPositions({ force: true }).catch((e) => ({ error: e?.message || String(e) }));
+
+    // Surface fetch/wallet errors instead of silently masking them as "no positions".
+    if (livePositions?.error) {
+      log("cron_error", `Management cycle: could not read positions (${livePositions.error}) — skipping this cycle (no screening triggered)`);
+      mgmtReport = `Management cycle skipped: could not read positions (${livePositions.error}).`;
+      return mgmtReport;
+    }
+
     const allPositions = livePositions?.positions || [];
 
     // Skip degen-tagged positions — they're managed by the degen management cycle
@@ -456,7 +483,17 @@ export async function runManagementCycle({ silent = false } = {}) {
       : allPositions;
 
     if (positions.length === 0) {
-      log("cron", "No open positions — triggering screening cycle");
+      // Explain WHY there is nothing to manage. If state tracks open positions but the live
+      // source returned none, that's a fetch/indexing problem — not an empty wallet.
+      const trackedOpen = getTrackedPositions(true).length;
+      const degenFiltered = allPositions.length - positions.length;
+      log("cron", `No open positions to manage — source returned ${allPositions.length} (${degenFiltered} degen-filtered), state tracks ${trackedOpen} open`);
+      if (trackedOpen > 0 && allPositions.length === 0) {
+        log("cron_error", `State tracks ${trackedOpen} open position(s) but the positions source returned 0 — likely a relay/indexing or fetch issue, NOT an empty wallet. Skipping screening to avoid over-deploying.`);
+        mgmtReport = `No positions from source, but state tracks ${trackedOpen} open — suspected fetch/relay issue. Screening skipped.`;
+        return mgmtReport;
+      }
+      log("cron", "Triggering screening cycle");
       mgmtReport = "No open positions. Triggering screening cycle.";
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       return mgmtReport;
@@ -565,7 +602,9 @@ export async function runManagementCycle({ silent = false } = {}) {
       return a.action === "CLOSE" || a.action === "CLAIM";
     });
     const deterministicResults = [];
-    if (deterministicActions.length > 0) {
+    if (config.spectateMode && deterministicActions.length > 0) {
+      log("spectate", "Deterministic close/claim loop skipped (spectate mode).");
+    } else if (deterministicActions.length > 0) {
       log("cron", `Management: ${deterministicActions.length} hardcoded action(s) — executing directly`);
       for (const p of deterministicActions) {
         const act = actionMap.get(p.position);
@@ -575,7 +614,11 @@ export async function runManagementCycle({ silent = false } = {}) {
           : { position_address: p.position };
         await liveMessage?.toolStart(toolName);
         const result = await executeTool(toolName, toolArgs);
-        const success = result?.success !== false && !result?.error && !result?.blocked;
+        // A close whose txs confirmed on-chain but whose position-record recheck
+        // timed out is a successful close (the base token was swept back to SOL);
+        // don't report it as a failure.
+        const success = (result?.success !== false && !result?.error && !result?.blocked)
+          || (toolName === "close_position" && result?.verification_timeout && !result?.blocked);
         await liveMessage?.toolFinish(toolName, result, success);
         if (success) {
           deterministicResults.push(`${act.action} ${p.pair} — ok${act.reason ? ` (${act.reason})` : ""}`);
@@ -603,7 +646,12 @@ export async function runManagementCycle({ silent = false } = {}) {
         ].filter(Boolean).join("\n");
       }).join("\n\n");
 
-      const { content } = await agentLoop(`
+      let content;
+      if (config.spectateMode) {
+        log("spectate", "Management LLM step skipped (spectate mode) — monitoring only.");
+        content = "👁 [SPECTATE] Instruction review skipped — monitoring only, no action taken.";
+      } else {
+        ({ content } = await agentLoop(`
 MANAGEMENT INSTRUCTION REVIEW — ${instructionPositions.length} position(s)
 
 ${actionBlocks}
@@ -617,9 +665,10 @@ RULES:
 Execute only the instruction-driven actions that are truly met.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
-        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
-      });
+          onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+          onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+        }));
+      }
 
       mgmtReport += `${deterministicResults.length ? `\n\nExecuted:\n- ${deterministicResults.join("\n- ")}` : ""}\n\n${content}`;
     } else {
@@ -646,8 +695,9 @@ After executing, write a brief one-line result per position.
     // Wrapped in its own try/catch so a guard failure can never break management.
     try {
       const bal = await getWalletBalances();
-      await solCrashGuard.tick({
+      const tickRes = await solCrashGuard.tick({
         solPrice: bal.sol_price,
+        observeOnly: config.spectateMode,
         deps: {
           getNormalOpenPositions: async () => {
             const live = await getMyPositions({ force: true, silent: true }).catch(() => ({ positions: [] }));
@@ -679,6 +729,9 @@ After executing, write a brief one-line result per position.
           notify: (text) => sendMessage(text),
         },
       });
+      if (config.spectateMode && tickRes?.wouldTrip && shouldSendAlert("spectate_breaker", 30 * 60_000)) {
+        await sendMessage(`⚠️ [SPECTATE] WOULD trigger SOL-crash breaker — ${tickRes.reason}. No action taken.`).catch(() => {});
+      }
     } catch (e) {
       log("cron_error", `SOL-crash guard tick failed: ${e.message}`);
     }
@@ -748,10 +801,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
       cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
     });
-    if (lossBreaker.triggered || solCrashGuard.isCoolingDown()) {
-      const reason = lossBreaker.triggered
-        ? formatLossCircuitBreakerReason(lossBreaker)
-        : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
+    if (lossBreaker.triggered || solCrashGuard.isCoolingDown() || config.spectateMode) {
+      const reason = config.spectateMode
+        ? "Spectate mode — screening/deploys paused"
+        : lossBreaker.triggered
+          ? formatLossCircuitBreakerReason(lossBreaker)
+          : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
       log("cron", `Screening paused by loss circuit breaker — ${reason}`);
       screenReport = `Screening paused — ${reason}.\nManagement stays active on existing positions.`;
       appendDecision({
@@ -1190,6 +1245,8 @@ function buildDegenScreeningOverrides() {
     minFeeActiveTvlRatio: d.minFeeActiveTvlRatio,
     minTokenAgeHours:     d.minTokenAgeHours,
     excludeHighSupplyConcentration: d.excludeHighSupplyConcentration,
+    maxPump5mPct:         null,  // degen chases pumps — pump guard disabled
+    maxPump15mPct:        null,
   };
 }
 
@@ -1217,7 +1274,11 @@ export async function runDegenManagementCycle() {
   let report = null;
 
   try {
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
+    const livePositions = await getMyPositions({ force: true }).catch((e) => ({ error: e?.message || String(e) }));
+    if (livePositions?.error) {
+      log("degen", `Degen management: could not read positions (${livePositions.error}) — skipping this cycle`);
+      return null;
+    }
     const positions = livePositions?.positions || [];
 
     // Only manage positions tagged as degen
@@ -1531,8 +1592,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
-            log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
-            runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            if (config.spectateMode) {
+              if (shouldSendAlert(`spectate_exit:${p.position}:${exit.reason || "exit"}`, 20 * 60_000)) {
+                await sendMessage(`👁 [SPECTATE] WOULD close ${p.pair} — ${exit.reason} (PnL ${p.pnl_pct ?? "?"}%). No action taken.`).catch(() => {});
+              }
+            } else {
+              log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
+              runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            }
           } else {
             log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
           }
@@ -1544,8 +1611,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
-            log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — triggering management`);
-            runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            if (config.spectateMode) {
+              if (shouldSendAlert(`spectate_exit:${p.position}:${closeRule.reason || "exit"}`, 20 * 60_000)) {
+                await sendMessage(`👁 [SPECTATE] WOULD close ${p.pair} — ${closeRule.reason} (PnL ${p.pnl_pct ?? "?"}%). No action taken.`).catch(() => {});
+              }
+            } else {
+              log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — triggering management`);
+              runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
+            }
           } else {
             log("state", `[PnL poll] Deterministic close rule: ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
           }
@@ -2173,6 +2246,7 @@ function formatHelpText() {
     "/hive pull — manual HiveMind pull now",
     "/pause — stop cron cycles",
     "/resume — start cron cycles again",
+    "/spectate on|off — watch-only mode (cycles run, no actions)",
     "/stop — shut down agent",
   ].join("\n");
 }
@@ -2183,10 +2257,12 @@ async function runDeterministicScreen(limit = 5) {
     maxConsecutiveLosses: config.risk.maxConsecutiveLosses,
     cooldownAfterLossMinutes: config.risk.cooldownAfterLossMinutes,
   });
-  if (lossBreaker.triggered || solCrashGuard.isCoolingDown()) {
-    const reason = lossBreaker.triggered
-      ? formatLossCircuitBreakerReason(lossBreaker)
-      : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
+  if (lossBreaker.triggered || solCrashGuard.isCoolingDown() || config.spectateMode) {
+    const reason = config.spectateMode
+      ? "Spectate mode — screening/deploys paused"
+      : lossBreaker.triggered
+        ? formatLossCircuitBreakerReason(lossBreaker)
+        : "SOL-crash circuit breaker active — screening paused until SOL stabilizes";
     return `Screening paused — ${reason}.\nManagement stays active on existing positions.`;
   }
   const top = await getTopCandidates({ limit });
@@ -2260,7 +2336,8 @@ async function deployLatestCandidate(index) {
     volatility: candidate.volatility,
     fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
     organic_score: candidate.organic_score,
-    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+    // Actual deposit value at open time (deployed SOL × SOL price), NOT pool TVL.
+    initial_value_usd: walletBal?.sol_price > 0 ? deployAmount * walletBal.sol_price : null,
   });
   if (result?.success === false || result?.error) {
     throw new Error(result.error || "Deploy failed");
@@ -2541,6 +2618,22 @@ async function telegramHandler(msg) {
     } else {
       const status = _degenEnabled ? "ON" : "OFF";
       await sendMessage(`Degen mode: ${status}\nMax positions: ${config.degen.maxPositions}\nVolume: $${config.degen.minVolume} | SL: ${config.degen.stopLossPct}% | TP: ${config.degen.takeProfitPct}%\nOOR close: ${config.degen.outOfRangeWaitMinutes}m`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/spectate" || text === "/spectate on" || text === "/spectate off") {
+    if (text === "/spectate on" || text === "/spectate off") {
+      const on = text.endsWith(" on");
+      setSpectateMode(on);
+      await sendMessage(
+        on
+          ? "👁 Spectate mode ON — monitoring continues, but NO actions: no SL/TP/close, no deploys, no claims/swaps, SOL-crash breaker stands down. You'll get '⚠️/👁 WOULD …' alerts.\n\nCycles still run — this is NOT /pause. Use /spectate off to resume automation."
+          : "▶️ Spectate mode OFF — automation resumed on the next cycle."
+      ).catch(() => {});
+    } else {
+      const live = await getMyPositions({ silent: true }).catch(() => ({ total_positions: 0 }));
+      await sendMessage(`👁 Spectate mode is ${config.spectateMode ? "ON" : "OFF"}. Open positions: ${live?.total_positions ?? "?"}.`).catch(() => {});
     }
     return;
   }

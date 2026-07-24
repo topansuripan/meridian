@@ -75,6 +75,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minHolders | screening | 500 |
 | minMcap / maxMcap | screening | 150k / 10M |
 | minBinStep / maxBinStep | screening | 80 / 125 |
+| minVolatility / maxVolatility | screening | null / null |
+| maxPump5mPct / maxPump15mPct / pumpLookbackHours | screening | 20 / 30 / 2 |
 | timeframe | screening | "5m" |
 | category | screening | "trending" |
 | minTokenFeesSol | screening | 30 |
@@ -88,6 +90,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
+| pendingSwapMinUsd | management | 0.10 |
+| autoReconcileWallet | management | true |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | management=`MiniMax-M2.7`, screening=`MiniMax-M2.7`, general=`MiniMax-M2.7` |
@@ -117,6 +121,7 @@ Before `deploy_position` executes:
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
+- Recent-pump guard (NORMAL only): refuses deploy if the pool's last `pumpLookbackHours` (2h) of 5m candles contain a single candle that rose ≥ `maxPump5mPct` (20%) or a 15m (3-candle) window that rose ≥ `maxPump15mPct` (30%). Data: Meteora 5m OHLCV (`fetchPoolOhlcv`/`detectRecentPump` in screening.js). Wash/parabolic tell — calibrated to the ALON loss (2026-06-29: +24.5% 5m candle one bar before entry → −7.53% stop). Degen exempt; missing data never blocks. Enforced at the deploy gate (executor.js) and as a screening filter in `getTopCandidates` (degen opts out via `buildDegenScreeningOverrides`).
 
 ---
 
@@ -144,6 +149,7 @@ Handled directly in `index.js` (bypass LLM):
 | `/positions` | List open positions with progress bar |
 | `/close <n>` | Close position by list index |
 | `/set <n> <note>` | Set note on position by list index |
+| `/spectate on\|off` | Toggle watch-only mode (cycles keep running, no actions); bare `/spectate` reports state |
 
 Progress bar format: `[████████░░░░░░░░░░░░] 40%` (no bin numbers, no arrows)
 
@@ -278,6 +284,11 @@ Key non-default values on VPS:
 - `executor.js` now delegates to `getPoolDetail()` from `screening.js` instead of hitting raw Meteora API directly
 - This ensures pool data goes through the same relay path (Agent Meridian) as screening, avoiding data mismatches
 
+### Pool Detail 404 Fallback (July 2026)
+- **Why**: the relay's `/discovery/pools/{addr}` only serves pools currently in its discovery set, so it 404s for a valid pool that has rotated out (or is inconsistently cached — observed: a pool returned detail at 16:49, 404'd 90s later). `getPoolDetail` had no fallback, so a single 404 hard-blocked `deploy_position` via `validateDeployPoolThresholds` and set a 2h cooldown on both pool and token. Recurring: ~2–4×/day.
+- **Fix**: `fetchPoolDiscoveryDetail` (screening.js) keeps the relay as primary (data consistency) but on a 404 / empty body falls back to the direct Meteora universal endpoint (`pool-discovery-api.datapi.meteora.ag/pools?filter_by=pool_address=…`), which serves any pool by address. Non-404 relay errors (5xx/etc.) still propagate — those are genuine failures, not a missing pool.
+- Orchestration lives in `pool-detail-resolver.js` (`resolvePoolDetail({ primary, fallback })`, pure/injectable, unit-tested in `test-pool-detail-resolver.js`). The direct endpoint returns the same field shape (`tvl`, `fee_active_tvl_ratio`, `dlmm_params.bin_step`, `volatility`, `token_x`), and the volatility check reads from the 30m re-fetch (also routed through the fallback), so thresholds verify on real data.
+
 ---
 
 ## SOL-Crash Circuit Breaker (June 2026)
@@ -307,6 +318,75 @@ Key non-default values on VPS:
 - `index.js` `runManagementCycle()` — calls `solCrashGuard.tick({ solPrice, deps })` (samples price, then trips or re-enters); `backfillSolHistory()` runs once at boot.
 - `tools/executor.js` `runSafetyChecks()` — gates `deploy_position`: blocks NORMAL deploys with `{ pass: false, reason }` while `solGuardCoolingDown()` is true (degen unaffected).
 - `index.js` screening gates (`runScreeningCycle` and `runDeterministicScreen`) — pause normal screening alongside the existing `lossBreaker.triggered` check.
+
+---
+
+## Spectate Mode (June 2026)
+
+A global watch-only mode. Cron cycles keep running and monitoring continues, but the agent takes **no** fund/position action — instead it emits "WOULD …" Telegram alerts so the operator acts manually.
+
+**What it suppresses (when `config.spectateMode` is true):**
+- **ALL write tools** via the `executeTool` chokepoint — `deploy_position`, `close_position`, `claim_fees`, `swap_token` return `{ blocked: true, reason: "Spectate mode — …" }` without executing (no SL/TP/close, no deploys, no claims/swaps). This is the hard enforcement layer; everything below is decision-site short-circuiting for cleaner behavior/alerts.
+- **Screening + deploys** — both screening gates (`runScreeningCycle`, `runDeterministicScreen`) pause, same as the loss/SOL-crash breakers.
+- **SOL-crash breaker stands down** — `solCrashGuard.tick()` runs with `observeOnly: true` (records price, reports `wouldTrip`, takes no action); a throttled `⚠️ [SPECTATE] WOULD trigger SOL-crash breaker` alert fires instead.
+- **MANAGER LLM step** is skipped (monitoring only).
+- **Deterministic close/claim loop** in `runManagementCycle` is skipped entirely (logs once: `Deterministic close/claim loop skipped (spectate mode).`) — avoids per-cycle "failed (Spectate mode…)" noise from the chokepoint.
+
+**What continues:** position fetch, PnL, OOR detection, pool-memory snapshots, and `👁 [SPECTATE] WOULD close …` alerts from the 30s PnL poll exit/close-rule sites.
+
+**Differs from `/pause`:** `/pause` stops the cron cycles entirely; spectate keeps cycles running (monitoring + alerts) and only suppresses actions.
+
+**Toggle:** `/spectate on|off` Telegram command (bare `/spectate` reports current state + open-position count). Persists via `setSpectateMode(on)` in `config.js`.
+
+**Config key:** `spectateMode` (top-level in `user-config.json`, default `false`).
+
+**Integration points:**
+- `config.js` — `spectateMode` flag + `setSpectateMode(on, configPath?)` (mutates live config, persists to `user-config.json`).
+- `tools/executor.js` — `spectateWouldBlock(name)` predicate + the chokepoint in `executeTool` (blocks `WRITE_TOOLS` while spectating).
+- `index.js` — guards in `runManagementCycle` (SOL-crash observe-only tick, MANAGER LLM skip, deterministic loop skip), the 30s PnL poll (WOULD-close alerts), the screening gates, and the `/spectate` command handler.
+
+---
+
+## Swap Verification & Pending-Swap Retry Queue (July 2026)
+
+**Why**: After closing a position, the base token sometimes stayed unswapped in the wallet and bled value. Three holes: (1) `swapToken` trusted Jupiter's execute response without confirming the tx landed on-chain, (2) nothing verified the wallet was actually clear of the token after a "successful" swap (partial fills / late-arriving tokens), (3) a failed swap-back was only logged once — never retried.
+
+**Three layers of defense:**
+
+1. **On-chain confirmation** (`tools/wallet.js`): `swapToken` now polls `getSignatureStatuses` (up to 15 × 3s, `searchTransactionHistory: true`) after Jupiter's execute and returns `success: false` unless the tx reaches confirmed/finalized with no error. A missing signature is also a failure.
+2. **Post-swap wallet verification** (`tools/executor.js`): `autoSwapToSol` retries failed swaps within its attempt loop (instead of returning on first failure), and after a confirmed swap calls `verifyWalletClearOfToken()` — if the token balance is still above dust (`pendingSwapMinUsd`), it loops and swaps the remainder. Only returns `success: true` when the wallet is verifiably clear. The `claim_fees` auto-swap path routes through `autoSwapToSol` too.
+3. **Persistent retry queue** (`pending-swaps.js`, state in gitignored `pending-swaps.json`): any swap-back that still fails after all attempts is queued via `addPendingSwap()`. `processPendingSwaps()` (executor.js) runs at the start of every management cycle — before the early returns, so it fires even with zero open positions — and retries each queued mint: wallet clear or dust → entry removed; swap succeeds + verified clear → removed + Telegram notify; still failing → attempt recorded, retried next cycle forever. Skipped in spectate mode and DRY_RUN. SOL/USDC can never be queued.
+
+**Config**: `pendingSwapMinUsd` (management, default 0.10) — leftover token value below this is treated as dust and dropped from the queue.
+
+**Tests**: `test-pending-swaps.js` (node:test, gitignored per convention) covers the registry: queue/dedupe, attempt history, SOL/USDC refusal, removal, corrupt-file recovery.
+
+---
+
+## Close-Verification Fix + Wallet Reconcile Sweep (July 2026)
+
+**Why**: A stop-loss close of traindog (`2kcdBw85…`) confirmed its claim + remove-liquidity/close txs on-chain, but the relay lagged so `close_position`'s 4-attempt/~14s position-record recheck (`dlmm.js`) still saw the position and returned `{ success: false, error: "…still appears open after verification window" }`. `executor.js` gated the *entire* post-close pipeline — auto-swap-to-SOL, the retry-queue, and Telegram notifications — behind `if (success)`, so the base token the close had already delivered to the wallet was never swapped, never queued, and never reported. The position closed moments later (`auto-closed — missing from on-chain data`), leaving the token orphaned until the operator swapped it manually. The swap engine itself was fine — a position-record lag was suppressing the sweep.
+
+**Module**: `wallet-reconcile.js` (pure/dependency-injected; no heavy imports so it unit-tests without a wallet).
+
+**Two layers:**
+
+1. **Root fix — decouple the sweep from position-record verification.** `close_position`'s verification-timeout return now carries `verification_timeout: true` + `base_mint` (the close txs are confirmed; only the recheck lagged). `shouldRunPostCloseSweep(result)` returns true for a real success OR for a `verification_timeout` with landed `close_txs`/`txs` + `base_mint`. `executor.js` runs the post-close pipeline when `success || runCloseSweep`, so the base token is swept back to SOL (and queued on failure) even on the lag. `index.js`'s deterministic close loop also treats `verification_timeout` as a successful close so it isn't reported as "failed".
+2. **Safety-net sweep.** `reconcileWalletToSol()` swaps any stray non-SOL/USDC token above `pendingSwapMinUsd` back to SOL — backstop for every orphan path (verification lag, relay-zap fallback, late-arriving tokens, process restarts). Open-position `base_mint`s are protected from sweeping; sub-dust and no-liquidity (non-finite USD) tokens are left alone. Exposed as `reconcileWallet()` in `executor.js` (skips spectate/DRY_RUN, gated by `config.management.autoReconcileWallet`), called each management cycle from `index.js` right after `processPendingSwaps()`.
+
+**Config**: `autoReconcileWallet` (management, default true) — per-cycle safety-net sweep of stray tokens → SOL.
+
+**Tests**: `test-wallet-reconcile.js` (node:test, gitignored per convention) — `shouldRunPostCloseSweep` truth table (success / blocked / genuine failure / verification-timeout with & without base_mint & txs) and `reconcileWalletToSol` (sweeps strays, skips SOL/USDC/dust, protects open positions, queues on swap failure).
+
+---
+
+## Loss Quarantine + Min-Token-Age Deploy Gate (July 2026)
+
+**Why**: Post-mortem of the record 2-day drawdown (Jul 11–12: −$21, all of it from 3 stop-loss closes). Two holes: (1) the `risk.lossQuarantine*` config keys existed in config.js / `update_config` / the `/status` line but were read by **nothing** — after a stop-loss the agent could immediately revenge-redeploy into the same token (observed: HOME-SOL deployed **5x in ~4h** on Jul 12, final leg gapped −17.42% in one 30s poll window, −$11). (2) The deploy gate never rechecked token age — HOME and Bison were both <24h-old tokens that rugged; screening's `minTokenAgeHours` filter can be bypassed by stale/side-channel candidates.
+
+- **Loss quarantine (now enforced)**: `evaluateLossQuarantine(deploys, config.risk)` in `pool-memory.js` (pure, unit-tested in `test-pool-memory-loss-cooldown.js`), called from `recordPoolDeploy()`. A deploy is a *qualifying loss* if its close reason matches stop-loss (reason match catches fee-offset PnL above the pct threshold) OR `pnl_pct <= lossQuarantineMinPnlPct`; range events (OOR / "pumped far above range") are exempt — the OOR cooldown handles those. When the last `lossQuarantineTriggerCount` deploys all qualify, both the pool and the base mint get a `lossQuarantineHours` cooldown (screening already filters via `isPoolOnCooldown`/`isBaseMintOnCooldown`). Defaults: 2x / 24h / −8%. VPS runs 1x / 24h / −5%.
+- **Min-token-age deploy gate**: `getTokenAgeGateReason(detail, config.screening)` in `screening.js` (pure, unit-tested in `test-token-age-gate.js`), enforced in `runSafetyChecks()` for NORMAL deploys (degen exempt, same as the pump guard). Missing `created_at` never blocks; accepts ms/seconds epoch or ISO strings. VPS: `minTokenAgeHours` raised 6 → 48.
+- **Loss breaker retuned**: `maxDailyLossUsd` 80 → 10 on the VPS (80 allowed a −67% day on a ~$120 book before pausing; Jul 12 bled −$15.8 without tripping). The breaker itself was verified live (`getLossCircuitBreakerStatus` in lessons.js, gates both screening paths).
 
 ---
 

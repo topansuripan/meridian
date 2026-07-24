@@ -184,19 +184,48 @@ export async function getWalletBalances() {
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-// Normalize any SOL-like address to the correct wrapped SOL mint
+// Normalize explicit SOL aliases to the canonical wrapped SOL mint.
+// IMPORTANT: only well-known aliases are coerced. A real SPL token whose
+// mint merely *starts with* "So1" must be left untouched — coercing it to
+// wSOL causes inputMint === outputMint swap-back loops (Jupiter 400).
 export function normalizeMint(mint) {
   if (!mint) return mint;
   const SOL_MINT = "So11111111111111111111111111111111111111112";
-  if (
-    mint === "SOL" || 
-    mint === "native" || 
-    /^So1+$/.test(mint) || 
-    (mint.length >= 32 && mint.length <= 44 && mint.startsWith("So1") && mint !== SOL_MINT)
-  ) {
+  if (mint === "SOL" || mint === "native" || mint === SOL_MINT || mint === "So11111111111111111111111111111111111111111") {
     return SOL_MINT;
   }
   return mint;
+}
+
+/**
+ * Poll the RPC until a transaction signature is confirmed/finalized on-chain.
+ * Jupiter's execute response alone has reported success for transactions that
+ * never landed — every swap must pass this check before being trusted.
+ */
+async function confirmSignature(signature, { attempts = 15, delayMs = 3000 } = {}) {
+  const connection = getConnection();
+  let lastReason = "no status returned";
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const { value } = await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      });
+      const status = value?.[0];
+      if (status) {
+        if (status.err) {
+          return { confirmed: false, reason: `on-chain error: ${JSON.stringify(status.err)}` };
+        }
+        if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") {
+          return { confirmed: true, status: status.confirmationStatus };
+        }
+        lastReason = `status=${status.confirmationStatus}`;
+      }
+    } catch (error) {
+      lastReason = error.message;
+    }
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return { confirmed: false, reason: `not confirmed after ${attempts} checks (${lastReason})` };
 }
 
 export async function swapToken({
@@ -206,6 +235,19 @@ export async function swapToken({
 }) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
+
+  // A swap where both sides resolve to the same mint is a no-op that Jupiter
+  // rejects with a 400. Short-circuit so a mis-detected stray token cannot get
+  // re-queued into an endless swap-back loop.
+  if (input_mint === output_mint) {
+    return {
+      success: true,
+      skipped: true,
+      reason: "input and output mint identical after normalization",
+      input_mint,
+      output_mint,
+    };
+  }
 
   if (process.env.DRY_RUN === "true") {
     return {
@@ -280,8 +322,17 @@ export async function swapToken({
     if (result.status === "Failed") {
       throw new Error(`Swap failed on-chain: code=${result.code}`);
     }
+    if (!result.signature) {
+      throw new Error(`Swap V2 execute returned no signature (status=${result.status ?? "unknown"})`);
+    }
 
-    log("swap", `SUCCESS tx: ${result.signature}`);
+    // Never trust Jupiter's response alone — require on-chain confirmation.
+    const confirmation = await confirmSignature(result.signature);
+    if (!confirmation.confirmed) {
+      throw new Error(`Swap tx ${result.signature} did not confirm on-chain: ${confirmation.reason}`);
+    }
+
+    log("swap", `SUCCESS tx: ${result.signature} (${confirmation.status})`);
     if (referralParams && order.feeBps !== referralParams.referralFee) {
       log(
         "swap_warn",

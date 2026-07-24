@@ -59,6 +59,47 @@ function isFeeGeneratingDeploy(deploy) {
   return Number.isFinite(feeEarnedPct) && feeEarnedPct >= minFeeEarnedPct;
 }
 
+/**
+ * Loss quarantine — decide whether the recent deploy history on a pool should
+ * quarantine the token (block re-entry). Pure — no I/O — so it is unit-testable
+ * (see test-pool-memory-loss-cooldown.js).
+ *
+ * Enforces the `risk.lossQuarantine*` config keys, which previously existed
+ * (config.js, update_config, /status line) but were read by NOTHING — the agent
+ * could revenge-redeploy into a token that just stopped it out (observed
+ * 2026-07-12: HOME-SOL deployed 5x in ~4h, -$11 total).
+ *
+ * A deploy counts as a qualifying loss if its close reason is a stop-loss, OR
+ * its PnL <= lossQuarantineMinPnlPct and it wasn't a range event (OOR /
+ * "pumped far above range" — those are handled by the OOR cooldown). Quarantine
+ * triggers when the last `lossQuarantineTriggerCount` deploys all qualify.
+ *
+ * @param {Array} deploys — the pool's deploy history, oldest first
+ * @returns {{ hours: number, reason: string } | null}
+ */
+export function evaluateLossQuarantine(deploys, riskConfig = config.risk) {
+  const triggerCount = Math.floor(Number(riskConfig?.lossQuarantineTriggerCount ?? 2));
+  const hours = Number(riskConfig?.lossQuarantineHours ?? 24);
+  if (!(triggerCount >= 1) || !(hours > 0)) return null; // 0/negative = disabled
+  const minPnlPct = Number(riskConfig?.lossQuarantineMinPnlPct ?? -8);
+  if (!Array.isArray(deploys) || deploys.length < triggerCount) return null;
+
+  const isQualifyingLoss = (d) => {
+    const reasonText = String(d?.close_reason || "");
+    if (/stop\s*loss/i.test(reasonText)) return true;
+    if (isAdjustedWinRateExcludedReason(reasonText)) return false; // range events exempt
+    return d?.pnl_pct != null && Number(d.pnl_pct) <= minPnlPct;
+  };
+
+  const recent = deploys.slice(-triggerCount);
+  if (!recent.every(isQualifyingLoss)) return null;
+  const lastPnl = recent[recent.length - 1]?.pnl_pct;
+  return {
+    hours,
+    reason: `loss quarantine (${triggerCount}x losing close${triggerCount > 1 ? "s" : ""}, last PnL ${lastPnl ?? "?"}%)`,
+  };
+}
+
 function setPoolCooldown(entry, hours, reason) {
   const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
   entry.cooldown_until = cooldownUntil;
@@ -241,6 +282,20 @@ export function recordPoolDeploy(poolAddress, deployData) {
         if (mintCooldownUntil) {
           log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
         }
+      }
+    }
+  }
+
+  // Loss quarantine (risk.lossQuarantine*) — losing closes block re-entry into this token
+  // so the agent can't revenge-redeploy into a loser (2026-07-12: HOME-SOL 5x in ~4h).
+  const quarantine = evaluateLossQuarantine(entry.deploys, config.risk);
+  if (quarantine) {
+    const poolCooldownUntil = setPoolCooldown(entry, quarantine.hours, quarantine.reason);
+    log("pool-memory", `Quarantine set for ${entry.name} until ${poolCooldownUntil} (${quarantine.reason})`);
+    if (entry.base_mint) {
+      const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, quarantine.hours, quarantine.reason);
+      if (mintCooldownUntil) {
+        log("pool-memory", `Base mint quarantine set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${quarantine.reason})`);
       }
     }
   }

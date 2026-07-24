@@ -928,6 +928,16 @@ async function fetchLpAgentOpenPositions(walletAddress) {
   }
 }
 
+// ─── Tolerant closed-PnL entry matcher ─────────────────────────
+// The Meteora datapi is inconsistent about the position identifier field
+// (positionAddress / address / position) and the container key
+// (positions / data). Match all shapes so closed PnL is never silently 0.
+export function findClosedPnlEntry(data, positionAddress) {
+  return (data?.positions || data?.data || []).find(
+    (p) => (p.positionAddress || p.address || p.position) === positionAddress,
+  );
+}
+
 // ─── Fetch DLMM PnL API for all positions in a pool ────────────
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
@@ -1118,15 +1128,24 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
           agentId: getAgentIdForRequests(),
         });
         const normalizedPositions = Array.isArray(result.positions) ? result.positions : [];
-        syncOpenPositions(normalizedPositions.map((p) => p.position));
-        _positionsCache = {
-          wallet: walletAddress,
-          total_positions: Number(result.total_positions || 0),
-          positions: normalizedPositions,
-          request_id: result.requestId || null,
-        };
-        _positionsCacheAt = Date.now();
-        return _positionsCache;
+        if (normalizedPositions.length === 0) {
+          // Deploys use the local Meteora SDK path (shouldUseLpAgentRelayForDeploy === false),
+          // so a freshly-deployed position may not be indexed by the relay yet. Do NOT trust an
+          // empty relay result — fall through to the Meteora portfolio API (on-chain discovery)
+          // before concluding "no positions". Otherwise management is blind to positions it just
+          // opened locally.
+          if (!silent) log("positions_warn", "Agent Meridian relay returned 0 positions — verifying against Meteora portfolio API (on-chain) before concluding empty");
+        } else {
+          syncOpenPositions(normalizedPositions.map((p) => p.position));
+          _positionsCache = {
+            wallet: walletAddress,
+            total_positions: Number(result.total_positions || 0),
+            positions: normalizedPositions,
+            request_id: result.requestId || null,
+          };
+          _positionsCacheAt = Date.now();
+          return _positionsCache;
+        }
       } catch (error) {
         log("positions_warn", `Agent Meridian relay failed; falling back to Meteora/local positions path: ${error.message}`);
       }
@@ -1388,6 +1407,21 @@ export async function claimFees({ position_address }) {
     const pool = await getPool(poolAddress);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
+
+    // Snapshot the unclaimed fee USD *before* claiming — this is the value
+    // actually being collected by claimSwapFee, so it's what recordClaim
+    // should attribute to this claim event.
+    let feesUsd = 0;
+    try {
+      const livePositions = await getMyPositions({ silent: true });
+      const livePosition = livePositions?.positions?.find((p) => p.position === position_address);
+      if (livePosition) {
+        feesUsd = livePosition.unclaimed_fees_true_usd ?? livePosition.unclaimed_fees_usd ?? 0;
+      }
+    } catch (e) {
+      log("claim_warn", `Could not read unclaimed fee USD before claim: ${e.message}`);
+    }
+
     const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
       position: positionData,
@@ -1404,13 +1438,48 @@ export async function claimFees({ position_address }) {
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
+    recordClaim(position_address, feesUsd);
 
     return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
   }
+}
+
+// ─── PnL Fallback Derivation ───────────────────────────────────
+// Derive a consistent PnL record from a pre-close live-position snapshot.
+// Used whenever the authoritative closed-PnL API hasn't settled yet: as the
+// closePosition fallback AND on the verification-timeout paths. Centralising it
+// here means a close never reports a bogus $0.00 when we already snapshotted the
+// live PnL before sending the close txs.
+//
+// `snapshot` is a live-position record (fields: pnl_true_usd / pnl_usd /
+// pnl_pct / total_value_true_usd / total_value_usd / collected_fees_true_usd /
+// unclaimed_fees_true_usd). `tracked` supplies initial_value_usd when known.
+// Returns { pnlUsd, pnlPct, feesUsd, finalValueUsd, initialUsd, derived }.
+export function derivePnlFromSnapshot(snapshot, tracked = {}) {
+  if (!snapshot) {
+    return { pnlUsd: 0, pnlPct: 0, feesUsd: 0, finalValueUsd: 0, initialUsd: 0, derived: false };
+  }
+
+  const pnlUsd = snapshot.pnl_true_usd ?? snapshot.pnl_usd ?? 0;
+  const feesUsd = (snapshot.collected_fees_true_usd || 0) + (snapshot.unclaimed_fees_true_usd || 0);
+  let initialUsd = tracked?.initial_value_usd || 0;
+  let finalValueUsd;
+  let pnlPct;
+
+  if (initialUsd > 0) {
+    // Keep the fallback internally consistent using USD-only snapshot metrics.
+    finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
+    pnlPct = (pnlUsd / initialUsd) * 100;
+  } else {
+    pnlPct = snapshot.pnl_pct ?? 0;
+    finalValueUsd = snapshot.total_value_true_usd ?? snapshot.total_value_usd ?? 0;
+    initialUsd = Math.max(0, finalValueUsd + feesUsd - pnlUsd);
+  }
+
+  return { pnlUsd, pnlPct, feesUsd, finalValueUsd, initialUsd, derived: true };
 }
 
 // ─── Close Position ────────────────────────────────────────────
@@ -1424,6 +1493,18 @@ export async function closePosition({ position_address, reason }) {
 
   try {
     log("close", `Closing position: ${position_address}`);
+
+    // Pre-close liveness check: if the position account no longer exists on-chain
+    // (or is no longer owned by the DLMM program), it was already closed. Record
+    // the close, force fresh discovery, and short-circuit before sending a relay order.
+    const DLMM_PROGRAM_ID = getDlmmProgramId();
+    const info = await getConnection().getAccountInfo(new PublicKey(position_address), "confirmed");
+    if (!info || !info.owner.equals(DLMM_PROGRAM_ID)) {
+      recordClose(position_address, reason || "already closed on-chain");
+      _positionsCacheAt = 0; // force fresh discovery next time
+      return { success: true, already_closed: true, position: position_address };
+    }
+
     const wallet = getWallet();
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
@@ -1438,6 +1519,19 @@ export async function closePosition({ position_address, reason }) {
       ];
       const livePositions = await getMyPositions({ force: true, silent: true });
       const livePosition = livePositions?.positions?.find((position) => position.position === position_address);
+      // Snapshot live PnL BEFORE the close-confirmation loop trashes _positionsCache.
+      // Used as the fallback if the closed-PnL API hasn't settled after the close.
+      const snapshotPnl = livePosition
+        ? {
+            pnl_true_usd: livePosition.pnl_true_usd,
+            pnl_usd: livePosition.pnl_usd,
+            pnl_pct: livePosition.pnl_pct,
+            total_value_true_usd: livePosition.total_value_true_usd,
+            total_value_usd: livePosition.total_value_usd,
+            collected_fees_true_usd: livePosition.collected_fees_true_usd,
+            unclaimed_fees_true_usd: livePosition.unclaimed_fees_true_usd,
+          }
+        : null;
       const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
       const closeToBinId = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
       const closeOutput = "allToken1";
@@ -1517,13 +1611,22 @@ export async function closePosition({ position_address, reason }) {
       }
 
       if (!closedConfirmed) {
+        // The close submit succeeded on-chain; only the position-record recheck
+        // lagged. Report the pre-close snapshot PnL instead of an implicit $0.00
+        // so the caller sees the real result of the (likely successful) close.
+        const derived = derivePnlFromSnapshot(snapshotPnl, tracked);
         return {
           success: false,
+          verification_timeout: true,
           error: "Close submit succeeded but position still appears open after verification window",
           position: position_address,
           pool: poolAddress,
           close_txs: closeTxHashes,
           txs: txHashes,
+          base_mint: livePosition?.base_mint || null,
+          pnl_usd: derived.pnlUsd,
+          pnl_pct: derived.pnlPct,
+          pnl_estimated: derived.derived,
         };
       }
 
@@ -1548,7 +1651,7 @@ export async function closePosition({ position_address, reason }) {
             const res = await fetch(closedUrl);
             if (res.ok) {
               const data = await res.json();
-              const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
+              const posEntry = findClosedPnlEntry(data, position_address);
               if (posEntry) {
                 pnlUsd = parseFloat(posEntry.pnlUsd || 0);
                 pnlPct = parseFloat(posEntry.pnlPctChange || 0);
@@ -1562,6 +1665,17 @@ export async function closePosition({ position_address, reason }) {
           }
         } catch (e) {
           log("close_warn", `Relay closed PnL fetch failed: ${e.message}`);
+        }
+
+        // Fallback to pre-close cache snapshot if the closed API had no data.
+        // The relay path is the prod path (lpAgentRelayEnabled) and previously
+        // had no fallback, so an unsettled/mismatched record left pnl at 0.
+        if (finalValueUsd === 0 && snapshotPnl) {
+          // Use the pre-close snapshot captured before the confirmation loop, NOT
+          // _positionsCache — the loop's force-refresh drops the now-closed position
+          // from the cache, so re-reading it here would find nothing.
+          ({ pnlUsd, pnlPct, feesUsd, finalValueUsd, initialUsd } = derivePnlFromSnapshot(snapshotPnl, tracked));
+          log("close_warn", `Using pre-close pnl snapshot for relay close because closed API has not settled yet`);
         }
 
         await recordPerformance({
@@ -1649,6 +1763,29 @@ export async function closePosition({ position_address, reason }) {
         if (relaySubmitted) throw relayError;
         log("close_warn", `Relay zap-out failed before submit; falling back to local close + Jupiter autoswap: ${relayError.message}`);
       }
+    }
+
+    // Snapshot live PnL BEFORE the close so we can still report a real figure if
+    // the post-close verification loop times out. The loop force-refreshes and
+    // drops the now-closed position from _positionsCache, so we must capture it
+    // up front rather than re-reading later.
+    let localSnapshotPnl = null;
+    try {
+      const livePositions = await getMyPositions({ silent: true });
+      const livePosition = livePositions?.positions?.find((p) => p.position === position_address);
+      if (livePosition) {
+        localSnapshotPnl = {
+          pnl_true_usd: livePosition.pnl_true_usd,
+          pnl_usd: livePosition.pnl_usd,
+          pnl_pct: livePosition.pnl_pct,
+          total_value_true_usd: livePosition.total_value_true_usd,
+          total_value_usd: livePosition.total_value_usd,
+          collected_fees_true_usd: livePosition.collected_fees_true_usd,
+          unclaimed_fees_true_usd: livePosition.unclaimed_fees_true_usd,
+        };
+      }
+    } catch (e) {
+      log("close_warn", `Could not snapshot pre-close pnl for local close: ${e.message}`);
     }
 
     // Clear cached pool so SDK loads fresh position fee state
@@ -1749,14 +1886,27 @@ export async function closePosition({ position_address, reason }) {
     }
 
     if (!closedConfirmed) {
+      // The close txs confirmed on-chain — only the position-record recheck
+      // lagged (relay/RPC propagation). The base token is already in the
+      // wallet, so flag this as a verification timeout (not a hard failure) and
+      // surface base_mint so the caller can still swap it back to SOL.
+      //
+      // Previously this path returned no PnL, so the manager logged a bogus
+      // "+$0.00". Report the pre-close snapshot PnL so the real result is shown.
+      const derived = derivePnlFromSnapshot(localSnapshotPnl, tracked);
       return {
         success: false,
+        verification_timeout: true,
         error: "Close transactions sent but position still appears open after verification window",
         position: position_address,
         pool: poolAddress,
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
         txs: txHashes,
+        base_mint: pool.lbPair.tokenXMint.toString(),
+        pnl_usd: derived.pnlUsd,
+        pnl_pct: derived.pnlPct,
+        pnl_estimated: derived.derived,
       };
     }
 
@@ -1793,7 +1943,7 @@ export async function closePosition({ position_address, reason }) {
           const res = await fetch(closedUrl);
           if (res.ok) {
             const data = await res.json();
-            const posEntry = (data.positions || []).find(p => p.positionAddress === position_address);
+            const posEntry = findClosedPnlEntry(data, position_address);
             if (posEntry) {
               const nextPnlUsd = parseFloat(posEntry.pnlUsd || 0);
               const nextPnlPct = parseFloat(posEntry.pnlPctChange || 0);
@@ -1821,22 +1971,14 @@ export async function closePosition({ position_address, reason }) {
       } catch (e) {
         log("close_warn", `Closed PnL fetch failed: ${e.message}`);
       }
-      // Fallback to pre-close cache snapshot if closed API had no data
+      // Fallback to the pre-close snapshot if the closed API had no data. Prefer
+      // the snapshot captured before the close txs; fall back to _positionsCache
+      // only if that snapshot is missing (it may still hold the record here since
+      // the local path times out only when the position still appears open).
       if (finalValueUsd === 0) {
-        const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
-        if (cachedPos) {
-          pnlUsd        = cachedPos.pnl_true_usd ?? cachedPos.pnl_usd ?? 0;
-          pnlPct        = cachedPos.pnl_pct   ?? 0;
-          feesUsd       = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
-          initialUsd    = tracked.initial_value_usd || 0;
-          if (initialUsd > 0) {
-            // Keep fallback internally consistent using USD-only cached metrics.
-            finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
-            pnlPct = (pnlUsd / initialUsd) * 100;
-          } else {
-            finalValueUsd = cachedPos.total_value_true_usd ?? cachedPos.total_value_usd ?? 0;
-            initialUsd = Math.max(0, finalValueUsd + feesUsd - pnlUsd);
-          }
+        const snapshot = localSnapshotPnl || _positionsCache?.positions?.find(p => p.position === position_address);
+        if (snapshot) {
+          ({ pnlUsd, pnlPct, feesUsd, finalValueUsd, initialUsd } = derivePnlFromSnapshot(snapshot, tracked));
           log("close_warn", `Using cached pnl fallback because closed API has not settled yet`);
         }
       }
