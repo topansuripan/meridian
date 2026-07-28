@@ -390,6 +390,33 @@ A global watch-only mode. Cron cycles keep running and monitoring continues, but
 
 ---
 
+## Fast-Drop Recovery-Exit Guard (July 2026)
+
+**Why**: The book is single-sided SOL and we want stability, not big dumping. The absolute
+`stopLossPct` (-50%) is a *level*, not a *rate* — it does nothing when a position falls fast
+while still above -50%. This guard adds a velocity signal, but avoids panic-selling at the
+bottom: after a sharp drop it waits to exit into a bounce.
+
+- **Module**: `fast-drop-guard.js` — pure/dependency-injected (mirrors `sol-crash-guard.js`).
+  `evaluateFastDropGuard({ samples, watch, currentPnlPct, now, cfg })` → `{ watch, samples, action, reason }`.
+  Value proxy is `factor = 1 + pnl_pct/100` (IL + price + fees).
+- **State machine (per position, NORMAL only)**: track a rolling `fastDropWindowMinutes` (15m)
+  buffer of value samples. Arm a "recovery watch" when value drops ≥ `fastDropTriggerPct` (15%)
+  from the rolling high. While watching, keep trailing the low; exit (`FAST_DROP_EXIT`) on any of:
+  PnL returns to breakeven (≥0%, checked first as the more meaningful label), value bounces
+  ≥ `fastDropBouncePct` (10%) off the low, or PnL hits the `fastDropHardFloorPct` (-25%) hard floor.
+- **Integration**: `state.js updatePnlAndCheckExits()` evaluates it each 30s poll (before the
+  absolute stop-loss) and persists `fast_drop_samples` + `fast_drop_watch` in `state.json` so an
+  active watch survives restarts (~15m sample re-warm after a restart). The returned
+  `FAST_DROP_EXIT` flows through the existing 30s-poll close/alert path (spectate "WOULD close"
+  + management trigger) unchanged — not routed through the `TRAILING_TP` confirmation branch.
+  Skipped when `pnl_pct_suspicious`. Degen exempt (`buildDegenMgmtConfig()` never sets `fastDropGuardEnabled`).
+- **Config (`config.management`)**: `fastDropGuardEnabled` (true), `fastDropWindowMinutes` (15),
+  `fastDropTriggerPct` (15), `fastDropBouncePct` (10), `fastDropHardFloorPct` (-25). All via `update_config`.
+- **Tests**: `test-fast-drop-guard.js` (node:test) — arm/no-arm, trailing low, bounce/breakeven/floor exits, window expiry, disabled, null-pnl skip.
+
+---
+
 ## Known Issues / Tech Debt
 
 - `lessons.js evolveThresholds()` evolves `maxVolatility` + `minFeeTvlRatio` (wrong key names — should be `minFeeActiveTvlRatio`; `maxVolatility` doesn't exist in config at all). The evolution is a no-op for those keys.
