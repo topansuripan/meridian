@@ -93,6 +93,11 @@ export const config = {
     lossQuarantineTriggerCount: u.lossQuarantineTriggerCount ?? 2,
     lossQuarantineHours: u.lossQuarantineHours ?? 24,
     lossQuarantineMinPnlPct: u.lossQuarantineMinPnlPct ?? -8,
+    // Permanent repeat-rug blacklist — a token that produces this many DEEP losses
+    // (single-step gap-downs / rugs) across its whole history is blacklisted forever,
+    // not just quarantined 24h. Motivated by HENTAI (rugged 3x), HOME, HANTA (2x).
+    deepLossBlacklistPct: u.deepLossBlacklistPct ?? -8,   // a close <= this counts as a deep loss
+    deepLossBlacklistCount: u.deepLossBlacklistCount ?? 2, // this many deep losses -> permanent blacklist (0 = off)
   },
 
   // ─── SOL-Crash Circuit Breaker ───────────
@@ -232,6 +237,11 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    // Dynamic ratcheting stop — once a position has been green, lock in profit so it can't
+    // round-trip back to a loss. Fills the gap between breakeven and the trailing-TP trigger.
+    dynamicStopEnabled:    u.dynamicStopEnabled    ?? true,
+    dynamicStopArmPct:     u.dynamicStopArmPct     ?? 0.8,  // arm once confirmed peak PnL >= X%
+    dynamicStopGiveBackPct: u.dynamicStopGiveBackPct ?? 0.8, // then stop = peak - this (peak 0.8% -> stop 0%)
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,

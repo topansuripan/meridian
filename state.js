@@ -422,6 +422,28 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     };
   }
 
+  // ── Dynamic ratcheting stop ────────────────────────────────────
+  // Once confirmed peak PnL has reached armPct, raise the stop to (peak - giveBackPct)
+  // so a position that has shown profit can't round-trip back into a loss. Covers the
+  // band between breakeven and the trailing-TP trigger; winners (peak >= trailingTriggerPct,
+  // trailing_active) are left to the trailing-TP logic below.
+  if (
+    !pnl_pct_suspicious &&
+    currentPnlPct != null &&
+    !pos.trailing_active &&
+    mgmtConfig.dynamicStopEnabled !== false &&
+    (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.dynamicStopArmPct ?? 0.8)
+  ) {
+    const giveBack = mgmtConfig.dynamicStopGiveBackPct ?? 0.8;
+    const dynStop = pos.peak_pnl_pct - giveBack;
+    if (currentPnlPct <= dynStop) {
+      return {
+        action: "DYNAMIC_STOP",
+        reason: `Dynamic stop: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (stop ${dynStop.toFixed(2)}%, give-back ${giveBack}%)`,
+      };
+    }
+  }
+
   // ── Trailing TP ────────────────────────────────────────────────
   if (!pnl_pct_suspicious && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;

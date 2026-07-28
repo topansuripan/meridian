@@ -8,6 +8,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { config } from "./config.js";
+import { addToBlacklist, isBlacklisted } from "./token-blacklist.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
 const MAX_NOTE_LENGTH = 280;
@@ -98,6 +99,33 @@ export function evaluateLossQuarantine(deploys, riskConfig = config.risk) {
     hours,
     reason: `loss quarantine (${triggerCount}x losing close${triggerCount > 1 ? "s" : ""}, last PnL ${lastPnl ?? "?"}%)`,
   };
+}
+
+/**
+ * Permanent repeat-rug blacklist. Counts DEEP losses (single-step gap-downs / rugs)
+ * for a base mint across ALL pools in the db. Range events (OOR / "pumped far above
+ * range") are exempt — those aren't rugs. When the count reaches deepLossBlacklistCount,
+ * returns a trigger so the caller can blacklist the mint forever (unlike the 24h quarantine
+ * which expires and lets repeat ruggers back in — e.g. HENTAI rugged 3x, HANTA 2x).
+ * @returns {{ count:number, pct:number, reason:string } | null}
+ */
+export function evaluateDeepLossBlacklist(db, baseMint, riskConfig = config.risk) {
+  const pct = Number(riskConfig?.deepLossBlacklistPct ?? -8);
+  const triggerCount = Math.floor(Number(riskConfig?.deepLossBlacklistCount ?? 2));
+  if (!baseMint || !(triggerCount >= 1) || !Number.isFinite(pct)) return null; // 0/off
+
+  let deep = 0;
+  for (const entry of Object.values(db)) {
+    if (entry?.base_mint !== baseMint) continue;
+    for (const d of entry.deploys || []) {
+      if (isAdjustedWinRateExcludedReason(String(d?.close_reason || ""))) continue; // range events exempt
+      if (d?.pnl_pct != null && Number(d.pnl_pct) <= pct) deep++;
+    }
+  }
+  if (deep >= triggerCount) {
+    return { count: deep, pct, reason: `repeat deep loss / rug (${deep}x close <= ${pct}%)` };
+  }
+  return null;
 }
 
 function setPoolCooldown(entry, hours, reason) {
@@ -298,6 +326,14 @@ export function recordPoolDeploy(poolAddress, deployData) {
         log("pool-memory", `Base mint quarantine set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${quarantine.reason})`);
       }
     }
+  }
+
+  // Permanent repeat-rug blacklist — supersedes the 24h quarantine for tokens that
+  // rug repeatedly (the quarantine expires; a blacklist does not).
+  const blacklistHit = evaluateDeepLossBlacklist(db, entry.base_mint, config.risk);
+  if (blacklistHit && entry.base_mint && !isBlacklisted(entry.base_mint)) {
+    addToBlacklist({ mint: entry.base_mint, symbol: entry.name, reason: blacklistHit.reason });
+    log("pool-memory", `Permanent blacklist for ${entry.name} (${entry.base_mint.slice(0, 8)}): ${blacklistHit.reason}`);
   }
 
   save(db);
