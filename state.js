@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { evaluateFastDropGuard } from "./fast-drop-guard.js";
 
 const STATE_FILE = "./state.json";
 
@@ -413,6 +414,33 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   if (changed) save(state);
+
+  // ── Fast-drop recovery-exit guard (NORMAL only) ────────────────────
+  // Skip when pnl is suspicious (same rule as every PnL-based exit below).
+  if (mgmtConfig.fastDropGuardEnabled && !pnl_pct_suspicious) {
+    const fd = evaluateFastDropGuard({
+      samples: pos.fast_drop_samples || [],
+      watch: pos.fast_drop_watch || null,
+      currentPnlPct,
+      now: Date.now(),
+      cfg: mgmtConfig,
+    });
+    // Persist rolling samples + watch state so an active watch survives restarts.
+    pos.fast_drop_samples = fd.samples;
+    pos.fast_drop_watch = fd.watch;
+    save(state);
+    if (fd.action) {
+      return { action: fd.action, reason: fd.reason };
+    }
+    if (fd.reason && pos.fast_drop_watch?.active && !pos._fast_drop_armed_logged) {
+      pos._fast_drop_armed_logged = true;
+      save(state);
+      log("state", `Position ${position_address} ${fd.reason}`);
+    } else if (!pos.fast_drop_watch?.active && pos._fast_drop_armed_logged) {
+      pos._fast_drop_armed_logged = false;
+      save(state);
+    }
+  }
 
   // ── Stop loss ──────────────────────────────────────────────────
   if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
