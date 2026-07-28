@@ -243,6 +243,14 @@ export const config = {
     dynamicStopArmPct:     u.dynamicStopArmPct     ?? 0.8,  // arm once confirmed peak PnL >= X%
     dynamicStopGiveBackPct: u.dynamicStopGiveBackPct ?? 0.8, // then stop = peak - this (peak 0.8% -> stop 0%)
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    // Fast-drop recovery-exit guard (NORMAL positions only). Detects a sharp value
+    // drop from a rolling high, then exits into a bounce / at breakeven / at a hard
+    // floor instead of dumping at the bottom. See fast-drop-guard.js.
+    fastDropGuardEnabled:  u.fastDropGuardEnabled  ?? true,
+    fastDropWindowMinutes: u.fastDropWindowMinutes ?? 15,   // rolling-high lookback
+    fastDropTriggerPct:    u.fastDropTriggerPct    ?? 15,   // drop-from-high that arms watch
+    fastDropBouncePct:     u.fastDropBouncePct     ?? 10,   // rise-from-low that triggers exit
+    fastDropHardFloorPct:  u.fastDropHardFloorPct  ?? -25,  // force-close floor while watching
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },
