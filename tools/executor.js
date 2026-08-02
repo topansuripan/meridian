@@ -26,17 +26,16 @@ import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../confi
 import { isCoolingDown as solGuardCoolingDown } from "../sol-crash-guard.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { execSync, spawn } from "child_process";
+import { REPO_ROOT, repoPath } from "../repo-root.js";
+import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
-const GMGN_CONFIG_PATH = path.join(__dirname, "../gmgn-config.json");
+const USER_CONFIG_PATH = repoPath("user-config.json");
+const GMGN_CONFIG_PATH = repoPath("gmgn-config.json");
+const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
-  "15m": 15,
   "30m": 30,
   "1h": 60,
   "2h": 120,
@@ -156,8 +155,14 @@ async function validateDeployPoolThresholds(args) {
 
   // Extract real base mint from pool detail for downstream checks
   const resolvedBaseMint = detail?.token_x?.address || detail?.base_token_address || null;
+  const entryMarketData = {
+    entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
+    entry_tvl: tvl,
+    entry_volume: numberOrNull(detail?.volume),
+    entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
+  };
 
-  return { pass: true, detail, resolvedBaseMint };
+  return { pass: true, detail, resolvedBaseMint, entryMarketData };
 }
 
 const SENSITIVE_CONFIG_KEYS = new Set([
@@ -567,6 +572,10 @@ function normalizeConfigValue(key, value) {
     "hiveMindPullMode",
     "publicApiKey",
     "agentMeridianApiUrl",
+    "pnlSource",
+    "pnlRpcUrl",
+    "gmgnFeeSource",
+    "gmgnApiKey",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
@@ -606,7 +615,7 @@ const toolMap = {
   },
   self_update: async () => {
     try {
-      const result = execSync("git pull", { cwd: process.cwd(), encoding: "utf8" }).trim();
+      const result = execSync("git pull", { cwd: REPO_ROOT, encoding: "utf8" }).trim();
       if (result.includes("Already up to date")) {
         return { success: true, updated: false, message: "Already up to date — no restart needed." };
       }
@@ -616,7 +625,7 @@ const toolMap = {
           const child = spawn(process.execPath, process.argv.slice(1), {
             detached: true,
             stdio: "inherit",
-            cwd: process.cwd(),
+            cwd: REPO_ROOT,
           });
           child.unref();
         }
@@ -695,21 +704,22 @@ const toolMap = {
       discordSignalMode: ["screening", "discordSignalMode"],
       avoidPvpSymbols: ["screening", "avoidPvpSymbols"],
       blockPvpSymbols: ["screening", "blockPvpSymbols"],
-      maxBundlePct:     ["screening", "maxBundlePct"],
       maxBotHoldersPct: ["screening", "maxBotHoldersPct"],
       maxTop10Pct: ["screening", "maxTop10Pct"],
       allowedLaunchpads: ["screening", "allowedLaunchpads"],
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
-      athFilterPct:     ["screening", "athFilterPct"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
+      loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       autoParkUsdcAfterClose: ["management", "autoParkUsdcAfterClose"],
       autoFundSolFromUsdc: ["management", "autoFundSolFromUsdc"],
       solUsdReserve: ["management", "solUsdReserve"],
+      autoSwapRetryAttempts: ["management", "autoSwapRetryAttempts"],
+      autoSwapRetryDelayMs: ["management", "autoSwapRetryDelayMs"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
@@ -728,6 +738,18 @@ const toolMap = {
       trailingDropPct: ["management", "trailingDropPct"],
       pnlSanityMaxDiffPct: ["management", "pnlSanityMaxDiffPct"],
       pendingSwapMinUsd: ["management", "pendingSwapMinUsd"],
+      // pnl poller
+      pnlConfirmTicks: ["pnl", "confirmTicks"],
+      // opportunity poller (interval/enabled changes apply on next restart)
+      opportunityPollEnabled: ["opportunity", "enabled"],
+      opportunityPollIntervalSec: ["opportunity", "pollIntervalSec"],
+      opportunityPollLimit: ["opportunity", "limit"],
+      opportunityMinScore: ["opportunity", "minScore"],
+      opportunitySmartWalletBonus: ["opportunity", "smartWalletScoreBonus"],
+      degenTargetVolRatio: ["opportunity", "targetVolRatio"],
+      degenTargetLpCount: ["opportunity", "targetLpCount"],
+      degenTargetFeeRatio: ["opportunity", "targetFeeRatio"],
+      degenTargetLiquidity: ["opportunity", "targetLiquidity"],
       solMode: ["management", "solMode"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
@@ -821,6 +843,13 @@ const toolMap = {
       gmgnMinRsi: ["gmgn", "indicatorRules", "minRsi"],
       gmgnMaxRsi: ["gmgn", "indicatorRules", "maxRsi"],
       gmgnRequireBbPosition: ["gmgn", "indicatorRules", "requireBbPosition"],
+      // pnl fetcher / poller
+      pnlSource: ["pnl", "source", ["pnlSource"]],
+      pnlRpcUrl: ["pnl", "rpcUrl", ["pnlRpcUrl"]],
+      pnlPollIntervalSec: ["pnl", "pollIntervalSec", ["pnlPollIntervalSec"]],
+      pnlDepositCacheTtlSec: ["pnl", "depositCacheTtlSec", ["pnlDepositCacheTtlSec"]],
+      // gmgn fee source
+      gmgnFeeSource: ["gmgn", "feeSource", ["gmgnFeeSource"]],
       // chart indicators
       chartIndicatorsEnabled: ["indicators", "enabled", ["chartIndicators", "enabled"]],
       indicatorEntryPreset: ["indicators", "entryPreset", ["chartIndicators", "entryPreset"]],
@@ -880,8 +909,20 @@ const toolMap = {
       }
     }
 
+    // Auto-scale fee/volume when timeframe changes (unless user set them explicitly in same call).
+    if (applied.timeframe != null && applied.minFeeActiveTvlRatio == null && applied.minVolume == null) {
+      const tf = normalizeTimeframe(applied.timeframe);
+      applied.timeframe = tf;
+      const scaled = scaleScreeningToTimeframe(tf);
+      applied.minFeeActiveTvlRatio = scaled.minFeeActiveTvlRatio;
+      applied.minVolume = scaled.minVolume;
+      applied._timeframeScaled = true;
+      log("config", `timeframe ${tf} → auto-scaled minFeeActiveTvlRatio=${scaled.minFeeActiveTvlRatio}, minVolume=${scaled.minVolume}`);
+    }
+
     // Apply to live config immediately after the persisted config is known-good.
     for (const [key, val] of Object.entries(applied)) {
+      if (key.startsWith("_")) continue;
       const [section, field, third] = CONFIG_MAP[key];
       const isNestedField = typeof third === "string"; // string = nested subfield, array = persistPath
       if (isNestedField) {
@@ -920,6 +961,7 @@ const toolMap = {
     let wroteUserConfig = false;
     let wroteGmgnConfig = false;
     for (const [key, val] of Object.entries(applied)) {
+      if (key.startsWith("_")) continue;
       const [section, field, third] = CONFIG_MAP[key] || [];
       const persistPath = Array.isArray(third) ? third : null;
       const nestedField = typeof third === "string" ? third : null;
@@ -958,15 +1000,15 @@ const toolMap = {
     }
 
     // Restart cron jobs if intervals changed
-    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
+    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlPollIntervalSec != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
-      log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
+      log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m, pnlPoll: ${config.pnl.pollIntervalSec}s`);
     }
 
     // Skip repeated volatility-driven interval changes; they are operational tuning, not reusable lessons.
     const lessonsKeys = Object.keys(applied).filter(
-      k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
+      k => !k.startsWith("_") && k !== "managementIntervalMin" && k !== "screeningIntervalMin"
     );
     if (lessonsKeys.length > 0) {
       const summary = lessonsKeys.map(k => `${k}=${redactConfigValue(k, applied[k])}`).join(", ");
@@ -1098,7 +1140,7 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold
+        // Auto-swap base token back to SOL unless user said to hold (retried).
         if (!args.skip_swap && result.base_mint) {
           const swapBack = await autoSwapToSol(result.base_mint);
           if (swapBack?.success) {
@@ -1186,6 +1228,7 @@ async function runSafetyChecks(name, args) {
     case "deploy_position": {
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
+      if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
 
       // Use real base mint from pool data, not LLM args (LLM often passes symbol instead of CA)
       const baseMint = poolThresholds.resolvedBaseMint || args.base_mint;

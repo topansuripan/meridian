@@ -3,9 +3,10 @@ import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
 import { getRecentSelfTuned } from "./memory.js";
 import { getConfiguredOwnerAddress, getHistoricalPositions, getOpeningPositions, getOverview, hasLpAgentKey } from "./tools/lpagent.js";
+import { repoPath } from "./repo-root.js";
 
-const STATE_FILE = "./state.json";
-const LESSONS_FILE = "./lessons.json";
+const STATE_FILE = repoPath("state.json");
+const LESSONS_FILE = repoPath("lessons.json");
 
 export async function generateBriefing() {
   const state = loadJson(STATE_FILE) || { positions: {}, recentEvents: [] };

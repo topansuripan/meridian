@@ -25,15 +25,18 @@ async function paceGmgnRequest() {
 
 function getApiKey() {
   const key = config.gmgn?.apiKey || process.env.GMGN_API_KEY;
-  if (!key) throw new Error("GMGN_API_KEY is required when screeningSource=gmgn.");
+  if (!key) throw new Error("GMGN_API_KEY is required for the GMGN screening/fee source.");
   return key;
+}
+
+export function hasGmgnApiKey() {
+  return !!(config.gmgn?.apiKey || process.env.GMGN_API_KEY);
 }
 
 function normalizeInterval(value, fallback = "5m") {
   const normalized = String(value || fallback).trim();
   return SUPPORTED_INTERVALS.has(normalized) ? normalized : fallback;
 }
-
 
 function appendParams(url, params = {}) {
   for (const [key, value] of Object.entries(params)) {
@@ -729,4 +732,23 @@ export function formatGmgnCandidateForPrompt(p) {
 
 function round(n) {
   return n != null ? Math.round(n) : null;
+}
+
+// ─── Token fees (SOL) for the minTokenFeesSol gate ──────────────
+// Returns { total_fee, trade_fee } in SOL, or null on missing key / error
+// so callers can fall back to Jupiter's fee figure.
+export async function getGmgnTokenFees(mint) {
+  if (!mint || !hasGmgnApiKey()) return null;
+  try {
+    const payload = await gmgnFetch("/v1/token/info", { params: { chain: "sol", address: mint } });
+    const info = payload?.data?.data || payload?.data || payload;
+    if (!info || typeof info !== "object") return null;
+    return {
+      total_fee: optionalNum(info.total_fee),
+      trade_fee: optionalNum(info.trade_fee),
+    };
+  } catch (error) {
+    log("gmgn", `token fees lookup failed for ${String(mint).slice(0, 8)}: ${error.message}`);
+    return null;
+  }
 }

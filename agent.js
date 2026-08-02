@@ -185,6 +185,11 @@ function isToolChoiceRequiredError(error) {
   return /tool_choice/i.test(message);
 }
 
+function isThinkingModeToolChoiceError(error) {
+  const message = String(error?.message || error?.error?.message || error || "");
+  return /thinking mode does not support/i.test(message) && /tool_choice/i.test(message);
+}
+
 /**
  * Core ReAct agent loop.
  *
@@ -222,6 +227,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
   let noToolRetryCount = 0;
+  // Stays true for the whole run once a thinking-mode provider rejects tool_choice
+  let omitToolChoice = false;
 
   let emptyStreak = 0;
   let currentModel = model || DEFAULT_MODEL;
@@ -239,15 +246,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
-          const requestBody = {
+          const reqParams = {
             model: usedModel,
             messages,
             tools: getToolsForRole(agentType, goal),
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           };
-          if (toolChoice) requestBody.tool_choice = toolChoice;
-          response = await client.chat.completions.create(requestBody);
+          if (!omitToolChoice && toolChoice) reqParams.tool_choice = toolChoice;
+          response = await client.chat.completions.create(reqParams);
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
@@ -265,6 +272,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           if (toolChoice === "auto" && isToolChoiceRequiredError(error)) {
             toolChoice = null;
             log("agent", "Provider rejected tool_choice=auto — retrying without tool_choice");
+            attempt -= 1;
+            continue;
+          }
+          if (!omitToolChoice && isThinkingModeToolChoiceError(error)) {
+            omitToolChoice = true;
+            log("agent", "Provider thinking mode does not support tool_choice — retrying without it");
             attempt -= 1;
             continue;
           }

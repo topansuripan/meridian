@@ -15,7 +15,6 @@ const METEORA_OHLCV_BASE = "https://dlmm.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
-  "15m": 15,
   "30m": 30,
   "1h": 60,
   "2h": 120,
@@ -23,6 +22,9 @@ const TIMEFRAME_MINUTES = {
   "12h": 720,
   "24h": 1440,
 };
+// Degen Score normalizes window-dependent inputs (volume/fee/LP) to this reference
+// window, so its targets stay valid regardless of the configured screening timeframe.
+const DEGEN_REFERENCE_MINUTES = 30;
 const PVP_SHORTLIST_LIMIT = 2;
 const PVP_RIVAL_LIMIT = 2;
 const PVP_MIN_ACTIVE_TVL = 5_000;
@@ -33,7 +35,7 @@ function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
 }
 
-function scoreCandidate(pool) {
+export function scoreCandidate(pool) {
   if (Number.isFinite(Number(pool.gmgn_score))) {
     return Number(pool.gmgn_score) + Number(pool.fee_active_tvl_ratio || 0) * 500;
   }
@@ -44,7 +46,57 @@ function scoreCandidate(pool) {
   return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
 }
 
+/**
+ * Degen Score — a pool's efficiency relative to its liquidity, on a 0..100 scale.
+ * Geometric mean of four liquidity-relative sub-scores so a HIGH score requires balance
+ * across all four (a pool spiking one metric can't dominate):
+ *   1. Recent trading activity   → volume / active_tvl   (volume_active_tvl_ratio)
+ *   2. Recent LP activity        → unique_lps + positions_created
+ *   3. Fees paid to LPs          → fee / active_tvl       (fee_active_tvl_ratio)
+ *   4. Liquidity                 → active_tvl (log floor — dust pools can't win on ratios)
+ * Efficiency only (no momentum/change_pct), per design. Targets are configurable so the
+ * score can be calibrated; each sub-score saturates at its target.
+ *
+ * The volume/fee/LP inputs are measured over `config.screening.timeframe`, so they are
+ * normalized to a fixed 30m reference window before scoring — the targets are expressed
+ * in 30m terms and stay valid even if the timeframe changes (5m, 1h, 24h, …). Liquidity
+ * is a level, not a rate, so it is not scaled.
+ */
+export function degenScore(pool, targets = {}) {
+  const {
+    targetVolRatio = 20,    // (30m) volume/active_tvl that earns a full trading sub-score
+    targetLpCount = 40,     // (30m) unique_lps + positions_created for a full LP sub-score
+    targetFeeRatio = 0.20,  // (30m) fee/active_tvl for a full fee sub-score
+    targetLiquidity = 20000, // active_tvl ($) floor for full liquidity sub-score (not timeframe-scaled)
+  } = targets;
+
+  const La = Number(pool.active_tvl ?? pool.tvl ?? 0);
+  if (!Number.isFinite(La) || La <= 0) return 0;
+
+  const clamp01 = (x) => (Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : 0);
+
+  // Normalize window-dependent inputs to the 30m reference (rate × scale).
+  const tfMinutes = TIMEFRAME_MINUTES[config.screening.timeframe] || DEGEN_REFERENCE_MINUTES;
+  const tfScale = DEGEN_REFERENCE_MINUTES / tfMinutes;
+
+  const volRatio = Number(pool.volume_active_tvl_ratio);
+  const tradingRatio = (Number.isFinite(volRatio) ? volRatio : Number(pool.volume_window || 0) / La) * tfScale;
+  const feeRatio = (Number.isFinite(Number(pool.fee_active_tvl_ratio))
+    ? Number(pool.fee_active_tvl_ratio)
+    : Number(pool.fee_window || 0) / La) * tfScale;
+  const lpActivity = (Number(pool.unique_lps || 0) + Number(pool.positions_created || 0)) * tfScale;
+
+  const sTrading = clamp01(tradingRatio / targetVolRatio);
+  const sLp      = clamp01(lpActivity / targetLpCount);
+  const sFees    = clamp01(feeRatio / targetFeeRatio);
+  const sLiq     = clamp01(Math.log10(La) / Math.log10(targetLiquidity));
+
+  // Geometric mean (×100). Any zero sub-score → 0, enforcing balance across all four.
+  return (sTrading * sLp * sFees * sLiq) ** 0.25 * 100;
+}
+
 function numeric(value) {
+  if (value == null) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
@@ -264,32 +316,46 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
 async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   if (!Array.isArray(rawPools) || rawPools.length === 0) return rawPools;
   const volatilityTimeframe = getVolatilityTimeframe(sourceTimeframe);
-  if (sourceTimeframe === volatilityTimeframe) {
-    for (const pool of rawPools) {
-      if (pool) pool.volatility_timeframe = volatilityTimeframe;
-    }
-    return rawPools;
+
+  // Tag primary-timeframe values on every pool before any overwrite
+  for (const pool of rawPools) {
+    if (!pool) continue;
+    pool[`volume_${sourceTimeframe}`] = pool.volume ?? null;
+    pool[`volatility_${sourceTimeframe}`] = pool.volatility ?? null;
+    pool.volatility_timeframe = volatilityTimeframe;
   }
 
+  if (sourceTimeframe === volatilityTimeframe) return rawPools;
+
   const uniquePoolAddresses = [...new Set(rawPools.map((pool) => pool?.pool_address).filter(Boolean))];
-  const volatilityResults = await Promise.allSettled(
+  const longResults = await Promise.allSettled(
     uniquePoolAddresses.map((poolAddress) =>
       fetchPoolDiscoveryDetail({ poolAddress, timeframe: volatilityTimeframe })
-        .then((pool) => ({ poolAddress, volatility: numeric(pool?.volatility) }))
+        .then((pool) => ({
+          poolAddress,
+          volatility: numeric(pool?.volatility),
+          volume: numeric(pool?.volume),
+        }))
     )
   );
 
-  const volatilityByPool = new Map();
-  for (const result of volatilityResults) {
+  const metricsByPool = new Map();
+  for (const result of longResults) {
     if (result.status !== "fulfilled") continue;
-    if (result.value.volatility == null) continue;
-    volatilityByPool.set(result.value.poolAddress, result.value.volatility);
+    metricsByPool.set(result.value.poolAddress, result.value);
   }
 
   for (const pool of rawPools) {
-    if (!pool?.pool_address || !volatilityByPool.has(pool.pool_address)) continue;
-    pool.volatility = volatilityByPool.get(pool.pool_address);
-    pool.volatility_timeframe = volatilityTimeframe;
+    if (!pool?.pool_address) continue;
+    const metrics = metricsByPool.get(pool.pool_address);
+    if (!metrics) continue;
+
+    pool[`volume_${volatilityTimeframe}`] = metrics.volume;
+    pool[`volatility_${volatilityTimeframe}`] = metrics.volatility;
+
+    // Use longer-timeframe values as the canonical ones for filtering
+    if (metrics.volatility != null) pool.volatility = metrics.volatility;
+    if (metrics.volume != null) pool.volume = metrics.volume;
   }
 
   return rawPools;
@@ -410,6 +476,32 @@ async function enrichPvpRisk(pools) {
 
 
 /**
+ * Refresh live metrics for discord-only signal pools.
+ * Their discovery_pool is a snapshot from when the signal was captured — volume/volatility/fee
+ * can be 0 even if the pool is active right now. We overwrite with fresh data from the
+ * pool discovery API so filtering uses current numbers, not stale ones.
+ */
+async function refreshDiscordOnlyPools(pools, timeframe) {
+  if (!pools.length) return;
+  const FIELDS = ["volume", "fee", "active_tvl", "tvl", "volatility", "fee_active_tvl_ratio"];
+  const results = await Promise.allSettled(
+    pools.map((pool) =>
+      fetchPoolDiscoveryDetail({ poolAddress: pool.pool_address, timeframe })
+        .then((fresh) => ({ pool, fresh }))
+    )
+  );
+  for (const result of results) {
+    if (result.status !== "fulfilled" || !result.value.fresh) continue;
+    const { pool, fresh } = result.value;
+    for (const field of FIELDS) {
+      const val = numeric(fresh[field]);
+      if (val != null) pool[field] = val;
+    }
+    log("screening", `Discord signal refreshed live data: ${pool.name || pool.pool_address} — vol=${pool.volume?.toFixed(0)} fee=${pool.fee?.toFixed(2)}`);
+  }
+}
+
+/**
  * Fetch pools from the Meteora Pool Discovery API.
  * Returns condensed data optimized for LLM consumption (saves tokens).
  */
@@ -473,8 +565,11 @@ export async function discoverPools({
 
     if (config.screening.discordSignalMode === "only") {
       rawPools = signalPools;
+      // Refresh all signal pools with live data since discovery_pool is a stale snapshot
+      await refreshDiscordOnlyPools(rawPools, s.timeframe);
     } else if (signalPools.length > 0) {
       const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
+      const discordOnlyPools = [];
       for (const signalPool of signalPools) {
         if (byPool.has(signalPool.pool_address)) {
           byPool.set(signalPool.pool_address, {
@@ -487,9 +582,15 @@ export async function discoverPools({
           });
         } else {
           byPool.set(signalPool.pool_address, signalPool);
+          discordOnlyPools.push(signalPool);
         }
       }
       rawPools = Array.from(byPool.values());
+      // Refresh discord-only pools with live data — their discovery_pool is a stale snapshot
+      // so volume/volatility/fee may be 0 even when the pool is active right now
+      if (discordOnlyPools.length > 0) {
+        await refreshDiscordOnlyPools(discordOnlyPools, s.timeframe);
+      }
     }
   }
 
@@ -690,103 +791,19 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
     }
   }
 
-  // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
-  // Skipped for GMGN: bundler/bot/wash data already sourced from GMGN pipeline
-  if (source !== "gmgn" && eligible.length > 0) {
-    const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
-    const okxResults = await Promise.allSettled(
-      eligible.map(async (p) => {
-        if (!p.base?.mint) return { adv: null, price: null, clusters: [], risk: null };
-        const [adv, price, clusters, risk] = await Promise.allSettled([
-          getAdvancedInfo(p.base.mint),
-          getPriceInfo(p.base.mint),
-          getClusterList(p.base.mint),
-          getRiskFlags(p.base.mint),
-        ]);
-
-        const mintShort = p.base.mint.slice(0, 8);
-        if (adv.status !== "fulfilled")      log("okx", `advanced-info unavailable for ${p.name} (${mintShort})`);
-        if (price.status !== "fulfilled")    log("okx", `price-info unavailable for ${p.name} (${mintShort})`);
-        if (clusters.status !== "fulfilled") log("okx", `cluster-list unavailable for ${p.name} (${mintShort})`);
-        if (risk.status !== "fulfilled")     log("okx", `risk-check unavailable for ${p.name} (${mintShort})`);
-
-        return {
-          adv: adv.status === "fulfilled" ? adv.value : null,
-          price: price.status === "fulfilled" ? price.value : null,
-          clusters: clusters.status === "fulfilled" ? clusters.value : [],
-          risk: risk.status === "fulfilled" ? risk.value : null,
-        };
-      })
-    );
-    for (let i = 0; i < eligible.length; i++) {
-      const r = okxResults[i];
-      if (r.status !== "fulfilled") continue;
-      const { adv, price, clusters, risk } = r.value;
-      if (adv) {
-        eligible[i].risk_level      = adv.risk_level;
-        eligible[i].bundle_pct      = adv.bundle_pct;
-        eligible[i].sniper_pct      = adv.sniper_pct;
-        eligible[i].suspicious_pct  = adv.suspicious_pct;
-        eligible[i].smart_money_buy = adv.smart_money_buy;
-        eligible[i].dev_sold_all    = adv.dev_sold_all;
-        eligible[i].dex_boost       = adv.dex_boost;
-        eligible[i].dex_screener_paid = adv.dex_screener_paid;
-        if (adv.creator && !eligible[i].dev) eligible[i].dev = adv.creator;
-      }
-      if (risk) {
-        eligible[i].is_rugpull = risk.is_rugpull;
-        eligible[i].is_wash    = risk.is_wash;
-      }
-      if (price) {
-        eligible[i].price_vs_ath_pct = price.price_vs_ath_pct;
-        eligible[i].ath              = price.ath;
-      }
-      if (clusters?.length) {
-        // Surface KOL presence and top cluster trend for LLM
-        eligible[i].kol_in_clusters      = clusters.some((c) => c.has_kol);
-        eligible[i].top_cluster_trend    = clusters[0]?.trend ?? null;      // buy|sell|neutral
-        eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
-      }
-    }
-    // Wash trading hard filter — fake volume = misleading fee yield
-    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-      if (p.is_wash) {
-        log("screening", `Risk filter: dropped ${p.name} — wash trading flagged`);
-        pushFilteredReason(filteredOut, p, "wash trading flagged");
-        return false;
-      }
-      return true;
-    }));
-
-    // ATH filter — drop pools where price is too close to ATH
-    const athFilter = config.screening.athFilterPct;
-    if (athFilter != null) {
-      const threshold = 100 + athFilter; // e.g. -20 → threshold = 80 (price must be <= 80% of ATH)
-      const before = eligible.length;
-      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-        if (p.price_vs_ath_pct == null) return true; // no data → don't filter
-        if (p.price_vs_ath_pct > threshold) {
-          log("screening", `ATH filter: dropped ${p.name} — ${p.price_vs_ath_pct}% of ATH (limit: ${threshold}%)`);
-          pushFilteredReason(filteredOut, p, `${p.price_vs_ath_pct}% of ATH > ${threshold}% limit`);
-          return false;
-        }
-        return true;
-      }));
-      if (eligible.length < before) log("screening", `ATH filter removed ${before - eligible.length} pool(s)`);
-    }
-
-    // Drop any pools whose creator is on the dev blocklist (caught via advanced-info)
+  // Dev blocklist check — filter pools whose creator is on the blocklist
+  if (eligible.length > 0) {
     const before = eligible.length;
     const filtered = eligible.filter((p) => {
       if (p.dev && isDevBlocked(p.dev)) {
-        log("dev_blocklist", `Filtered blocked deployer (okx) ${p.dev.slice(0, 8)} token ${p.base?.symbol}`);
+        log("dev_blocklist", `Filtered blocked deployer ${p.dev.slice(0, 8)} token ${p.base?.symbol}`);
         pushFilteredReason(filteredOut, p, "blocked deployer");
         return false;
       }
       return true;
     });
     eligible.splice(0, eligible.length, ...filtered);
-    if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
+    if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via dev blocklist`);
   }
 
   if (config.indicators.enabled && eligible.length > 0) {
@@ -969,6 +986,13 @@ function condensePool(p) {
     volatility: fix(p.volatility, 4),
     volatility_timeframe: p.volatility_timeframe || getVolatilityTimeframe(config.screening.timeframe),
 
+    // Per-timeframe breakdown (populated when sourceTimeframe !== volatilityTimeframe)
+    ...(p.volatility_timeframe && p.volatility_timeframe !== config.screening.timeframe ? {
+      [`volume_${config.screening.timeframe}`]: round(p[`volume_${config.screening.timeframe}`] ?? null),
+      [`volume_${p.volatility_timeframe}`]: round(p[`volume_${p.volatility_timeframe}`] ?? null),
+      [`volatility_${config.screening.timeframe}`]: fix(p[`volatility_${config.screening.timeframe}`] ?? null, 4),
+      [`volatility_${p.volatility_timeframe}`]: fix(p[`volatility_${p.volatility_timeframe}`] ?? null, 4),
+    } : {}),
 
     // Token health
     holders: p.base_token_holders,
@@ -1001,6 +1025,12 @@ function condensePool(p) {
     fee_change_pct: fix(p.fee_change_pct, 1),
     swap_count: p.swap_count,
     unique_traders: p.unique_traders,
+
+    // Liquidity-relative + LP-activity metrics (Degen Score inputs)
+    volume_active_tvl_ratio: p.volume_active_tvl_ratio != null ? fix(p.volume_active_tvl_ratio, 4) : null,
+    unique_lps: p.unique_lps,
+    unique_lps_change_pct: fix(p.unique_lps_change_pct, 1),
+    positions_created: p.positions_created,
   };
 }
 

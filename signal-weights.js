@@ -12,7 +12,9 @@
 import fs from "fs";
 import { log } from "./logger.js";
 
-const WEIGHTS_FILE = "./signal-weights.json";
+import { repoPath } from "./repo-root.js";
+
+const WEIGHTS_FILE = repoPath("signal-weights.json");
 
 // ─── Signal Definitions ─────────────────────────────────────────
 
@@ -27,6 +29,9 @@ const SIGNAL_NAMES = [
   "study_win_rate",
   "hive_consensus",
   "volatility",
+  "entry_mcap",
+  "entry_tvl",
+  "entry_volume",
 ];
 
 const DEFAULT_WEIGHTS = Object.fromEntries(SIGNAL_NAMES.map((s) => [s, 1.0]));
@@ -230,7 +235,7 @@ function computeBooleanLift(signal, wins, losses, minSamples) {
   let trueWins = 0, trueTotal = 0, falseWins = 0, falseTotal = 0;
 
   for (const { w, snap } of allEntries) {
-    const val = snap.signal_snapshot?.[signal];
+    const val = getEntrySignalSnapshot(snap)?.[signal];
     if (val === undefined || val === null) continue;
     if (val) { trueTotal++; if (w) trueWins++; }
     else      { falseTotal++; if (w) falseWins++; }
@@ -246,7 +251,7 @@ function computeCategoricalLift(signal, wins, losses, minSamples) {
   const buckets = {};
 
   for (const { w, snap } of allEntries) {
-    const val = snap.signal_snapshot?.[signal];
+    const val = getEntrySignalSnapshot(snap)?.[signal];
     if (val === undefined || val === null) continue;
     if (!buckets[val]) buckets[val] = { wins: 0, total: 0 };
     buckets[val].total++;
@@ -266,12 +271,21 @@ function computeCategoricalLift(signal, wins, losses, minSamples) {
 function extractNumeric(signal, entries) {
   const vals = [];
   for (const entry of entries) {
-    const snap = entry.signal_snapshot;
+    const snap = getEntrySignalSnapshot(entry);
     if (!snap) continue;
     const v = snap[signal];
     if (v != null && typeof v === "number" && isFinite(v)) vals.push(v);
   }
   return vals;
+}
+
+function getEntrySignalSnapshot(entry) {
+  if (entry.signal_snapshot) return entry.signal_snapshot;
+  const snapshot = {};
+  for (const signal of SIGNAL_NAMES) {
+    if (entry[signal] != null) snapshot[signal] = entry[signal];
+  }
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
 }
 
 function mean(arr) {
