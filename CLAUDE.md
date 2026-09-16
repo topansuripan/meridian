@@ -388,6 +388,8 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 | `LLM_BASE_URL` | no | Override for any OpenAI-compatible endpoint (LM Studio: `http://localhost:1234/v1`). |
 | `LLM_MODEL` | no | Default model. Per-role models in `user-config.json` override. |
 | `HELIUS_API_KEY` | recommended | Wallet balance lookups via Helius. |
+| `HELIUS_API_KEY_FALLBACK` | no | Comma-separated extra Helius keys, tried in order when the primary fails (e.g. credits exhausted). See § Helius key rotation. |
+| `PNL_RPC_URL` | no | RPC for the 3s PnL poller. Defaults to `https://pump.helius-rpc.com`. **Never point this at a keyed Helius endpoint** — at 3s it is ~28.8k calls/day per position. |
 | `LPAGENT_API_KEY` | optional | Direct LPAgent positions fetch fallback. |
 | `JUPITER_API_KEY` | optional | Better rate limit on Jupiter Swap. Default key baked in. |
 | `TELEGRAM_BOT_TOKEN` | no | Notifications + REPL. |
@@ -411,11 +413,11 @@ Encrypted env flow (optional, see `scripts/envrypt.js`):
 
 ## VPS Deployment
 
-- **Host**: `root@43.133.133.150`
+- **Host**: `vps` (`~/.ssh/config` alias → `root@100.109.23.110` over Tailscale; public fallback `root@43.133.133.150`)
 - **Path**: `/root/meridian`
 - **Branch**: `feature/degen-mode`
 - **Process manager**: PM2 (process name: `meridian`)
-- **Deploy workflow**: `git push origin feature/degen-mode` locally → `ssh root@43.133.133.150 "cd ~/meridian && git pull origin feature/degen-mode && npm install && pm2 restart meridian"`
+- **Deploy workflow**: `git push origin feature/degen-mode` locally → `ssh vps "cd ~/meridian && git pull origin feature/degen-mode && npm install && pm2 restart meridian"`
 - **Logs**: `pm2 logs meridian --lines 50 --nostream`
 - **Config**: `/root/meridian/user-config.json` (not in git, edit directly on VPS)
 
@@ -595,6 +597,43 @@ bottom: after a sharp drop it waits to exit into a bounce.
 - **Config (`config.management`)**: `fastDropGuardEnabled` (true), `fastDropWindowMinutes` (15),
   `fastDropTriggerPct` (15), `fastDropBouncePct` (10), `fastDropHardFloorPct` (-25). All via `update_config`.
 - **Tests**: `test-fast-drop-guard.js` (node:test) — arm/no-arm, trailing low, bounce/breakeven/floor exits, window expiry, disabled, null-pnl skip.
+
+---
+
+## Helius Key Rotation + On-Chain Balance Fallback (September 2026)
+
+**Why**: On 2026-09-15 16:00 UTC the Helius key ran out of credits and every call
+started returning `429 max usage reached`. `getWalletBalances()` caught the error and
+returned `sol: 0`, so the screening gate logged
+`insufficient liquid balance (0.000 < 0.100 SOL equivalent needed)` every cycle for
+~21h while the wallet actually held **7.44 SOL**. Zero positions were opened. A failed
+network call must never be indistinguishable from an empty wallet.
+
+- **Module**: `helius-balance.js` — pure/dependency-injected (mirrors `sol-crash-guard.js`
+  and `wallet-reconcile.js`). `resolveWalletBalances({ walletAddress, apiKeys, fetchBalances,
+  getSolBalance, log })`.
+- **Key rotation**: keys are tried in order — `HELIUS_API_KEY`, then each comma-separated
+  entry of `HELIUS_API_KEY_FALLBACK`. Blanks and duplicates are skipped. The first key that
+  answers wins; order only matters for latency, so keep a known-good key first.
+- **Degraded mode**: if *every* key fails, SOL is read directly from `RPC_URL`
+  (`getBalance`) and the result is flagged `degraded: true`. The SOL figure is real;
+  USD pricing and the SPL token list are not available.
+  - `tokens: []` is deliberate — every consumer treats an empty list conservatively
+    (`reconcileWalletToSol` sweeps nothing, `verifyWalletClearOfToken` reports not-clear).
+  - `sol_price`/`sol_usd` are **`null`, not `0`** — `sol-crash-guard.tick()` records any
+    *finite* price, so a `0` would read as a −100% SOL crash and close the entire normal
+    book. Every other consumer uses `Number(x || 0)` and is unaffected.
+- **Tests**: `test-helius-balance.js` (node:test, gitignored per convention) — 9 cases
+  covering rotation, the on-chain fallback, degraded flagging, the null-price guard,
+  blank/duplicate key handling, and total failure.
+
+### API burn notes (measured 2026-09-16)
+
+- Idle meridian costs ~**26 Helius calls/hour (~624/day)** with zero open positions.
+- **An idle bot burns more than a working one**: with no open positions every management
+  cycle immediately triggers a screening cycle, so screening runs at the management
+  cadence. Measured Sep 9 → Sep 16: 166 → 288 screening cycles/day as the book emptied.
+- `managementIntervalMin` on the VPS is `5` (default is `10`), which doubles that loop.
 
 ---
 
