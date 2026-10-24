@@ -82,7 +82,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | **Entry / orchestration** | | |
 | `index.js` | ~2016 | Daemon. Cron, REPL, Telegram bot, briefing, HiveMind bootstrap, PnL poller, deterministic close rules, single-candidate skip rule, settings menu. **All** automatic cycles start here. |
 | `agent.js` | 416 | `agentLoop(goal, maxSteps, history, agentType, model, maxOut, opts)`. The ReAct loop. Provider fallback, JSON repair, once-per-session tool locks, no-tool retries, `onToolStart`/`onToolFinish` callbacks for live Telegram messages. |
-| `cli.js` | 676 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
+| `cli.js` | 707 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
 | `setup.js` | ~750 | Interactive first-run wizard. Three presets (degen/moderate/safe) + custom. Covers strategy, screening filters, position sizing, trailing TP, per-role models. |
 | **Config & state** | | |
 | `config.js` | 278 | Loads `user-config.json` → live `config` object. Sections: `risk`, `screening`, `management`, `strategy`, `schedule`, `llm`, `darwin`, `tokens`, `hiveMind`, `api`, `jupiter`, `indicators`. Exposes `computeDeployAmount(walletSol)`, `reloadScreeningThresholds()`. `MIN_SAFE_BINS_BELOW = 35` (exported). |
@@ -229,6 +229,7 @@ Before `deploy_position` executes:
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
 - Recent-pump guard (NORMAL only): refuses deploy if the pool's last `pumpLookbackHours` (2h) of 5m candles contain a single candle that rose ≥ `maxPump5mPct` (20%) or a 15m (3-candle) window that rose ≥ `maxPump15mPct` (30%). Data: Meteora 5m OHLCV (`fetchPoolOhlcv`/`detectRecentPump` in screening.js). Wash/parabolic tell — calibrated to the ALON loss (2026-06-29: +24.5% 5m candle one bar before entry → −7.53% stop). Degen exempt; missing data never blocks. Enforced at the deploy gate (executor.js) and as a screening filter in `getTopCandidates` (degen opts out via `buildDegenScreeningOverrides`).
+- Smart-wallet presence guard (NORMAL deploys only; degen exempt; **off by default**, `smartWalletGuardEnabled`): requires ≥`smartWalletMinCount` tracked LP smart wallets to hold a DLMM position in a pool of the token. Fails closed (list/infra errors block); only a verified "none" sets the 2h pool/token cooldown, infra failures do not.
 
 ---
 
@@ -473,6 +474,14 @@ Key non-default values on VPS:
 - Orchestration lives in `pool-detail-resolver.js` (`resolvePoolDetail({ primary, fallback })`, pure/injectable, unit-tested in `test-pool-detail-resolver.js`). The direct endpoint returns the same field shape (`tvl`, `fee_active_tvl_ratio`, `dlmm_params.bin_step`, `volatility`, `token_x`), and the volatility check reads from the 30m re-fetch (also routed through the fallback), so thresholds verify on real data.
 
 ---
+
+## Smart-wallet guard (October 2026)
+
+Off by default; see docs/plans/2026-10-24-smart-wallet-guard-design.md. Enable flow:
+1. Add LP wallets via chat: "add smart wallet <addr> as <name>".
+2. Vet each with `node cli.js smart-wallet-check --mint <mint> --wallet <addr>` (read-only, ignores the enable flag).
+3. Enable with Telegram `/setcfg smartWalletGuardEnabled true` (parsed by `parseConfigValue`, applied through `update_config`); optionally `/setcfg smartWalletMinCount <n>`.
+`/config` shows a "Smart-wallet guard" line (state, min count, LP wallet count).
 
 ## SOL-Crash Circuit Breaker (June 2026)
 
