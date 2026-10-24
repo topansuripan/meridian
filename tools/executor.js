@@ -1072,14 +1072,16 @@ export async function executeTool(name, args) {
       if (name === "deploy_position") {
         sendHTML(`⛔ <b>Deploy Blocked</b>\n\n${safetyCheck.reason}`).catch(() => {});
         // Set cooldown so screener skips this pool/token next cycle
-        try {
-          setDeployFailureCooldown(
-            args.pool_address,
-            safetyCheck.resolvedBaseMint || args.base_mint || null,
-            `deploy blocked: ${safetyCheck.reason}`.slice(0, 200),
-          );
-        } catch (e) {
-          log("pool-memory", `Failed to set deploy-failure cooldown: ${e.message}`);
+        if (!safetyCheck.skipCooldown) {
+          try {
+            setDeployFailureCooldown(
+              args.pool_address,
+              safetyCheck.resolvedBaseMint || args.base_mint || null,
+              `deploy blocked: ${safetyCheck.reason}`.slice(0, 200),
+            );
+          } catch (e) {
+            log("pool-memory", `Failed to set deploy-failure cooldown: ${e.message}`);
+          }
         }
       }
       return {
@@ -1442,16 +1444,6 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // Smart-wallet presence guard (NORMAL only, degen exempt): tracked LP smart wallets
-      // must already be LPing this token. Fails closed — see smart-wallets.js.
-      try {
-        const swGuard = await evaluateSmartWalletGuard({ baseMint, isDegen });
-        if (!swGuard.pass) return { pass: false, reason: swGuard.reason };
-        if (swGuard.kind === "ok") log("safety_check", swGuard.reason);
-      } catch (e) {
-        return { pass: false, reason: `Smart-wallet guard error: ${e.message}` };
-      }
-
       // Check amount limits
       const amountY = deployAmountY;
       if (!Number.isFinite(amountY) || amountY <= 0) {
@@ -1474,6 +1466,28 @@ async function runSafetyChecks(name, args) {
           pass: false,
           reason: `SOL amount ${amountY} exceeds maximum allowed per position (${maxDeploy}).`,
         };
+      }
+
+      // Smart-wallet presence guard (NORMAL only, degen exempt): tracked LP smart wallets
+      // must already be LPing this token. Fails closed — see smart-wallets.js. Runs after the
+      // free deterministic checks above so bad requests are rejected before any RPC/alerts.
+      try {
+        const swGuard = await evaluateSmartWalletGuard({
+          baseMint: poolThresholds.resolvedBaseMint || null, // on-chain/pool-detail mint only, never the LLM's arg
+          isDegen: isDegen && config.degen?.enabled === true, // LLM-set degen:true can't bypass when degen mode is off
+        });
+        if (!swGuard.pass) {
+          return {
+            pass: false,
+            reason: swGuard.reason,
+            resolvedBaseMint: poolThresholds.resolvedBaseMint || null,
+            // Only a verified "no smart wallets" earns the pool/token cooldown; infra failures don't.
+            skipCooldown: swGuard.kind !== "none",
+          };
+        }
+        if (swGuard.kind === "ok") log("safety_check", swGuard.reason);
+      } catch (e) {
+        return { pass: false, reason: `Smart-wallet guard error: ${e.message}`, skipCooldown: true };
       }
 
       // Check SOL balance
