@@ -20,12 +20,12 @@ const HOLDER = { name: "hodl", address: "Wallet333333333333333333333333333333333
 // P_TOKEN = TOKEN/SOL, P_OTHER = OTHER/SOL, P_FLIP = SOL/TOKEN (token on the Y side)
 const POOL_MINTS = { P_TOKEN: [TOKEN, SOL], P_OTHER: [OTHER, SOL], P_FLIP: [SOL, TOKEN] };
 
-function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mintFails = false, notifyThrows = false, poolMints = { ...POOL_MINTS }, mintCacheMax } = {}) {
+function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mintFails = false, notifyThrows = false, poolMints = { ...POOL_MINTS }, mintCacheMax, listWallets } = {}) {
   let t = 1_000_000;
   const calls = { positions: [], mints: [], alerts: [], sleeps: [] };
   const state = { failing, mintFails };
   const checker = createPresenceChecker({
-    listWallets: () => wallets,
+    listWallets: listWallets || (() => wallets),
     fetchPositionPools: async (addr) => {
       calls.positions.push(addr);
       if (state.failing.has(addr)) throw new Error("429 Too Many Requests");
@@ -296,7 +296,8 @@ test("a shared lookup that rejects falls back to stale cache for every waiter", 
   assert.equal(h.calls.positions.filter((a) => a === W1.address).length, 2);
 });
 
-import { evaluateSmartWalletGuard } from "../smart-wallets.js";
+import { evaluateSmartWalletGuard, fetchPositionPools, fetchPoolMints } from "../smart-wallets.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
 
 async function withGuardConfig(patch, fn) {
   const saved = { ...config.smartWalletGuard };
@@ -330,4 +331,93 @@ test("evaluateSmartWalletGuard: enabled delegates with config minCount", async (
     assert.equal(seen.baseMint, TOKEN);
     assert.equal(seen.minCount, 2);
   });
+});
+
+test("listWallets throwing -> list-error with one alert", async () => {
+  const { checker, calls } = harness({ listWallets: () => { throw new Error("boom"); } });
+  const r = await checker.check({ baseMint: TOKEN });
+  assert.equal(r.pass, false);
+  assert.equal(r.kind, "list-error");
+  assert.ok(r.reason.includes("list (boom)"));
+  assert.equal(calls.alerts.length, 1);
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(calls.alerts.length, 1);
+});
+
+test("listWallets returning a non-array -> list-error", async () => {
+  const { checker } = harness({ listWallets: () => ({}) });
+  const r = await checker.check({ baseMint: TOKEN });
+  assert.equal(r.kind, "list-error");
+  assert.equal(r.pass, false);
+});
+
+test("junk list entries are skipped", async () => {
+  const { checker } = harness({ listWallets: () => [null, { name: "x" }, W1], positions: { [W1.address]: [P("P_TOKEN")] } });
+  const r = await checker.check({ baseMint: TOKEN });
+  assert.equal(r.pass, true);
+  assert.equal(r.matched[0].name, "alpha");
+});
+
+// ─── real fetchers with fake connections ───────────────────────
+const DLMM = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const POSITION_V2_B58 = "LgkNAEYaVX3";
+const LB_PAIR_DISC = Buffer.from([33, 11, 49, 98, 181, 101, 177, 13]);
+const key = () => Keypair.generate().publicKey;
+
+function lbPairInfo(x, y, { owner = DLMM, disc = LB_PAIR_DISC, size = 904 } = {}) {
+  const data = Buffer.alloc(size);
+  disc.copy(data, 0);
+  if (size >= 152) { x.toBuffer().copy(data, 88); y.toBuffer().copy(data, 120); }
+  return { owner: new PublicKey(owner), data };
+}
+
+test("fetchPoolMints reads mints at 88/120 and omits bad accounts", async () => {
+  const pools = [key().toBase58(), key().toBase58(), key().toBase58(), key().toBase58()];
+  const x = key(), y = key();
+  const infos = [
+    lbPairInfo(x, y),
+    lbPairInfo(x, y, { owner: key().toBase58() }),
+    lbPairInfo(x, y, { size: 100 }),
+    lbPairInfo(x, y, { disc: Buffer.alloc(8, 1) }),
+  ];
+  const conn = { getMultipleAccountsInfo: async () => infos };
+  const out = await fetchPoolMints(pools, conn);
+  assert.deepEqual([...out.keys()], [pools[0]]);
+  assert.deepEqual(out.get(pools[0]), [x.toBase58(), y.toBase58()]);
+});
+
+test("fetchPoolMints chunks 250 pools into 100/100/50", async () => {
+  const pools = Array.from({ length: 250 }, () => key().toBase58());
+  const sizes = [];
+  const conn = { getMultipleAccountsInfo: async (ks) => { sizes.push(ks.length); return ks.map(() => null); } };
+  const out = await fetchPoolMints(pools, conn);
+  assert.deepEqual(sizes, [100, 100, 50]);
+  assert.equal(out.size, 0);
+});
+
+test("fetchPositionPools filters by discriminator + owner, slices lbPair, dedupes", async () => {
+  const owner = key().toBase58();
+  const lb = key();
+  let args = null;
+  const conn = {
+    getProgramAccounts: async (pid, cfg) => {
+      args = { pid: pid.toBase58(), cfg };
+      return [{ account: { data: lb.toBuffer() } }, { account: { data: Buffer.from(lb.toBuffer()) } }];
+    },
+  };
+  const pools = await fetchPositionPools(owner, conn);
+  assert.deepEqual(pools, [lb.toBase58()]);
+  assert.equal(args.pid, DLMM);
+  assert.deepEqual(args.cfg.dataSlice, { offset: 8, length: 32 });
+  assert.deepEqual(args.cfg.filters, [
+    { memcmp: { offset: 0, bytes: POSITION_V2_B58 } },
+    { memcmp: { offset: 40, bytes: owner } },
+  ]);
+});
+
+test("fetchPositionPools rejects an invalid owner before any RPC call", async () => {
+  let called = false;
+  const conn = { getProgramAccounts: async () => { called = true; return []; } };
+  await assert.rejects(() => fetchPositionPools("not-a-key!", conn));
+  assert.equal(called, false);
 });

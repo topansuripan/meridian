@@ -11,8 +11,9 @@ function loadWallets() {
   if (!fs.existsSync(WALLETS_PATH)) return { wallets: [] };
   try {
     return JSON.parse(fs.readFileSync(WALLETS_PATH, "utf8"));
-  } catch {
-    return { wallets: [] };
+  } catch (e) {
+    log("smart_wallets", `smart-wallets.json unreadable: ${e.message}`);
+    return { wallets: [], corrupt: true };
   }
 }
 
@@ -27,6 +28,7 @@ export function addSmartWallet({ name, address, category = "alpha", type = "lp" 
     return { success: false, error: "Invalid Solana address format" };
   }
   const data = loadWallets();
+  if (data.corrupt) return { success: false, error: "smart-wallets.json is unreadable — fix or delete it by hand first" };
   const existing = data.wallets.find((w) => w.address === address);
   if (existing) {
     return { success: false, error: `Already tracked as "${existing.name}"` };
@@ -39,6 +41,7 @@ export function addSmartWallet({ name, address, category = "alpha", type = "lp" 
 
 export function removeSmartWallet({ address }) {
   const data = loadWallets();
+  if (data.corrupt) return { success: false, error: "smart-wallets.json is unreadable — fix or delete it by hand first" };
   const wallet = data.wallets.find((w) => w.address === address);
   if (!wallet) return { success: false, error: "Wallet not found" };
   data.wallets = data.wallets.filter((w) => w.address !== address);
@@ -209,8 +212,18 @@ export function createPresenceChecker({
       if (!baseMint && alert) await maybeAlert("no-mint", "⚠️ Smart-wallet guard received a candidate with no base mint — likely a wiring bug; that deploy is blocked.");
       return { ...empty, pass: false, kind: "no-mint", reason: `Smart-wallet guard: base mint ${baseMint ? "is a quote token" : "unknown"} — cannot verify presence` };
     }
+    let list;
+    try {
+      list = listWallets();
+      if (!Array.isArray(list)) throw new Error("wallet list is not an array");
+    } catch (e) {
+      const reason = `Smart-wallet guard: can't read the smart-wallet list (${e.message}) — deploys blocked`;
+      if (alert) await maybeAlert("list-error", `⚠️ ${reason}`);
+      return { ...empty, pass: false, kind: "list-error", reason };
+    }
     const seen = new Set();
-    const wallets = listWallets()
+    const wallets = list
+      .filter((w) => w && typeof w === "object" && typeof w.address === "string")
       .filter((w) => !w.type || w.type === "lp")
       .filter((w) => !seen.has(w.address) && seen.add(w.address));
     if (wallets.length === 0) {
@@ -262,6 +275,10 @@ export function createPresenceChecker({
 }
 
 // ─── Real fetchers (public RPC_URL) ─────────────────────────────
+// Anchor account discriminators = sha256("account:<Name>")[0..8]; confirmed against the installed
+// @meteora-ag/dlmm SDK (positionV2Filter() -> "LgkNAEYaVX3"; getAccountDiscriminator("positionV2"/"lbPair")).
+const POSITION_V2_DISCRIMINATOR_B58 = "LgkNAEYaVX3"; // bytes 75b0d4c7f5b485b6
+const LB_PAIR_DISCRIMINATOR = Buffer.from([33, 11, 49, 98, 181, 101, 177, 13]);
 const DLMM_PROGRAM_ID = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const RPC_TIMEOUT_MS = 15_000; // lookups are shared between checks — a hung request must not stall the deploy gate
 
@@ -269,7 +286,12 @@ let _connection = null;
 function getConnection() {
   // disableRetryOnRateLimit: web3.js otherwise retries 429s for ~7.5s per call; the checker's
   // own backoff + stale cache handle rate limits instead.
-  if (!_connection) _connection = new Connection(process.env.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true });
+  if (!_connection) _connection = new Connection(process.env.RPC_URL, {
+      commitment: "confirmed",
+      disableRetryOnRateLimit: true,
+      // really abort hung requests (withTimeout below is only a backstop)
+      fetch: (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(RPC_TIMEOUT_MS) }),
+    });
   return _connection;
 }
 
@@ -284,11 +306,15 @@ function withTimeout(promise, label) {
 // Pools (lbPair addresses) the owner has open DLMM positions in.
 // Position layout: lbPair @8..40, owner @40..72 — same filter as getWalletPositions,
 // but sliced to the lbPair only and without the Meteora PnL enrichment.
-export async function fetchPositionPools(owner) {
+export async function fetchPositionPools(owner, conn = getConnection()) {
+  const ownerB58 = new PublicKey(owner).toBase58(); // throws on malformed input before any RPC call
   const accounts = await withTimeout(
-    getConnection().getProgramAccounts(new PublicKey(DLMM_PROGRAM_ID), {
+    conn.getProgramAccounts(new PublicKey(DLMM_PROGRAM_ID), {
       dataSlice: { offset: 8, length: 32 },
-      filters: [{ memcmp: { offset: 40, bytes: owner } }],
+      filters: [
+        { memcmp: { offset: 0, bytes: POSITION_V2_DISCRIMINATOR_B58 } },
+        { memcmp: { offset: 40, bytes: ownerB58 } },
+      ],
     }),
     "getProgramAccounts",
   );
@@ -297,16 +323,17 @@ export async function fetchPositionPools(owner) {
 
 // lbPair -> [tokenXMint, tokenYMint]. LbPair layout: tokenXMint @88..120, tokenYMint @120..152
 // (verified on DMXK4u68… and Gc5hVCBy… 2026-10-24). Missing/foreign accounts are omitted.
-export async function fetchPoolMints(pools) {
+export async function fetchPoolMints(pools, conn = getConnection()) {
   const out = new Map();
   for (let i = 0; i < pools.length; i += 100) {
     const chunk = pools.slice(i, i + 100);
     const infos = await withTimeout(
-      getConnection().getMultipleAccountsInfo(chunk.map((p) => new PublicKey(p))),
+      conn.getMultipleAccountsInfo(chunk.map((p) => new PublicKey(p))),
       "getMultipleAccountsInfo",
     );
     infos.forEach((info, j) => {
       if (!info || info.owner.toBase58() !== DLMM_PROGRAM_ID || info.data.length < 152) return;
+      if (!info.data.subarray(0, 8).equals(LB_PAIR_DISCRIMINATOR)) return;
       out.set(chunk[j], [
         new PublicKey(info.data.subarray(88, 120)).toBase58(),
         new PublicKey(info.data.subarray(120, 152)).toBase58(),
@@ -320,7 +347,11 @@ let _defaultChecker = null;
 function defaultChecker() {
   if (!_defaultChecker) {
     _defaultChecker = createPresenceChecker({
-      listWallets: () => loadWallets().wallets,
+      listWallets: () => {
+        const d = loadWallets();
+        if (d.corrupt) throw new Error("smart-wallets.json is not valid JSON");
+        return d.wallets;
+      },
       fetchPositionPools,
       fetchPoolMints,
       notify: (text) => sendMessage(text),
