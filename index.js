@@ -31,7 +31,7 @@ import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTracke
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
-import { checkSmartWalletsOnPool } from "./smart-wallets.js";
+import { checkSmartWalletsOnPool, evaluateSmartWalletGuard, listSmartWallets } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { studyTopLPers } from "./tools/study.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -888,10 +888,27 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const gmgnAllFiltered = topCandidates?.all_filtered ?? [];
 
     const allCandidates = [];
+    const filteredOut = [];
+    // Smart-wallet guard on: use the token-level presence check (same one the executor
+    // enforces) so the LLM never picks a pool that will be blocked. Off: legacy soft signal.
+    const guardOn = config.smartWalletGuard?.enabled === true;
     for (const pool of candidates) {
       const mint = pool.base?.mint;
+      // Guard first: a failing candidate is dropped before any Jupiter lookups are spent on it.
+      let presence = null;
+      if (guardOn) {
+        presence = await evaluateSmartWalletGuard({ baseMint: mint })
+          .catch((e) => ({ pass: false, reason: `Smart-wallet guard error: ${e.message}`, matched: [] }));
+        if (!presence.pass) {
+          log("screening", `Smart-wallet guard: dropped ${pool.name} — ${presence.reason}`);
+          filteredOut.push({ name: pool.name, reason: presence.reason });
+          continue;
+        }
+      }
       const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
-        checkSmartWalletsOnPool({ pool_address: pool.pool }),
+        guardOn
+          ? Promise.resolve({ in_pool: presence.matched || [], presence })
+          : checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
       ]);
@@ -907,7 +924,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     // Skipped for GMGN: platforms already filtered upstream; bundler/bot data from GMGN pipeline
-    const filteredOut = [];
     const passing = allCandidates.filter(({ pool, ti }) => {
       if (pool.gmgn) return true;
       const launchpad = ti?.launchpad ?? null;
@@ -938,8 +954,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
         .join("\n");
       const funnelBlock = buildGmgnFunnelReport(gmgnStageCounts, gmgnAllFiltered, { fromStage: 2 });
       const thresholds = `Thresholds: tvl>$${config.screening.minTvl} | vol>$${config.screening.minVolume} | organic>${config.screening.minOrganic}% | holders>${config.screening.minHolders} | fee/tvl>${config.screening.minFeeActiveTvlRatio}%`;
+      const guardDropExamples = funnelBlock && filteredOut.length > 0
+        ? filteredOut.slice(0, 5).map((entry) => `- ${entry.name}: ${entry.reason}`).join("\n")
+        : "";
       screenReport = funnelBlock
-        ? `No candidates available.\n\n${funnelBlock}`
+        ? `No candidates available.\n\n${funnelBlock}${guardDropExamples ? `\n\nFiltered examples:\n${guardDropExamples}` : ""}`
         : combinedExamples
           ? `No candidates available.\nFiltered examples:\n${combinedExamples}`
           : `No candidates available (all filtered).\n${thresholds}`;
@@ -947,7 +966,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         type: "no_deploy",
         actor: "SCREENER",
         summary: "No candidates available",
-        reason: funnelBlock || combinedExamples || "All candidates filtered before deploy",
+        reason: funnelBlock ? `${funnelBlock}${guardDropExamples ? `\n\nFiltered examples:\n${guardDropExamples}` : ""}` : (combinedExamples || "All candidates filtered before deploy"),
         rejected: combined.slice(0, 5).map((entry) => `${entry.name}: ${entry.reason}`),
       });
       return screenReport;
@@ -1035,7 +1054,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
           `POOL: ${pool.name} (${pool.pool})`,
           formatGmgnCandidateForPrompt(pool),
           pvpLine,
-          `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
+          guardOn
+            ? `  smart_wallets: guard passed (${(sw?.in_pool || []).map(w => w.name || w.address?.slice(0, 4)).join(", ")}) — required for every candidate, not a differentiator`
+            : `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
           activeBin != null ? `  active_bin: ${activeBin}` : null,
           strategyHint ? `  top_lp_hint: ${strategyHint.summary} | score_boost=+${strategyHint.score_boost}` : null,
           n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
@@ -1052,7 +1073,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
           `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
           gmgnPriceLine,
           pvpLine,
-          `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
+          guardOn
+            ? `  smart_wallets: guard passed (${(sw?.in_pool || []).map(w => w.name || w.address?.slice(0, 4)).join(", ")}) — required for every candidate, not a differentiator`
+            : `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
           activeBin != null ? `  active_bin: ${activeBin}` : null,
           priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
           strategyHint ? `  top_lp_hint: ${strategyHint.summary} | score_boost=+${strategyHint.score_boost}` : null,
@@ -1072,7 +1095,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
           volume:                pool.volume_window         ?? null,
           mcap:                  pool.mcap                  ?? null,
           holder_count:          ti?.holders                ?? null,
-          smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
+          smart_wallets_present: guardOn ? null : (sw?.in_pool?.length ?? 0) > 0, // guard on: constant-true, no signal
           narrative_quality:     n?.narrative ? "present" : "absent",
           volatility:            pool.volatility            ?? null,
         });
@@ -1647,9 +1670,19 @@ Summarize the current portfolio health, total fees earned, and performance of al
         // tracked KOL list). The smart-wallet lookup runs only for borderline pools to keep
         // the 45s poll cheap.
         let trigger = null;
+        const guardOn = config.smartWalletGuard?.enabled === true;
         for (const c of candidates) {
           const s = degenScore(c, config.opportunity);
           if (s < floor) break; // sorted desc — nothing below can qualify either
+          if (guardOn) {
+            // Presence is mandatory but never lowers the bar: the pool must still reach
+            // minScore. Cached per wallet, so the 45s poll adds no RPC load beyond the 5-min refresh.
+            if (s < minScore) continue; // guard on: presence is required, not a score bonus
+            const pres = await evaluateSmartWalletGuard({ baseMint: c.base?.mint }).catch(() => null);
+            if (!pres?.pass) continue;
+            trigger = { c, s, smart: pres.matched };
+            break;
+          }
           if (s >= minScore) { trigger = { c, s, smart: [] }; break; }
           if (bonus <= 0) continue; // borderline but smart-wallet rescue disabled
           const smart = (await checkSmartWalletsOnPool({ pool_address: c.pool }).catch(() => null))?.in_pool || [];
@@ -1657,10 +1690,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         if (!trigger) return;
 
+        const smartNames = trigger.smart.map((w) => w.name || w.address?.slice(0, 4)).join(", ");
         const smartTag = trigger.smart.length
-          ? ` + smart wallet [${trigger.smart.map((w) => w.name || w.address?.slice(0, 4)).join(", ")}] (bar lowered ${minScore}→${floor})`
+          ? ` + smart wallet [${smartNames}]${trigger.s < minScore ? ` (bar lowered ${minScore}→${floor})` : ""}`
           : "";
-        log("cron", `[Opportunity] ${trigger.c.name} degen ${trigger.s.toFixed(1)} >= ${trigger.smart.length ? floor : minScore}${smartTag} — triggering screening deploy decision`);
+        log("cron", `[Opportunity] ${trigger.c.name} degen ${trigger.s.toFixed(1)} >= ${trigger.s < minScore ? floor : minScore}${smartTag} — triggering screening deploy decision`);
         runScreeningCycle({ silent: true }).catch((e) => log("cron_error", `Opportunity-triggered screening failed: ${e.message}`));
       } catch (e) {
         log("cron_error", `Opportunity poll failed: ${e.message}`);
@@ -1862,6 +1896,7 @@ function formatConfigSnapshot() {
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
     `GMGN interval: ${config.gmgn.interval} | OrderBy: ${config.gmgn.orderBy} | Dir: ${config.gmgn.direction}`,
     `Top LP learning: ${config.learning.autoLearnTopLps ? "on" : "off"} | TTL ${config.learning.topLpStudyTtlHours}h | top ${config.learning.topLpAutoLearnLimit}`,
+    `Smart-wallet guard: ${config.smartWalletGuard.enabled ? `ON (min ${config.smartWalletGuard.minCount}, ${listSmartWallets().wallets.filter((w) => !w.type || w.type === "lp").length} LP wallets)` : "off"}`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
     `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
   ];
@@ -2618,10 +2653,12 @@ async function telegramHandler(msg) {
     const action = text.match(/\b(on|off|status)\b/i)?.[1]?.toLowerCase();
     if (action === "on") {
       _degenEnabled = true;
+      config.degen.enabled = true; // executor guard exemption reads config.degen.enabled
       startDegenCrons();
       await sendMessage(`Degen mode ON\nScreening: with normal cycle\nManagement: every ${config.degen.managementIntervalMin}m\nMax positions: ${config.degen.maxPositions}\nMax deploy: ${config.degen.maxDeployAmount} SOL\nVolume filter: $${config.degen.minVolume}\nSL: ${config.degen.stopLossPct}% | TP: ${config.degen.takeProfitPct}%`).catch(() => {});
     } else if (action === "off") {
       _degenEnabled = false;
+      config.degen.enabled = false;
       stopDegenCrons();
       await sendMessage("Degen mode OFF").catch(() => {});
     } else {

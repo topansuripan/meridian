@@ -118,6 +118,15 @@ export const config = {
     backfillOnStart:       u.solCrashGuard?.backfillOnStart      ?? true,
   },
 
+  // ─── Smart-Wallet Presence Guard ─────────
+  // Hard deploy gate: require tracked LP smart wallets to already be LPing the token.
+  // Ships OFF — with an empty smart-wallets.json it would block every deploy.
+  // See docs/plans/2026-10-24-smart-wallet-guard-design.md
+  smartWalletGuard: {
+    enabled:  u.smartWalletGuardEnabled === true,
+    minCount: Number(u.smartWalletMinCount ?? 1),
+  },
+
   // ─── Pool Screening Thresholds ───────────
   screening: {
     source:            u.screeningSource    ?? "meteora", // meteora | gmgn

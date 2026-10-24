@@ -20,7 +20,7 @@ import { getPoolMemory, addPoolNote, wasBaseMintDeployedSince, setDeployFailureC
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
-import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
+import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool, evaluateSmartWalletGuard } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative, getTokenAudit } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { isCoolingDown as solGuardCoolingDown } from "../sol-crash-guard.js";
@@ -45,6 +45,10 @@ const TIMEFRAME_MINUTES = {
 };
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap, notifySwapBack, sendHTML } from "../telegram.js";
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -556,6 +560,7 @@ function normalizeConfigValue(key, value) {
     "darwinEnabled",
     "lpAgentRelayEnabled",
     "autoLearnTopLps",
+    "smartWalletGuardEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
   const stringKeys = new Set([
@@ -746,6 +751,9 @@ const toolMap = {
       opportunityPollLimit: ["opportunity", "limit"],
       opportunityMinScore: ["opportunity", "minScore"],
       opportunitySmartWalletBonus: ["opportunity", "smartWalletScoreBonus"],
+      // smart-wallet presence guard
+      smartWalletGuardEnabled: ["smartWalletGuard", "enabled"],
+      smartWalletMinCount: ["smartWalletGuard", "minCount"],
       degenTargetVolRatio: ["opportunity", "targetVolRatio"],
       degenTargetLpCount: ["opportunity", "targetLpCount"],
       degenTargetFeeRatio: ["opportunity", "targetFeeRatio"],
@@ -1066,16 +1074,18 @@ export async function executeTool(name, args) {
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       if (name === "deploy_position") {
-        sendHTML(`⛔ <b>Deploy Blocked</b>\n\n${safetyCheck.reason}`).catch(() => {});
+        sendHTML(`⛔ <b>Deploy Blocked</b>\n\n${escapeHtml(safetyCheck.reason)}`).catch(() => {});
         // Set cooldown so screener skips this pool/token next cycle
-        try {
-          setDeployFailureCooldown(
-            args.pool_address,
-            safetyCheck.resolvedBaseMint || args.base_mint || null,
-            `deploy blocked: ${safetyCheck.reason}`.slice(0, 200),
-          );
-        } catch (e) {
-          log("pool-memory", `Failed to set deploy-failure cooldown: ${e.message}`);
+        if (!safetyCheck.skipCooldown) {
+          try {
+            setDeployFailureCooldown(
+              args.pool_address,
+              safetyCheck.resolvedBaseMint || args.base_mint || null,
+              `deploy blocked: ${safetyCheck.reason}`.slice(0, 200),
+            );
+          } catch (e) {
+            log("pool-memory", `Failed to set deploy-failure cooldown: ${e.message}`);
+          }
         }
       }
       return {
@@ -1460,6 +1470,28 @@ async function runSafetyChecks(name, args) {
           pass: false,
           reason: `SOL amount ${amountY} exceeds maximum allowed per position (${maxDeploy}).`,
         };
+      }
+
+      // Smart-wallet presence guard (NORMAL only, degen exempt): tracked LP smart wallets
+      // must already be LPing this token. Fails closed — see smart-wallets.js. Runs after the
+      // free deterministic checks above so bad requests are rejected before any RPC/alerts.
+      try {
+        const swGuard = await evaluateSmartWalletGuard({
+          baseMint: poolThresholds.resolvedBaseMint || null, // on-chain/pool-detail mint only, never the LLM's arg
+          isDegen: isDegen && config.degen?.enabled === true, // LLM-set degen:true can't bypass when degen mode is off
+        });
+        if (!swGuard.pass) {
+          return {
+            pass: false,
+            reason: swGuard.reason,
+            resolvedBaseMint: poolThresholds.resolvedBaseMint || null,
+            // Only a verified "no smart wallets" earns the pool/token cooldown; infra failures don't.
+            skipCooldown: swGuard.kind !== "none",
+          };
+        }
+        if (swGuard.kind === "ok") log("safety_check", swGuard.reason);
+      } catch (e) {
+        return { pass: false, reason: `Smart-wallet guard error: ${e.message}`, skipCooldown: true };
       }
 
       // Check SOL balance
