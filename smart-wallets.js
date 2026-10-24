@@ -51,8 +51,8 @@ export function removeSmartWallet({ address }) {
 }
 
 export function listSmartWallets() {
-  const { wallets } = loadWallets();
-  return { total: wallets.length, wallets };
+  const { wallets, corrupt } = loadWallets();
+  return { total: wallets.length, wallets, ...(corrupt ? { corrupt: true } : {}) };
 }
 
 // Cache wallet positions for 5 minutes to avoid hammering RPC

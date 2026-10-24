@@ -46,6 +46,10 @@ const TIMEFRAME_MINUTES = {
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap, notifySwapBack, sendHTML } from "../telegram.js";
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function numberOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -1070,7 +1074,7 @@ export async function executeTool(name, args) {
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       if (name === "deploy_position") {
-        sendHTML(`⛔ <b>Deploy Blocked</b>\n\n${safetyCheck.reason}`).catch(() => {});
+        sendHTML(`⛔ <b>Deploy Blocked</b>\n\n${escapeHtml(safetyCheck.reason)}`).catch(() => {});
         // Set cooldown so screener skips this pool/token next cycle
         if (!safetyCheck.skipCooldown) {
           try {

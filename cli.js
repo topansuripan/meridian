@@ -439,18 +439,24 @@ switch (subcommand) {
   // ── smart-wallet-check ───────────────────────────────────────────
   case "smart-wallet-check": {
     if (!flags.mint) die("Usage: meridian smart-wallet-check --mint <base_mint> [--wallet <addr>]");
+    if (flags.wallet) {
+      const { PublicKey } = await import("@solana/web3.js");
+      try { new PublicKey(flags.wallet); } catch { die("Invalid --wallet address"); }
+    }
     const { createPresenceChecker, fetchPositionPools, fetchPoolMints, listSmartWallets } = await import("./smart-wallets.js");
     const { config } = await import("./config.js");
-    const wallets = flags.wallet
-      ? [{ name: "adhoc", address: flags.wallet, type: "lp" }]
-      : listSmartWallets().wallets;
     const checker = createPresenceChecker({
-      listWallets: () => wallets,
+      listWallets: () => {
+        if (flags.wallet) return [{ name: "adhoc", address: flags.wallet, type: "lp" }];
+        const l = listSmartWallets();
+        if (l.corrupt) throw new Error("smart-wallets.json is not valid JSON");
+        return l.wallets;
+      },
       fetchPositionPools: (owner) => fetchPositionPools(owner),
       fetchPoolMints: (pools) => fetchPoolMints(pools),
     });
     const started = Date.now();
-    const result = await checker.check({ baseMint: flags.mint, minCount: config.smartWalletGuard.minCount, alert: false, stopAtMinCount: false });
+    const result = await checker.check({ baseMint: flags.mint, minCount: flags.wallet ? 1 : config.smartWalletGuard.minCount, alert: false, stopAtMinCount: false });
     out({ ...result, elapsed_ms: Date.now() - started });
     break;
   }

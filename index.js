@@ -31,7 +31,7 @@ import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTracke
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
-import { checkSmartWalletsOnPool, evaluateSmartWalletGuard } from "./smart-wallets.js";
+import { checkSmartWalletsOnPool, evaluateSmartWalletGuard, listSmartWallets } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { studyTopLPers } from "./tools/study.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -1055,7 +1055,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
           formatGmgnCandidateForPrompt(pool),
           pvpLine,
           guardOn
-            ? `  smart_wallets: guard passed (${(sw?.in_pool || []).map(w => w.name).join(", ")}) — required for every candidate, not a differentiator`
+            ? `  smart_wallets: guard passed (${(sw?.in_pool || []).map(w => w.name || w.address?.slice(0, 4)).join(", ")}) — required for every candidate, not a differentiator`
             : `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
           activeBin != null ? `  active_bin: ${activeBin}` : null,
           strategyHint ? `  top_lp_hint: ${strategyHint.summary} | score_boost=+${strategyHint.score_boost}` : null,
@@ -1074,7 +1074,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
           gmgnPriceLine,
           pvpLine,
           guardOn
-            ? `  smart_wallets: guard passed (${(sw?.in_pool || []).map(w => w.name).join(", ")}) — required for every candidate, not a differentiator`
+            ? `  smart_wallets: guard passed (${(sw?.in_pool || []).map(w => w.name || w.address?.slice(0, 4)).join(", ")}) — required for every candidate, not a differentiator`
             : `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
           activeBin != null ? `  active_bin: ${activeBin}` : null,
           priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
@@ -1896,6 +1896,7 @@ function formatConfigSnapshot() {
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
     `GMGN interval: ${config.gmgn.interval} | OrderBy: ${config.gmgn.orderBy} | Dir: ${config.gmgn.direction}`,
     `Top LP learning: ${config.learning.autoLearnTopLps ? "on" : "off"} | TTL ${config.learning.topLpStudyTtlHours}h | top ${config.learning.topLpAutoLearnLimit}`,
+    `Smart-wallet guard: ${config.smartWalletGuard.enabled ? `ON (min ${config.smartWalletGuard.minCount}, ${listSmartWallets().wallets.filter((w) => !w.type || w.type === "lp").length} LP wallets)` : "off"}`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
     `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
   ];

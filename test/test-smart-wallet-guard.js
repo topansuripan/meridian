@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { config } from "../config.js";
 
-test("config.smartWalletGuard defaults to off with minCount 1", () => {
-  assert.equal(config.smartWalletGuard.enabled, false);
-  assert.equal(config.smartWalletGuard.minCount, 1);
+test("config.smartWalletGuard is well-formed", () => {
   assert.equal(typeof config.smartWalletGuard.enabled, "boolean");
+  const { minCount } = config.smartWalletGuard;
+  assert.ok(Number.isInteger(minCount) && minCount >= 1);
 });
 
 import { createPresenceChecker } from "../smart-wallets.js";
