@@ -1,4 +1,5 @@
 import "./envcrypt.js";
+import "./network-defaults.js";
 import cron from "node-cron";
 import readline from "readline";
 import path from "path";

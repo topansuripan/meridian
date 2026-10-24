@@ -115,6 +115,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `discord-listener/pre-checks.js` | 205 | Pipeline: dedup (10min) → blacklist → pool resolution (Meteora direct → DexScreener) → rugcheck.xyz (score>50000 OR top10>60% reject) → deployer blacklist → Jupiter global fees check (`minTokenFeesSol`). |
 | `briefing.js` | 71 | HTML daily report. 24h activity, performance, lessons, current portfolio. Sent at 1:00 UTC. |
 | `envcrypt.js` | 121 | XOR-cipher with a key from `.envrypt`/`ENVRYPT_KEY`. Encrypts anything matching `*_KEY`, `*SECRET*`, `*TOKEN*`, `*MNEMONIC*`, etc. The `# encrypted` marker in `.env` precedes encrypted lines. |
+| `network-defaults.js` | 8 | Imported second in `index.js`. Raises Node's happy-eyeballs per-address timeout from 250 ms to 5 s; at 250 ms, Telegram sends and polls failed with `fetch failed (ETIMEDOUT [ETIMEDOUT, ENETUNREACH])` whenever the event loop stalled (VPS→Telegram ≈175 ms, no IPv6). |
 | `logger.js` | 75 | Daily-rotating `logs/agent-YYYY-MM-DD.log`. `logAction({tool, args, result, duration_ms, success})` writes JSONL `actions-YYYY-MM-DD.jsonl` audit trail. Level via `LOG_LEVEL` env. |
 | **Other** | | |
 | `discord-listener/`, `test/`, `scripts/`, `utils/` | | Discord listener (above), syntax-checked tests, envcrypt CLI, `safeNumber`. |
