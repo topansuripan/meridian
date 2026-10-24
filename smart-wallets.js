@@ -127,6 +127,7 @@ export function createPresenceChecker({
   now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   logger = log,
+  mintCacheMax = MINT_CACHE_MAX,
 }) {
   const posCache = new Map();    // wallet address -> { pools, fetchedAt }
   const mintCache = new Map();   // pool address -> { mints: [mintX, mintY] ([] if the account is missing), at }
@@ -159,27 +160,36 @@ export function createPresenceChecker({
       failedAt.delete(wallet.address);
       return pools;
     } catch (e) {
-      if (!inBackoff(wallet.address)) failedAt.set(wallet.address, now());
+      // quiet = already in backoff (skipped, or another waiter on the same lookup already recorded the failure)
+      const quiet = inBackoff(wallet.address);
+      if (!quiet) failedAt.set(wallet.address, now());
       if (cached && now() - cached.fetchedAt <= STALE_OK_MS) {
-        logger("smart_wallets", `Lookup failed for ${walletLabel(wallet)} (${e.message}) — using ${Math.round((now() - cached.fetchedAt) / 60_000)}m-old cache`);
+        if (!quiet) logger("smart_wallets", `Lookup failed for ${walletLabel(wallet)} (${e.message}) — using ${Math.round((now() - cached.fetchedAt) / 60_000)}m-old cache`);
         return cached.pools;
       }
-      logger("smart_wallets", `Lookup failed for ${walletLabel(wallet)}: ${e.message}`);
+      if (!quiet) logger("smart_wallets", `Lookup failed for ${walletLabel(wallet)}: ${e.message}`);
       return null;
     }
   }
 
   async function mintsFor(pools) {
-    const missing = pools.filter((p) => {
+    const entries = [];
+    const missing = [];
+    for (const p of pools) {
       const c = mintCache.get(p);
-      return !c || (c.mints.length === 0 && now() - c.at > MISS_RETRY_MS);
-    });
+      if (!c || (c.mints.length === 0 && now() - c.at > MISS_RETRY_MS)) missing.push(p);
+      else entries.push(c);
+    }
     if (missing.length) {
       const resolved = await fetchPoolMints(missing);
-      if (mintCache.size >= MINT_CACHE_MAX) mintCache.clear();
-      for (const p of missing) mintCache.set(p, { mints: resolved.get(p) || [], at: now() });
+      if (mintCache.size >= mintCacheMax) mintCache.clear();
+      for (const p of missing) {
+        const e = { mints: resolved.get(p) || [], at: now() };
+        mintCache.set(p, e);
+        entries.push(e);
+      }
     }
-    return new Set(pools.flatMap((p) => mintCache.get(p).mints));
+    return new Set(entries.flatMap((e) => e.mints));
   }
 
   async function maybeAlert(kind, text) {

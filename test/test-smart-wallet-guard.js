@@ -20,7 +20,7 @@ const HOLDER = { name: "hodl", address: "Wallet333333333333333333333333333333333
 // P_TOKEN = TOKEN/SOL, P_OTHER = OTHER/SOL, P_FLIP = SOL/TOKEN (token on the Y side)
 const POOL_MINTS = { P_TOKEN: [TOKEN, SOL], P_OTHER: [OTHER, SOL], P_FLIP: [SOL, TOKEN] };
 
-function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mintFails = false, notifyThrows = false, poolMints = { ...POOL_MINTS } } = {}) {
+function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mintFails = false, notifyThrows = false, poolMints = { ...POOL_MINTS }, mintCacheMax } = {}) {
   let t = 1_000_000;
   const calls = { positions: [], mints: [], alerts: [], sleeps: [] };
   const state = { failing, mintFails };
@@ -43,6 +43,7 @@ function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mint
     now: () => t,
     sleep: async (ms) => { calls.sleeps.push(ms); },
     logger: () => {},
+    ...(mintCacheMax != null ? { mintCacheMax } : {}),
   });
   return { checker, calls, state, wallets, poolMints, advance: (ms) => { t += ms; } };
 }
@@ -272,4 +273,25 @@ test("minCount is coerced to a positive integer-ish value", async () => {
   assert.equal((await checker.check({ baseMint: TOKEN, minCount: "2" })).required, 2);
   assert.equal((await checker.check({ baseMint: TOKEN, minCount: 0 })).required, 1);
   assert.equal((await checker.check({ baseMint: TOKEN, minCount: NaN })).required, 1);
+});
+
+test("mint cache cap clearing mid-call does not fail the lookup", async () => {
+  const positions = { [W1.address]: ["P_TOKEN", "P_OTHER"] };
+  const { checker, advance } = harness({ wallets: [W1], positions, mintCacheMax: 2 });
+  assert.equal((await checker.check({ baseMint: TOKEN })).pass, true);
+  positions[W1.address] = ["P_TOKEN", "P_FLIP"];
+  advance(6 * MIN);
+  const r = await checker.check({ baseMint: TOKEN });
+  assert.equal(r.kind, "ok");
+  assert.equal(r.pass, true);
+});
+
+test("a shared lookup that rejects falls back to stale cache for every waiter", async () => {
+  const h = harness({ wallets: [W1], positions: { [W1.address]: ["P_TOKEN"] } });
+  assert.equal((await h.checker.check({ baseMint: TOKEN })).pass, true);
+  h.state.failing.add(W1.address);
+  h.advance(10 * MIN);
+  const rs = await Promise.all([1, 2, 3].map(() => h.checker.check({ baseMint: TOKEN })));
+  assert.ok(rs.every((r) => r.pass === true));
+  assert.equal(h.calls.positions.filter((a) => a === W1.address).length, 2);
 });
