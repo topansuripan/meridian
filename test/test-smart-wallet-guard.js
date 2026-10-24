@@ -162,3 +162,36 @@ test("stops fetching wallets once minCount is met", async () => {
   await checker.check({ baseMint: TOKEN, minCount: 1 });
   assert.deepEqual(calls.positions, [W1.address]);
 });
+
+test("empty-list alert fires at most once per 6 hours", async () => {
+  const { checker, calls, advance } = harness({ wallets: [] });
+  await checker.check({ baseMint: TOKEN });
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(calls.alerts.length, 1);
+  advance(6 * HOUR + 1);
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(calls.alerts.length, 2);
+});
+
+test("alert kinds are rate-limited independently", async () => {
+  const h = harness({ wallets: [] });
+  await h.checker.check({ baseMint: TOKEN }); // empty
+  h.wallets.push(W1);
+  h.state.failing.add(W1.address);
+  await h.checker.check({ baseMint: TOKEN }); // unverified
+  assert.equal(h.calls.alerts.length, 2);
+  assert.match(h.calls.alerts[0], /no LP smart wallets/);
+  assert.match(h.calls.alerts[1], /unverified/);
+});
+
+test("alert:false never notifies", async () => {
+  const { checker, calls } = harness({ wallets: [] });
+  await checker.check({ baseMint: TOKEN, alert: false });
+  assert.equal(calls.alerts.length, 0);
+});
+
+test("a throwing notifier does not break the check", async () => {
+  const { checker } = harness({ wallets: [], notifyThrows: true });
+  const r = await checker.check({ baseMint: TOKEN });
+  assert.equal(r.kind, "empty");
+});
