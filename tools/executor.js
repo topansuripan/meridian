@@ -556,6 +556,7 @@ function normalizeConfigValue(key, value) {
     "darwinEnabled",
     "lpAgentRelayEnabled",
     "autoLearnTopLps",
+    "smartWalletGuardEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
   const stringKeys = new Set([
@@ -746,6 +747,9 @@ const toolMap = {
       opportunityPollLimit: ["opportunity", "limit"],
       opportunityMinScore: ["opportunity", "minScore"],
       opportunitySmartWalletBonus: ["opportunity", "smartWalletScoreBonus"],
+      // smart-wallet presence guard
+      smartWalletGuardEnabled: ["smartWalletGuard", "enabled"],
+      smartWalletMinCount: ["smartWalletGuard", "minCount"],
       degenTargetVolRatio: ["opportunity", "targetVolRatio"],
       degenTargetLpCount: ["opportunity", "targetLpCount"],
       degenTargetFeeRatio: ["opportunity", "targetFeeRatio"],
