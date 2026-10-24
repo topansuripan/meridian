@@ -96,6 +96,20 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+// undici reports every network failure as "fetch failed"; the real reason is in e.cause.
+export function describeFetchError(e, secret = TOKEN) {
+  const c = e?.cause;
+  let text = e?.message || String(e);
+  if (c) {
+    const head = [c.code, c.message].filter(Boolean).join(": ");
+    const attempts = Array.isArray(c.errors) && c.errors.length
+      ? ` [${c.errors.map((x) => x.code || x.message).join(", ")}]`
+      : "";
+    text += ` (${head}${attempts})`;
+  }
+  return secret ? text.split(secret).join("***") : text;
+}
+
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
   try {
@@ -115,7 +129,7 @@ async function postTelegram(method, body) {
     }
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    log("telegram_error", `${method} failed: ${describeFetchError(e)}`);
     return null;
   }
 }
@@ -139,7 +153,7 @@ async function postTelegramRaw(method, body) {
     }
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    log("telegram_error", `${method} failed: ${describeFetchError(e)}`);
     return null;
   }
 }
@@ -401,7 +415,7 @@ async function poll(onMessage) {
       }
     } catch (e) {
       if (!e.message?.includes("aborted")) {
-        log("telegram_error", `Poll error: ${e.message}`);
+        log("telegram_error", `Poll error: ${describeFetchError(e)}`);
       }
       await sleep(5000);
     }
@@ -440,7 +454,7 @@ async function registerCommands() {
     });
     log("telegram", "Bot commands registered");
   } catch (e) {
-    log("telegram_warn", `Failed to register bot commands: ${e.message}`);
+    log("telegram_warn", `Failed to register bot commands: ${describeFetchError(e)}`);
   }
 }
 
