@@ -45,8 +45,10 @@ picks one of them. `type: "holder"` wallets are ignored, as today.
 
 ## Lookup
 
-`checkSmartWalletPresence({ baseMint })` in `smart-wallets.js`, dependency-injected
-(`fetchPositionsByOwner`, `fetchPoolMints`, `now`) like `sol-crash-guard.js`:
+`createPresenceChecker({ listWallets, fetchPositionPools, fetchPoolMints, notify, now })`
+in `smart-wallets.js` returns `{ check({ baseMint, minCount }) }` — dependency-injected like
+`sol-crash-guard.js`. `evaluateSmartWalletGuard({ baseMint, isDegen })` wraps the default
+instance with the config switch and degen exemption; every call site uses the wrapper.
 
 1. For each `lp` wallet: open DLMM positions via `getProgramAccounts(LBUZK…, memcmp owner @40)`
    → lbPair address = `data[8..40]`. **Per-wallet cache 5 min.** Wallets are fetched
