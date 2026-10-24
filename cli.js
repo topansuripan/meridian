@@ -149,6 +149,12 @@ Returns DLMM positions for any wallet address.
 Output: { wallet, positions: [...], total_positions }
 \`\`\`
 
+### meridian smart-wallet-check --mint <base_mint> [--wallet <addr>]
+Read-only. Checks which tracked LP smart wallets (or one ad-hoc --wallet) hold an open DLMM position in any pool of the token. Never sends alerts; ignores smartWalletGuardEnabled.
+\`\`\`
+Output: { pass, kind, required, count, matched: [{name, address}], failed: [...], reason }
+\`\`\`
+
 ### meridian config get
 Returns the full runtime config.
 
@@ -427,6 +433,25 @@ switch (subcommand) {
     if (!wallet) die("Usage: meridian wallet-positions --wallet <addr>");
     const { getWalletPositions } = await import("./tools/dlmm.js");
     out(await getWalletPositions({ wallet_address: wallet }));
+    break;
+  }
+
+  // ── smart-wallet-check ───────────────────────────────────────────
+  case "smart-wallet-check": {
+    if (!flags.mint) die("Usage: meridian smart-wallet-check --mint <base_mint> [--wallet <addr>]");
+    const { createPresenceChecker, fetchPositionPools, fetchPoolMints, listSmartWallets } = await import("./smart-wallets.js");
+    const { config } = await import("./config.js");
+    const wallets = flags.wallet
+      ? [{ name: "adhoc", address: flags.wallet, type: "lp" }]
+      : listSmartWallets().wallets;
+    const checker = createPresenceChecker({
+      listWallets: () => wallets,
+      fetchPositionPools: (owner) => fetchPositionPools(owner),
+      fetchPoolMints: (pools) => fetchPoolMints(pools),
+    });
+    const started = Date.now();
+    const result = await checker.check({ baseMint: flags.mint, minCount: config.smartWalletGuard.minCount, alert: false, stopAtMinCount: false });
+    out({ ...result, elapsed_ms: Date.now() - started });
     break;
   }
 
