@@ -1,6 +1,9 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { config } from "./config.js";
+import { sendMessage } from "./telegram.js";
 
 const WALLETS_PATH = repoPath("smart-wallets.json");
 
@@ -256,4 +259,80 @@ export function createPresenceChecker({
   }
 
   return { check };
+}
+
+// ─── Real fetchers (public RPC_URL) ─────────────────────────────
+const DLMM_PROGRAM_ID = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const RPC_TIMEOUT_MS = 15_000; // lookups are shared between checks — a hung request must not stall the deploy gate
+
+let _connection = null;
+function getConnection() {
+  // disableRetryOnRateLimit: web3.js otherwise retries 429s for ~7.5s per call; the checker's
+  // own backoff + stale cache handle rate limits instead.
+  if (!_connection) _connection = new Connection(process.env.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true });
+  return _connection;
+}
+
+function withTimeout(promise, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${RPC_TIMEOUT_MS / 1000}s`)), RPC_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Pools (lbPair addresses) the owner has open DLMM positions in.
+// Position layout: lbPair @8..40, owner @40..72 — same filter as getWalletPositions,
+// but sliced to the lbPair only and without the Meteora PnL enrichment.
+export async function fetchPositionPools(owner) {
+  const accounts = await withTimeout(
+    getConnection().getProgramAccounts(new PublicKey(DLMM_PROGRAM_ID), {
+      dataSlice: { offset: 8, length: 32 },
+      filters: [{ memcmp: { offset: 40, bytes: owner } }],
+    }),
+    "getProgramAccounts",
+  );
+  return [...new Set(accounts.map((a) => new PublicKey(a.account.data).toBase58()))];
+}
+
+// lbPair -> [tokenXMint, tokenYMint]. LbPair layout: tokenXMint @88..120, tokenYMint @120..152
+// (verified on DMXK4u68… and Gc5hVCBy… 2026-10-24). Missing/foreign accounts are omitted.
+export async function fetchPoolMints(pools) {
+  const out = new Map();
+  for (let i = 0; i < pools.length; i += 100) {
+    const chunk = pools.slice(i, i + 100);
+    const infos = await withTimeout(
+      getConnection().getMultipleAccountsInfo(chunk.map((p) => new PublicKey(p))),
+      "getMultipleAccountsInfo",
+    );
+    infos.forEach((info, j) => {
+      if (!info || info.owner.toBase58() !== DLMM_PROGRAM_ID || info.data.length < 152) return;
+      out.set(chunk[j], [
+        new PublicKey(info.data.subarray(88, 120)).toBase58(),
+        new PublicKey(info.data.subarray(120, 152)).toBase58(),
+      ]);
+    });
+  }
+  return out;
+}
+
+let _defaultChecker = null;
+function defaultChecker() {
+  if (!_defaultChecker) {
+    _defaultChecker = createPresenceChecker({
+      listWallets: () => loadWallets().wallets,
+      fetchPositionPools,
+      fetchPoolMints,
+      notify: (text) => sendMessage(text),
+    });
+  }
+  return _defaultChecker;
+}
+
+// Single entry point for every call site: applies the config switch + degen exemption.
+export async function evaluateSmartWalletGuard({ baseMint, isDegen = false } = {}, checker = defaultChecker()) {
+  const cfg = config.smartWalletGuard;
+  if (!cfg?.enabled) return { pass: true, kind: "disabled", matched: [], reason: "Smart-wallet guard disabled" };
+  if (isDegen) return { pass: true, kind: "degen", matched: [], reason: "Smart-wallet guard: degen deploys exempt" };
+  return checker.check({ baseMint, minCount: cfg.minCount });
 }

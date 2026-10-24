@@ -295,3 +295,39 @@ test("a shared lookup that rejects falls back to stale cache for every waiter", 
   assert.ok(rs.every((r) => r.pass === true));
   assert.equal(h.calls.positions.filter((a) => a === W1.address).length, 2);
 });
+
+import { evaluateSmartWalletGuard } from "../smart-wallets.js";
+
+async function withGuardConfig(patch, fn) {
+  const saved = { ...config.smartWalletGuard };
+  Object.assign(config.smartWalletGuard, patch);
+  try { return await fn(); } finally { Object.assign(config.smartWalletGuard, saved); }
+}
+const explodingChecker = { check: async () => { throw new Error("checker must not run"); } };
+
+test("evaluateSmartWalletGuard: disabled guard skips the check", async () => {
+  await withGuardConfig({ enabled: false }, async () => {
+    const r = await evaluateSmartWalletGuard({ baseMint: TOKEN }, explodingChecker);
+    assert.equal(r.pass, true);
+    assert.equal(r.kind, "disabled");
+  });
+});
+
+test("evaluateSmartWalletGuard: degen deploys are exempt", async () => {
+  await withGuardConfig({ enabled: true }, async () => {
+    const r = await evaluateSmartWalletGuard({ baseMint: TOKEN, isDegen: true }, explodingChecker);
+    assert.equal(r.pass, true);
+    assert.equal(r.kind, "degen");
+  });
+});
+
+test("evaluateSmartWalletGuard: enabled delegates with config minCount", async () => {
+  await withGuardConfig({ enabled: true, minCount: 2 }, async () => {
+    let seen = null;
+    const checker = { check: async (args) => { seen = args; return { pass: false, kind: "none", matched: [] }; } };
+    const r = await evaluateSmartWalletGuard({ baseMint: TOKEN }, checker);
+    assert.equal(r.kind, "none");
+    assert.equal(seen.baseMint, TOKEN);
+    assert.equal(seen.minCount, 2);
+  });
+});
