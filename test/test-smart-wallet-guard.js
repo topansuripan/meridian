@@ -95,3 +95,70 @@ test("missing or quote base mint blocks as 'no-mint'", async () => {
 
 // pool ids are plain strings in the fakes
 function P(id) { return id; }
+
+test("a failed lookup does not block when presence is already proven", async () => {
+  const { checker } = harness({
+    positions: { [W2.address]: ["P_TOKEN"] },
+    failing: new Set([W1.address]),
+  });
+  const r = await checker.check({ baseMint: TOKEN, minCount: 1 });
+  assert.equal(r.pass, true);
+  assert.equal(r.failed[0].name, "alpha");
+});
+
+test("failed lookup without enough presence blocks as 'unverified'", async () => {
+  const { checker } = harness({
+    positions: { [W2.address]: ["P_OTHER"] },
+    failing: new Set([W1.address]),
+  });
+  const r = await checker.check({ baseMint: TOKEN, minCount: 1 });
+  assert.equal(r.pass, false);
+  assert.equal(r.kind, "unverified");
+});
+
+test("pool-mint resolution failure counts as a failed lookup", async () => {
+  const { checker } = harness({ positions: { [W1.address]: ["P_TOKEN"] }, mintFails: true });
+  const r = await checker.check({ baseMint: TOKEN, minCount: 1 });
+  assert.equal(r.kind, "unverified");
+});
+
+test("per-wallet positions are cached for 5 minutes", async () => {
+  const { checker, calls, advance } = harness({
+    positions: { [W1.address]: ["P_OTHER"], [W2.address]: ["P_OTHER"] },
+  });
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(calls.positions.length, 2);
+  advance(4 * MIN);
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(calls.positions.length, 2, "no refetch inside TTL");
+  advance(2 * MIN);
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(calls.positions.length, 4, "refetch after TTL");
+});
+
+test("stale cache rides out a transient failure for up to 30 minutes", async () => {
+  const h = harness({ wallets: [W1], positions: { [W1.address]: ["P_TOKEN"] } });
+  assert.equal((await h.checker.check({ baseMint: TOKEN })).pass, true);
+  h.state.failing.add(W1.address);
+  h.advance(10 * MIN);
+  assert.equal((await h.checker.check({ baseMint: TOKEN })).pass, true, "10m-old cache used");
+  h.advance(25 * MIN); // cache now 35m old
+  assert.equal((await h.checker.check({ baseMint: TOKEN })).kind, "unverified");
+});
+
+test("pool mints are resolved once and reused", async () => {
+  const { checker, calls } = harness({
+    positions: { [W1.address]: ["P_TOKEN", "P_OTHER"], [W2.address]: ["P_TOKEN"] },
+  });
+  await checker.check({ baseMint: TOKEN, minCount: 1, stopAtMinCount: false });
+  assert.equal(calls.mints.length, 1);
+  assert.deepEqual(calls.mints[0], ["P_TOKEN", "P_OTHER"]);
+});
+
+test("stops fetching wallets once minCount is met", async () => {
+  const { checker, calls } = harness({
+    positions: { [W1.address]: ["P_TOKEN"], [W2.address]: ["P_TOKEN"] },
+  });
+  await checker.check({ baseMint: TOKEN, minCount: 1 });
+  assert.deepEqual(calls.positions, [W1.address]);
+});
