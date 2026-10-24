@@ -31,7 +31,7 @@ import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTracke
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
-import { checkSmartWalletsOnPool } from "./smart-wallets.js";
+import { checkSmartWalletsOnPool, evaluateSmartWalletGuard } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { studyTopLPers } from "./tools/study.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -888,10 +888,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const gmgnAllFiltered = topCandidates?.all_filtered ?? [];
 
     const allCandidates = [];
+    // Smart-wallet guard on: use the token-level presence check (same one the executor
+    // enforces) so the LLM never picks a pool that will be blocked. Off: legacy soft signal.
+    const guardOn = config.smartWalletGuard?.enabled === true;
     for (const pool of candidates) {
       const mint = pool.base?.mint;
       const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
-        checkSmartWalletsOnPool({ pool_address: pool.pool }),
+        guardOn
+          ? evaluateSmartWalletGuard({ baseMint: mint }).then((presence) => ({ in_pool: presence.matched || [], presence }))
+          : checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
       ]);
@@ -908,7 +913,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     // Skipped for GMGN: platforms already filtered upstream; bundler/bot data from GMGN pipeline
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti }) => {
+    const passing = allCandidates.filter(({ pool, ti, sw }) => {
+      // Before the GMGN early-return: the smart-wallet guard applies to every candidate source.
+      if (guardOn && !sw?.presence?.pass) {
+        const reason = sw?.presence?.reason || "smart-wallet check failed";
+        log("screening", `Smart-wallet guard: dropped ${pool.name} — ${reason}`);
+        filteredOut.push({ name: pool.name, reason });
+        return false;
+      }
       if (pool.gmgn) return true;
       const launchpad = ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
