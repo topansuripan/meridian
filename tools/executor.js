@@ -20,7 +20,7 @@ import { getPoolMemory, addPoolNote, wasBaseMintDeployedSince, setDeployFailureC
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
-import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
+import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool, evaluateSmartWalletGuard } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative, getTokenAudit } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { isCoolingDown as solGuardCoolingDown } from "../sol-crash-guard.js";
@@ -1440,6 +1440,16 @@ async function runSafetyChecks(name, args) {
             reason: `Saturday rule: token ${baseMint.slice(0, 8)}… was already deployed on Friday. Skipping to avoid weekend losses.`,
           };
         }
+      }
+
+      // Smart-wallet presence guard (NORMAL only, degen exempt): tracked LP smart wallets
+      // must already be LPing this token. Fails closed — see smart-wallets.js.
+      try {
+        const swGuard = await evaluateSmartWalletGuard({ baseMint, isDegen });
+        if (!swGuard.pass) return { pass: false, reason: swGuard.reason };
+        if (swGuard.kind === "ok") log("safety_check", swGuard.reason);
+      } catch (e) {
+        return { pass: false, reason: `Smart-wallet guard error: ${e.message}` };
       }
 
       // Check amount limits
