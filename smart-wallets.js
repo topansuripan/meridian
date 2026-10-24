@@ -112,6 +112,9 @@ const QUOTE_MINTS = new Set([
 const POSITIONS_TTL_MS = 5 * 60_000;    // fresh per-wallet lookup
 const STALE_OK_MS = 30 * 60_000;        // a cached lookup this old still counts when RPC fails
 const ALERT_INTERVAL_MS = 6 * 3600_000; // one Telegram alert per failure kind per 6h
+const MISS_RETRY_MS = 10 * 60_000;     // re-resolve a pool whose mints came back missing after this long
+const MINT_CACHE_MAX = 10_000;          // pool->mints cache size cap (cleared when hit)
+const FAIL_BACKOFF_MS = 60_000;         // don't re-hit RPC for a wallet whose lookup just failed
 const LOOKUP_GAP_MS = 250;              // between uncached wallet lookups (public RPC rate limit)
 
 const walletLabel = (w) => w.name || `${w.address.slice(0, 4)}…${w.address.slice(-4)}`;
@@ -123,9 +126,12 @@ export function createPresenceChecker({
   notify = async () => {},
   now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  logger = log,
 }) {
   const posCache = new Map();    // wallet address -> { pools, fetchedAt }
-  const mintCache = new Map();   // pool address -> [mintX, mintY] ([] if the account is missing)
+  const mintCache = new Map();   // pool address -> { mints: [mintX, mintY] ([] if the account is missing), at }
+  const failedAt = new Map();    // wallet address -> ms of last failed lookup
+  const inflight = new Map();    // wallet address -> in-flight lookup promise
   const lastAlertAt = new Map(); // alert kind -> ms
 
   const isFresh = (address) => {
@@ -133,30 +139,47 @@ export function createPresenceChecker({
     return !!c && now() - c.fetchedAt < POSITIONS_TTL_MS;
   };
 
+  const inBackoff = (address) => {
+    const f = failedAt.get(address);
+    return f != null && now() - f < FAIL_BACKOFF_MS;
+  };
+
   async function poolsFor(wallet) {
     const cached = posCache.get(wallet.address);
     if (isFresh(wallet.address)) return cached.pools;
     try {
-      const pools = await fetchPositionPools(wallet.address);
+      if (inBackoff(wallet.address)) throw new Error("recent lookup failure — backing off");
+      let p = inflight.get(wallet.address);
+      if (!p) {
+        p = fetchPositionPools(wallet.address).finally(() => inflight.delete(wallet.address));
+        inflight.set(wallet.address, p);
+      }
+      const pools = await p;
       posCache.set(wallet.address, { pools, fetchedAt: now() });
+      failedAt.delete(wallet.address);
       return pools;
     } catch (e) {
+      if (!inBackoff(wallet.address)) failedAt.set(wallet.address, now());
       if (cached && now() - cached.fetchedAt <= STALE_OK_MS) {
-        log("smart_wallets", `Lookup failed for ${walletLabel(wallet)} (${e.message}) — using ${Math.round((now() - cached.fetchedAt) / 60_000)}m-old cache`);
+        logger("smart_wallets", `Lookup failed for ${walletLabel(wallet)} (${e.message}) — using ${Math.round((now() - cached.fetchedAt) / 60_000)}m-old cache`);
         return cached.pools;
       }
-      log("smart_wallets", `Lookup failed for ${walletLabel(wallet)}: ${e.message}`);
+      logger("smart_wallets", `Lookup failed for ${walletLabel(wallet)}: ${e.message}`);
       return null;
     }
   }
 
   async function mintsFor(pools) {
-    const missing = pools.filter((p) => !mintCache.has(p));
+    const missing = pools.filter((p) => {
+      const c = mintCache.get(p);
+      return !c || (c.mints.length === 0 && now() - c.at > MISS_RETRY_MS);
+    });
     if (missing.length) {
       const resolved = await fetchPoolMints(missing);
-      for (const p of missing) mintCache.set(p, resolved.get(p) || []);
+      if (mintCache.size >= MINT_CACHE_MAX) mintCache.clear();
+      for (const p of missing) mintCache.set(p, { mints: resolved.get(p) || [], at: now() });
     }
-    return new Set(pools.flatMap((p) => mintCache.get(p)));
+    return new Set(pools.flatMap((p) => mintCache.get(p).mints));
   }
 
   async function maybeAlert(kind, text) {
@@ -170,9 +193,13 @@ export function createPresenceChecker({
     const required = Math.max(1, Number(minCount) || 1);
     const empty = { required, count: 0, matched: [], failed: [] };
     if (!baseMint || QUOTE_MINTS.has(baseMint)) {
+      if (!baseMint && alert) await maybeAlert("no-mint", "⚠️ Smart-wallet guard received a candidate with no base mint — likely a wiring bug; that deploy is blocked.");
       return { ...empty, pass: false, kind: "no-mint", reason: `Smart-wallet guard: base mint ${baseMint ? "is a quote token" : "unknown"} — cannot verify presence` };
     }
-    const wallets = listWallets().filter((w) => !w.type || w.type === "lp");
+    const seen = new Set();
+    const wallets = listWallets()
+      .filter((w) => !w.type || w.type === "lp")
+      .filter((w) => !seen.has(w.address) && seen.add(w.address));
     if (wallets.length === 0) {
       const reason = "Smart-wallet guard: no LP smart wallets tracked — every deploy is blocked until you add some (or set smartWalletGuardEnabled false)";
       if (alert) await maybeAlert("empty", `⚠️ ${reason}`);
@@ -184,7 +211,7 @@ export function createPresenceChecker({
     let fetchedThisCall = false;
     for (const w of wallets) {
       if (stopAtMinCount && matched.length >= required) break;
-      const needsFetch = !isFresh(w.address);
+      const needsFetch = !isFresh(w.address) && !inBackoff(w.address);
       if (needsFetch && fetchedThisCall) await sleep(LOOKUP_GAP_MS);
       if (needsFetch) fetchedThisCall = true;
       const pools = await poolsFor(w);
@@ -193,7 +220,7 @@ export function createPresenceChecker({
       try {
         mints = await mintsFor(pools);
       } catch (e) {
-        log("smart_wallets", `Pool mint lookup failed for ${walletLabel(w)}: ${e.message}`);
+        logger("smart_wallets", `Pool mint lookup failed for ${walletLabel(w)}: ${e.message}`);
         failed.push(w);
         continue;
       }
@@ -215,7 +242,7 @@ export function createPresenceChecker({
       if (alert) await maybeAlert("unverified", `⚠️ ${reason} (${failed.map(walletLabel).join(", ")}). Deploys stay blocked while lookups fail.`);
       return { ...result, pass: false, kind: "unverified", reason };
     }
-    return { ...result, pass: false, kind: "none", reason: `Smart-wallet guard: ${matched.length}/${required} tracked LP wallets in this token${names ? ` (${names})` : ""}` };
+    return { ...result, pass: false, kind: "none", reason: `Smart-wallet guard: ${matched.length} of ${wallets.length} tracked LP wallets in this token (need ${required})${names ? ` — ${names}` : ""}` };
   }
 
   return { check };

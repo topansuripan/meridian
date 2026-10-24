@@ -5,6 +5,7 @@ import { config } from "../config.js";
 test("config.smartWalletGuard defaults to off with minCount 1", () => {
   assert.equal(config.smartWalletGuard.enabled, false);
   assert.equal(config.smartWalletGuard.minCount, 1);
+  assert.equal(typeof config.smartWalletGuard.enabled, "boolean");
 });
 
 import { createPresenceChecker } from "../smart-wallets.js";
@@ -19,9 +20,9 @@ const HOLDER = { name: "hodl", address: "Wallet333333333333333333333333333333333
 // P_TOKEN = TOKEN/SOL, P_OTHER = OTHER/SOL, P_FLIP = SOL/TOKEN (token on the Y side)
 const POOL_MINTS = { P_TOKEN: [TOKEN, SOL], P_OTHER: [OTHER, SOL], P_FLIP: [SOL, TOKEN] };
 
-function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mintFails = false, notifyThrows = false } = {}) {
+function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mintFails = false, notifyThrows = false, poolMints = { ...POOL_MINTS } } = {}) {
   let t = 1_000_000;
-  const calls = { positions: [], mints: [], alerts: [] };
+  const calls = { positions: [], mints: [], alerts: [], sleeps: [] };
   const state = { failing, mintFails };
   const checker = createPresenceChecker({
     listWallets: () => wallets,
@@ -33,20 +34,22 @@ function harness({ wallets = [W1, W2], positions = {}, failing = new Set(), mint
     fetchPoolMints: async (pools) => {
       calls.mints.push([...pools]);
       if (state.mintFails) throw new Error("rpc down");
-      return new Map(pools.filter((p) => POOL_MINTS[p]).map((p) => [p, POOL_MINTS[p]]));
+      return new Map(pools.filter((p) => poolMints[p]).map((p) => [p, poolMints[p]]));
     },
     notify: async (text) => {
       if (notifyThrows) throw new Error("telegram down");
       calls.alerts.push(text);
     },
     now: () => t,
-    sleep: async () => {},
+    sleep: async (ms) => { calls.sleeps.push(ms); },
+    logger: () => {},
   });
-  return { checker, calls, state, wallets, advance: (ms) => { t += ms; } };
+  return { checker, calls, state, wallets, poolMints, advance: (ms) => { t += ms; } };
 }
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
+const W3 = { name: "gamma", address: "Wallet4444444444444444444444444444444444444", type: "lp" };
 
 test("passes when one tracked wallet LPs any pool of the token", async () => {
   const { checker } = harness({ positions: { [W1.address]: [P("P_TOKEN")] } });
@@ -194,4 +197,79 @@ test("a throwing notifier does not break the check", async () => {
   const { checker } = harness({ wallets: [], notifyThrows: true });
   const r = await checker.check({ baseMint: TOKEN });
   assert.equal(r.kind, "empty");
+});
+
+test("lookups are spaced 250ms apart and not repeated inside the TTL", async () => {
+  const { checker, calls } = harness({ wallets: [W1, W2, W3] });
+  await checker.check({ baseMint: TOKEN });
+  assert.deepEqual(calls.sleeps, [250, 250]);
+  await checker.check({ baseMint: TOKEN });
+  assert.deepEqual(calls.sleeps, [250, 250]);
+});
+
+test("a failed wallet is not retried inside the 60s backoff", async () => {
+  const { checker, calls, advance } = harness({ failing: new Set([W1.address]) });
+  const n = () => calls.positions.filter((a) => a === W1.address).length;
+  await checker.check({ baseMint: TOKEN });
+  advance(10_000);
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(n(), 1);
+  advance(61_000);
+  await checker.check({ baseMint: TOKEN });
+  assert.equal(n(), 2);
+});
+
+test("a pool whose mints were missing is re-resolved after 10 minutes", async () => {
+  const { checker, calls, poolMints, advance } = harness({
+    wallets: [W1], positions: { [W1.address]: ["P_NEW"] },
+  });
+  assert.equal((await checker.check({ baseMint: TOKEN })).kind, "none");
+  poolMints.P_NEW = [TOKEN, SOL];
+  advance(5 * MIN);
+  assert.equal((await checker.check({ baseMint: TOKEN })).kind, "none");
+  assert.equal(calls.mints.length, 1);
+  advance(6 * MIN);
+  assert.equal((await checker.check({ baseMint: TOKEN })).pass, true);
+});
+
+test("concurrent checks share one lookup per wallet", async () => {
+  const { checker, calls } = harness();
+  await Promise.all([checker.check({ baseMint: TOKEN }), checker.check({ baseMint: TOKEN })]);
+  assert.equal(calls.positions.filter((a) => a === W1.address).length, 1);
+  assert.equal(calls.positions.filter((a) => a === W2.address).length, 1);
+});
+
+test("duplicate wallet entries count once", async () => {
+  const { checker } = harness({
+    wallets: [W1, { ...W1, name: "alpha-dup" }],
+    positions: { [W1.address]: ["P_TOKEN"] },
+  });
+  const r = await checker.check({ baseMint: TOKEN, minCount: 2 });
+  assert.equal(r.kind, "none");
+  assert.equal(r.count, 1);
+});
+
+test("a wallet with no type field counts as LP", async () => {
+  const { name, address } = W1;
+  const { checker } = harness({ wallets: [{ name, address }], positions: { [address]: ["P_TOKEN"] } });
+  assert.equal((await checker.check({ baseMint: TOKEN })).pass, true);
+});
+
+test("missing base mint alerts once per 6h; a quote mint never alerts", async () => {
+  const { checker, calls, advance } = harness();
+  await checker.check({ baseMint: SOL });
+  assert.equal(calls.alerts.length, 0);
+  await checker.check({ baseMint: undefined });
+  await checker.check({ baseMint: undefined });
+  assert.equal(calls.alerts.length, 1);
+  advance(6 * HOUR + 1);
+  await checker.check({ baseMint: undefined });
+  assert.equal(calls.alerts.length, 2);
+});
+
+test("minCount is coerced to a positive integer-ish value", async () => {
+  const { checker } = harness();
+  assert.equal((await checker.check({ baseMint: TOKEN, minCount: "2" })).required, 2);
+  assert.equal((await checker.check({ baseMint: TOKEN, minCount: 0 })).required, 1);
+  assert.equal((await checker.check({ baseMint: TOKEN, minCount: NaN })).required, 1);
 });

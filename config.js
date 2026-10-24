@@ -123,7 +123,7 @@ export const config = {
   // Ships OFF — with an empty smart-wallets.json it would block every deploy.
   // See docs/plans/2026-10-24-smart-wallet-guard-design.md
   smartWalletGuard: {
-    enabled:  u.smartWalletGuardEnabled ?? false,
+    enabled:  u.smartWalletGuardEnabled === true,
     minCount: Number(u.smartWalletMinCount ?? 1),
   },
 
