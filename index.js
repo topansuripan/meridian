@@ -1659,9 +1659,19 @@ Summarize the current portfolio health, total fees earned, and performance of al
         // tracked KOL list). The smart-wallet lookup runs only for borderline pools to keep
         // the 45s poll cheap.
         let trigger = null;
+        const guardOn = config.smartWalletGuard?.enabled === true;
         for (const c of candidates) {
           const s = degenScore(c, config.opportunity);
           if (s < floor) break; // sorted desc — nothing below can qualify either
+          if (guardOn) {
+            // Presence is mandatory; it also earns the borderline bonus. Cached per wallet,
+            // so the 45s poll does not add RPC load beyond the 5-min refresh.
+            if (s < minScore && bonus <= 0) continue;
+            const pres = await evaluateSmartWalletGuard({ baseMint: c.base?.mint }).catch(() => null);
+            if (!pres?.pass) continue;
+            trigger = { c, s, smart: pres.matched };
+            break;
+          }
           if (s >= minScore) { trigger = { c, s, smart: [] }; break; }
           if (bonus <= 0) continue; // borderline but smart-wallet rescue disabled
           const smart = (await checkSmartWalletsOnPool({ pool_address: c.pool }).catch(() => null))?.in_pool || [];
