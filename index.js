@@ -1675,8 +1675,9 @@ Summarize the current portfolio health, total fees earned, and performance of al
           const s = degenScore(c, config.opportunity);
           if (s < floor) break; // sorted desc — nothing below can qualify either
           if (guardOn) {
-            // Presence is mandatory; it also earns the borderline bonus. Cached per wallet,
-            // so the 45s poll does not add RPC load beyond the 5-min refresh.
+            // Presence is mandatory but never lowers the bar: the pool must still reach
+            // minScore. Cached per wallet, so the 45s poll adds no RPC load beyond the 5-min refresh.
+            if (s < minScore) continue; // guard on: presence is required, not a score bonus
             const pres = await evaluateSmartWalletGuard({ baseMint: c.base?.mint }).catch(() => null);
             if (!pres?.pass) continue;
             trigger = { c, s, smart: pres.matched };
@@ -2651,10 +2652,12 @@ async function telegramHandler(msg) {
     const action = text.match(/\b(on|off|status)\b/i)?.[1]?.toLowerCase();
     if (action === "on") {
       _degenEnabled = true;
+      config.degen.enabled = true; // executor guard exemption reads config.degen.enabled
       startDegenCrons();
       await sendMessage(`Degen mode ON\nScreening: with normal cycle\nManagement: every ${config.degen.managementIntervalMin}m\nMax positions: ${config.degen.maxPositions}\nMax deploy: ${config.degen.maxDeployAmount} SOL\nVolume filter: $${config.degen.minVolume}\nSL: ${config.degen.stopLossPct}% | TP: ${config.degen.takeProfitPct}%`).catch(() => {});
     } else if (action === "off") {
       _degenEnabled = false;
+      config.degen.enabled = false;
       stopDegenCrons();
       await sendMessage("Degen mode OFF").catch(() => {});
     } else {
