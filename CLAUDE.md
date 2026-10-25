@@ -117,6 +117,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `envcrypt.js` | 121 | XOR-cipher with a key from `.envrypt`/`ENVRYPT_KEY`. Encrypts anything matching `*_KEY`, `*SECRET*`, `*TOKEN*`, `*MNEMONIC*`, etc. The `# encrypted` marker in `.env` precedes encrypted lines. |
 | `network-defaults.js` | 8 | Imported second in `index.js`. Raises Node's happy-eyeballs per-address timeout from 250 ms to 5 s; at 250 ms, Telegram sends and polls failed with `fetch failed (ETIMEDOUT [ETIMEDOUT, ENETUNREACH])` whenever the event loop stalled (VPS→Telegram ≈175 ms, no IPv6). |
 | `usdc-parking.js` | 184 | Idle funds live in USDC. `parkExcessSol` (after each close, `autoParkUsdcAfterClose`) swaps SOL above the reserve to USDC; `fundSolForDeploy` (before `deploy_position`, `autoFundSolFromUsdc`) swaps the shortfall ×1.03 back, targeting deploy + reserve + `DEPLOY_RENT_SOL` (0.05, position rent). `createMutex` backs the executor's treasury lock. Toggle with Telegram `/park on|off` (status: `/park`). Dependency-injected; wrappers in `executor.js`. See docs/plans/2026-10-25-usdc-parking-design.md. |
+| `manual-positions.js` | 72 | The operator trades by hand from the bot wallet. `splitPositions` (used by `getMyPositions`) keeps positions recorded in `state.json` in `positions` and moves the rest to `manual_positions`; `listedPositions` returns both; `createManualAlerter` announces each manual position once; `manualGuardReason` blocks automatic close/claim of one. Pure. See § Manual Trades. |
 | `logger.js` | 75 | Daily-rotating `logs/agent-YYYY-MM-DD.log`. `logAction({tool, args, result, duration_ms, success})` writes JSONL `actions-YYYY-MM-DD.jsonl` audit trail. Level via `LOG_LEVEL` env. |
 | **Other** | | |
 | `discord-listener/`, `test/`, `scripts/`, `utils/` | | Discord listener (above), syntax-checked tests, envcrypt CLI, `safeNumber`. |
@@ -566,7 +567,7 @@ A global watch-only mode. Cron cycles keep running and monitoring continues, but
 **Two layers:**
 
 1. **Root fix — decouple the sweep from position-record verification.** `close_position`'s verification-timeout return now carries `verification_timeout: true` + `base_mint` (the close txs are confirmed; only the recheck lagged). `shouldRunPostCloseSweep(result)` returns true for a real success OR for a `verification_timeout` with landed `close_txs`/`txs` + `base_mint`. `executor.js` runs the post-close pipeline when `success || runCloseSweep`, so the base token is swept back to SOL (and queued on failure) even on the lag. `index.js`'s deterministic close loop also treats `verification_timeout` as a successful close so it isn't reported as "failed".
-2. **Safety-net sweep.** `reconcileWalletToSol()` swaps any stray non-SOL/USDC token above `pendingSwapMinUsd` back to SOL — backstop for every orphan path (verification lag, relay-zap fallback, late-arriving tokens, process restarts). Open-position `base_mint`s are protected from sweeping; sub-dust and no-liquidity (non-finite USD) tokens are left alone. Exposed as `reconcileWallet()` in `executor.js` (skips spectate/DRY_RUN, gated by `config.management.autoReconcileWallet`), called each management cycle from `index.js` right after `processPendingSwaps()`.
+2. **Safety-net sweep.** `reconcileWalletToSol()` swaps any stray non-SOL/USDC token above `pendingSwapMinUsd` back to SOL — backstop for every orphan path (verification lag, relay-zap fallback, late-arriving tokens, process restarts). Open-position `base_mint`s (bot and manual) are protected from sweeping, and only tokens from pools the bot was in during the last 24h are swept (`isBotToken`, see § Manual Trades); sub-dust and no-liquidity (non-finite USD) tokens are left alone. Exposed as `reconcileWallet()` in `executor.js` (skips spectate/DRY_RUN, gated by `config.management.autoReconcileWallet`), called each management cycle from `index.js` right after `processPendingSwaps()`.
 
 **Config**: `autoReconcileWallet` (management, default true) — per-cycle safety-net sweep of stray tokens → SOL.
 
@@ -583,6 +584,26 @@ A global watch-only mode. Cron cycles keep running and monitoring continues, but
 **Gotchas**: a deploy pays ~0.042–0.044 SOL position rent on top of the amount, so the funding floor is deploy + max(reserve, 0.05 SOL) and the target adds another 0.05 SOL on top; the floor check allows ~1% swap costs and the top-up stays a cent under the reported USDC (Helius rounds to the cent); if USDC can't cover the full buffer it swaps what USDC there is, and blocks only when SOL + USDC can't cover deploy + reserve. The post-swap check polls up to 4× because the balance can lag a confirmed swap. Parking is skipped under DRY_RUN. The post-close park is wrapped in try/catch so a park failure never reports a landed close as failed (before Oct 2026 a `solPrice` scope bug threw on every successful park). Each park/top-up sends a swap notification.
 
 **Tests**: `test/test-usdc-parking.js`.
+
+---
+
+## Manual Trades in the Bot Wallet (October 2026)
+
+The operator trades by hand from the same wallet. The bot manages only what it opened. See docs/plans/2026-10-25-manual-trades-design.md.
+
+**Ownership**: a position is the bot's when `state.json` has a record for it (`getTrackedPositionSet()`, cached on mtime/size). Every deploy path calls `trackPosition`. If `state.json` can't be parsed, the set is `null` and every position counts as the bot's, the behaviour before this feature.
+
+**Split at the source**: `getMyPositions` (local wallet) returns bot positions in `positions`/`total_positions` and the rest in `manual_positions`. Every automatic consumer reads `positions` and so ignores manual ones: management and degen cycles, the PnL poller, the SOL-crash guard, the emergency exit, position caps, the screening and opportunity pre-checks, `/closeall`, `/status` and the agent prompt. Callers that must see everything use `listedPositions(result)`: by-address lookups in dlmm.js (the relay deploy's own-position match, PnL, claim/close snapshots, close verification, cache fallbacks), the deploy duplicate pool/token checks, screening's occupied set, the reconcile sweep's protected mints, cli `pnl`, and Telegram `/positions` `/pool` `/close` `/set`. Any new by-address lookup must use `listedPositions`, or it won't find a position the bot hasn't recorded yet.
+
+**Guards**:
+- `agent.js` blocks `close_position`/`claim_fees` on a manual position unless the run is `interactive` (Telegram chat or REPL). It is keyed on `interactive`, not the role, because Telegram chat runs as MANAGER whenever the text mentions "close".
+- The reconcile sweep only sells tokens with `wasBaseMintDeployedSince(mint, now − 24h)` (`BOT_TOKEN_WINDOW_MS`).
+
+**Telegram**: `/positions` lists manual positions after the bot's, marked 👤. `/set` refuses a manual one. The management cycle sends "👤 Manual position detected" once per manual position, after a 3-minute grace, so an unrecorded bot deploy can't go unnoticed. Alerts are in memory, so a restart re-announces each manual position once.
+
+**Not split**: SOL and USDC. Deploys are sized from the whole wallet, and parking works as before. Closing a manual position via `/close` or chat runs the normal post-close swap and park but records no performance or lessons (`recordPerformance` needs a tracked record).
+
+**Tests**: `test/test-manual-positions.js`, plus the `isBotToken` cases in `test-wallet-reconcile.js`.
 
 ---
 
@@ -667,7 +688,7 @@ network call must never be indistinguishable from an empty wallet.
 | `/help` / `/status` / `/wallet` / `/config` | `index.js#telegramHandler` | Read-only. |
 | `/positions` / `/pool <n>` / `/close <n>` / `/set <n> <note>` | `index.js#telegramHandler` | Bypass LLM — direct state mutation. `/close <n>` calls `closePosition` directly. `/positions` renders a progress bar (`[████████░░░░░░░░░░░░] 40%`, no bin numbers/arrows). |
 | `/spectate on\|off` | `index.js#telegramHandler` | Toggle watch-only mode (cycles keep running, no fund/position actions); bare `/spectate` reports state + open-position count. See § Spectate Mode. |
-| `/closeall` | index.js | Closes all open positions in sequence. |
+| `/closeall` | index.js | Closes all the bot's open positions in sequence; positions opened by hand stay open. |
 | `/screen` / `/candidates` / `/deploy <n>` | `runDeterministicScreen` + `deployLatestCandidate` | Deterministic — no LLM. The single-candidate skip rule applies. |
 | `/briefing` | `generateBriefing` | On-demand daily report. |
 | `/settings` / `/menu` / `/configmenu` | `renderSettingsMenu` + `applySettingsMenuCallback` | Inline-keyboard menu with toggle/step buttons. Updates flow through `update_config` tool. |
