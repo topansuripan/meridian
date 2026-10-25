@@ -30,6 +30,14 @@ Both halves are already in `tools/executor.js`. Each one is off on the VPS.
 4. Turn on `autoParkUsdcAfterClose` and `autoFundSolFromUsdc` in the VPS `user-config.json`.
 5. Deploy and restart, then park the SOL that is already idle once, everything above the reserve.
 
+## Rent buffer (added after reading the chain)
+
+Each meridian deploy pays 0.042–0.044 SOL of position rent on top of the amount. The rent is refunded on close. Until now the wallet always held far more SOL than a deploy needed. Once funds are parked, a top-up to exactly amount + reserve would let the rent eat the gas reserve. At $200 SOL the $8 reserve is only 0.04 SOL, so that reserve would be gone entirely.
+
+`fundSolForDeploy` therefore targets amount + reserve + `DEPLOY_RENT_SOL` (0.05 SOL). If USDC can't cover the buffer but SOL already covers amount + reserve, the deploy goes ahead as before rather than being blocked. The post-swap check uses that same floor, so slippage on the buffer never blocks a deploy.
+
+A park that throws is caught at the `close_position` call site. A close that already landed is therefore never reported to the LLM as failed.
+
 ## Behaviour after
 
 - A position closes. The token is swapped to SOL as today. Then SOL above about $8 is swapped to USDC.
