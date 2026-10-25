@@ -686,15 +686,23 @@ export async function deployPosition({
         }),
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      _positionsCacheAt = 0;
-      const refreshed = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      // The new position isn't recorded yet, so it sits in manual_positions until trackPosition below.
-      const matching = listedPositions(refreshed).find(
-        (position) => position.pool === pool_address && position.lower_bin === minBinId && position.upper_bin === maxBinId,
-      ) || listedPositions(refreshed).find((position) => position.pool === pool_address);
+      // The new position isn't recorded yet, so it sits in manual_positions until trackPosition
+      // below. An unrecorded position is never managed, so keep looking for ~30s: indexing can
+      // lag, and an in-flight fetch may predate the deploy.
+      let matching = null;
+      for (let attempt = 0; attempt < 6 && !matching; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        _positionsCacheAt = 0;
+        const listed = listedPositions(await getMyPositions({ force: true, silent: true }).catch(() => null));
+        matching = listed.find(
+          (position) => position.pool === pool_address && position.lower_bin === minBinId && position.upper_bin === maxBinId,
+        ) || listed.find((position) => position.pool === pool_address);
+      }
 
       const positionAddress = matching?.position || null;
+      if (!positionAddress) {
+        log("deploy_warn", `Relay deploy into ${pool_name || pool_address} landed but its position wasn't found to record — it will show as a manual position and won't be managed`);
+      }
       if (positionAddress) {
         const signalSnapshot = config.darwin?.enabled
           ? getAndClearStagedSignals(pool_address, baseMint)
@@ -721,6 +729,7 @@ export async function deployPosition({
           entry_holders,
         });
         recordPoolDeployStart(pool_address, { pool_name, base_mint: pool.lbPair.tokenXMint.toString(), strategy: activeStrategy, volatility });
+        _positionsCacheAt = 0; // the cached split still lists it as manual
       }
 
       appendDecision({
