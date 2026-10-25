@@ -15,6 +15,10 @@ import { config, reloadScreeningThresholds, computeDeployAmount, setSpectateMode
 import { evolveThresholds, getPerformanceSummary, getLossCircuitBreakerStatus } from "./lessons.js";
 import { executeTool, registerCronRestarter, processPendingSwaps, reconcileWallet, parkIdleSolNow } from "./tools/executor.js";
 import { parkingSwitchChanges } from "./usdc-parking.js";
+import { listedPositions, createManualAlerter } from "./manual-positions.js";
+
+// Announces each position opened outside the bot once (manual-positions.js).
+const manualAlerter = createManualAlerter();
 import {
   startPolling,
   stopPolling,
@@ -502,6 +506,12 @@ export async function runManagementCycle({ silent = false } = {}) {
       log("cron_error", `Management cycle: could not read positions (${livePositions.error}) — skipping this cycle (no screening triggered)`);
       mgmtReport = `Management cycle skipped: could not read positions (${livePositions.error}).`;
       return mgmtReport;
+    }
+
+    // Positions opened by hand are left alone; say so once, so an unrecorded bot deploy can't hide.
+    for (const p of manualAlerter.observe(livePositions?.manual_positions)) {
+      log("cron", `Manual position detected: ${p.pair} ${p.position} — not managing it`);
+      sendMessage(`👤 Manual position detected: ${p.pair} (${p.position.slice(0, 8)}…) — the bot won't manage it. If you didn't open it, check the wallet.`).catch(() => {});
     }
 
     const allPositions = livePositions?.positions || [];
@@ -2504,16 +2514,21 @@ async function telegramHandler(msg) {
 
   if (text === "/positions") {
     try {
-      const { positions, total_positions } = await getMyPositions({ force: true });
-      if (total_positions === 0) { await sendMessage("No open positions."); return; }
+      const result = await getMyPositions({ force: true });
+      const positions = listedPositions(result);
+      if (positions.length === 0) { await sendMessage("No open positions."); return; }
+      const manualSet = new Set((result.manual_positions || []).map((p) => p.position));
       const cur = config.management.solMode ? "◎" : "$";
       const lines = positions.map((p, i) => {
         const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
         const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
         const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        const mine = manualSet.has(p.position) ? "👤 " : "";
+        return `${i + 1}. ${mine}${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      const header = `📊 Open Positions (${result.total_positions}${manualSet.size ? ` + ${manualSet.size} manual 👤` : ""}):`;
+      const legend = manualSet.size ? "\n👤 = opened by you; the bot doesn't manage it." : "";
+      await sendMessage(`${header}\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction${legend}`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
@@ -2522,7 +2537,7 @@ async function telegramHandler(msg) {
   if (poolMatch) {
     try {
       const idx = parseInt(poolMatch[1]) - 1;
-      const { positions } = await getMyPositions({ force: true });
+      const positions = listedPositions(await getMyPositions({ force: true }));
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage([
@@ -2545,7 +2560,7 @@ async function telegramHandler(msg) {
   if (closeMatch) {
     try {
       const idx = parseInt(closeMatch[1]) - 1;
-      const { positions } = await getMyPositions({ force: true });
+      const positions = listedPositions(await getMyPositions({ force: true }));
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage(`Closing ${pos.pair}...`);
@@ -2567,8 +2582,10 @@ async function telegramHandler(msg) {
 
   if (text === "/closeall") {
     try {
-      const { positions } = await getMyPositions({ force: true });
-      if (!positions.length) { await sendMessage("No open positions."); return; }
+      // Bot positions only: positions opened by hand stay open.
+      const { positions, manual_positions } = await getMyPositions({ force: true });
+      const manualNote = manual_positions?.length ? `${manual_positions.length} manual position(s) left open 👤` : "";
+      if (!positions.length) { await sendMessage(manualNote ? `No bot positions to close (${manualNote}).` : "No open positions."); return; }
       await sendMessage(`Closing ${positions.length} position(s)...`);
       const results = [];
       for (const pos of positions) {
@@ -2583,7 +2600,7 @@ async function telegramHandler(msg) {
           results.push(`${pos.pair}: failed (${error.message})`);
         }
       }
-      await sendMessage(`Close-all finished.\n\n${results.join("\n")}`).catch(() => {});
+      await sendMessage(`Close-all finished.\n\n${results.join("\n")}${manualNote ? `\n\n${manualNote}.` : ""}`).catch(() => {});
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     }
@@ -2595,9 +2612,14 @@ async function telegramHandler(msg) {
     try {
       const idx = parseInt(setMatch[1]) - 1;
       const note = setMatch[2].trim();
-      const { positions } = await getMyPositions({ force: true });
+      const result = await getMyPositions({ force: true });
+      const positions = listedPositions(result);
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
+      if (result.manual_positions?.some((p) => p.position === pos.position)) {
+        await sendMessage("👤 That's your manual position — the bot doesn't manage it, so a note would do nothing.");
+        return;
+      }
       setPositionInstruction(pos.position, note);
       await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
