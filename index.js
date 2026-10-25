@@ -13,7 +13,8 @@ import { getTopCandidates, degenScore } from "./tools/screening.js";
 import { formatGmgnCandidateForPrompt } from "./tools/gmgn.js";
 import { config, reloadScreeningThresholds, computeDeployAmount, setSpectateMode } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, getLossCircuitBreakerStatus } from "./lessons.js";
-import { executeTool, registerCronRestarter, processPendingSwaps, reconcileWallet } from "./tools/executor.js";
+import { executeTool, registerCronRestarter, processPendingSwaps, reconcileWallet, parkIdleSolNow } from "./tools/executor.js";
+import { parkingSwitchChanges } from "./usdc-parking.js";
 import {
   startPolling,
   stopPolling,
@@ -2300,6 +2301,7 @@ function formatHelpText() {
     "/pause — stop cron cycles",
     "/resume — start cron cycles again",
     "/spectate on|off — watch-only mode (cycles run, no actions)",
+    "/park on|off — keep idle funds in USDC, swap back to SOL on deploy",
     "/stop — shut down agent",
   ].join("\n");
 }
@@ -2673,6 +2675,46 @@ async function telegramHandler(msg) {
     } else {
       const status = _degenEnabled ? "ON" : "OFF";
       await sendMessage(`Degen mode: ${status}\nMax positions: ${config.degen.maxPositions}\nVolume: $${config.degen.minVolume} | SL: ${config.degen.stopLossPct}% | TP: ${config.degen.takeProfitPct}%\nOOR close: ${config.degen.outOfRangeWaitMinutes}m`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/park" || text === "/park on" || text === "/park off") {
+    try {
+      const lines = [];
+      if (text !== "/park") {
+        const on = text === "/park on";
+        const result = await executeTool("update_config", {
+          changes: parkingSwitchChanges(on),
+          reason: `Telegram slash command ${text}`,
+        });
+        if (!result?.success) {
+          await sendMessage(`Couldn't switch USDC parking: ${result?.error || "config update failed"}`).catch(() => {});
+          return;
+        }
+        if (on) {
+          lines.push("💵 USDC parking ON — idle SOL above the reserve is kept in USDC; each deploy swaps back what it needs.");
+          const parked = await parkIdleSolNow();
+          if (parked?.success) {
+            lines.push(`Parked ${parked.amount} SOL → ${parked.usdcOut != null ? parked.usdcOut.toFixed(2) : "?"} USDC.`);
+          } else if (parked?.skipped) {
+            lines.push(`Nothing to park right now (${parked.reason}).`);
+          } else {
+            lines.push(`Park failed: ${parked?.error || "unknown error"} — it will run again after the next close.`);
+          }
+        } else {
+          lines.push("💤 USDC parking OFF — SOL stays SOL after closes. USDC already in the wallet is still swapped back to SOL as deploys need it.");
+        }
+      } else {
+        const on = config.management.autoParkUsdcAfterClose && config.management.autoFundSolFromUsdc;
+        lines.push(`💵 USDC parking is ${on ? "ON" : "OFF"}. Use /park on or /park off.`);
+      }
+      const bal = await getWalletBalances();
+      lines.push(`Wallet: ${Number(bal.sol || 0).toFixed(4)} SOL | ${Number(bal.usdc || 0).toFixed(2)} USDC`);
+      lines.push(`SOL reserve kept for gas: ~${getTargetSolReserve(bal).toFixed(4)} SOL`);
+      await sendMessage(lines.join("\n")).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
     }
     return;
   }

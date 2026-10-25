@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parkExcessSol, fundSolForDeploy, createMutex, DEPLOY_RENT_SOL } from "../usdc-parking.js";
+import { parkExcessSol, fundSolForDeploy, createMutex, parkingSwitchChanges, DEPLOY_RENT_SOL } from "../usdc-parking.js";
 
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -163,13 +163,14 @@ test("fund: rejects a missing or non-positive amount without swapping", async ()
 test("fund: tops up with all the USDC there is when it covers deploy + reserve but not the buffer", async () => {
   const { deps, swaps } = fakes({
     balances: [
-      { sol: 0.08, usdc: 62.004, sol_price: 100 },
+      { sol: 0.08, usdc: 62, sol_price: 100 },
       { sol: 0.7, usdc: 0, sol_price: 100 },
     ],
   });
   // floor 0.6 + 0.08 = 0.68 SOL; full target would need 66.95 USDC; only 62 available.
   const r = await fundSolForDeploy(0.6, deps);
-  assert.deepEqual(swaps, [{ input_mint: USDC, output_mint: "SOL", amount: 62 }]);
+  // one cent under the reported balance, which the balance API rounds to the cent
+  assert.deepEqual(swaps, [{ input_mint: USDC, output_mint: "SOL", amount: 61.99 }]);
   assert.equal(r.success, true);
 });
 
@@ -209,4 +210,40 @@ test("createMutex runs critical sections one at a time, even when one throws", a
   assert.deepEqual(events, ["a:start", "a:end", "b:start", "b:end", "c:start", "c:end"]);
   assert.equal(results[0].status, "rejected");
   assert.equal(results[1].value, "b");
+});
+
+test("/park on turns on both parking and deploy funding", () => {
+  assert.deepEqual(parkingSwitchChanges(true), { autoParkUsdcAfterClose: true, autoFundSolFromUsdc: true });
+});
+
+test("/park off stops parking but keeps funding so leftover USDC still pays for deploys", () => {
+  assert.deepEqual(parkingSwitchChanges(false), { autoParkUsdcAfterClose: false });
+});
+
+test("fund: blocks when USDC covers deploy + reserve only before swap costs", async () => {
+  const { deps, swaps } = fakes({ balances: { sol: 0.08, usdc: 60.2, sol_price: 100 } });
+  // 0.08 + 0.602 = 0.682 ≥ 0.68 at a straight conversion, but not after ~1% swap costs
+  const r = await fundSolForDeploy(0.6, deps);
+  assert.equal(r.success, false);
+  assert.equal(swaps.length, 0);
+});
+
+test("fund: the floor always leaves room for position rent, even when the reserve is smaller", async () => {
+  const { deps, swaps } = fakes({ balances: { sol: 1.04, usdc: 0, sol_price: 250 } });
+  deps.reserveFor = () => 0.032; // $8 at $250/SOL — below the ~0.044 SOL position rent
+  const r = await fundSolForDeploy(1, deps);
+  assert.equal(r.success, false, "1.04 SOL clears 1 + 0.032 reserve but not 1 + 0.05 rent");
+  assert.equal(swaps.length, 0);
+});
+
+test("createMutex reports busy while a section runs", async () => {
+  const lock = createMutex();
+  assert.equal(lock.busy, false);
+  let release;
+  const held = lock(() => new Promise((res) => { release = res; }));
+  await Promise.resolve();
+  assert.equal(lock.busy, true);
+  release();
+  await held;
+  assert.equal(lock.busy, false);
 });

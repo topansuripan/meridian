@@ -24,11 +24,26 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  */
 export function createMutex() {
   let tail = Promise.resolve();
-  return (fn) => {
-    const run = tail.then(() => fn());
+  let pending = 0;
+  const lock = (fn) => {
+    pending++;
+    const run = tail.then(() => fn()).finally(() => { pending--; });
     tail = run.catch(() => {});
     return run;
   };
+  Object.defineProperty(lock, "busy", { get: () => pending > 0 });
+  return lock;
+}
+
+/**
+ * Config changes for `/park on|off`. Off stops parking but keeps deploy funding on:
+ * the USDC already parked still counts as buying power, so without funding every
+ * deploy sized from it would fail.
+ */
+export function parkingSwitchChanges(on) {
+  return on
+    ? { autoParkUsdcAfterClose: true, autoFundSolFromUsdc: true }
+    : { autoParkUsdcAfterClose: false };
 }
 
 export async function parkExcessSol({
@@ -109,8 +124,9 @@ export async function fundSolForDeploy(amountSol, {
   const sol = Number(before.sol || 0);
   const usdc = Number(before.usdc || 0);
   const reserveSol = reserveFor(before);
-  // The deploy itself needs `minRequired`; the rent buffer keeps the reserve intact.
-  const minRequired = amount + reserveSol;
+  // The deploy itself needs `minRequired` (amount + rent, or the reserve if larger);
+  // the target adds the rent buffer on top so the reserve survives the deploy.
+  const minRequired = amount + Math.max(reserveSol, DEPLOY_RENT_SOL);
   const target = minRequired + DEPLOY_RENT_SOL;
   if (sol >= target) {
     return { success: true, skipped: true, reason: "enough SOL already available", reserveSol, minRequired };
@@ -120,7 +136,8 @@ export async function fundSolForDeploy(amountSol, {
   if (!(solPrice > 0)) {
     return { success: false, error: "Cannot estimate SOL price to fund deploy from USDC" };
   }
-  if (sol + usdc / solPrice < minRequired) {
+  // ~1% for swap fees + slippage, so we never spend all the USDC and still come up short.
+  if (sol + (usdc / solPrice) * 0.99 < minRequired) {
     return {
       success: false,
       error: `Insufficient liquid balance: need ${minRequired.toFixed(4)} SOL for deploy + reserve, have ${sol.toFixed(4)} SOL + ${usdc.toFixed(2)} USDC`,
@@ -129,7 +146,8 @@ export async function fundSolForDeploy(amountSol, {
 
   // Full top-up when USDC allows; otherwise whatever USDC there is (covers the floor, not all the buffer).
   const neededUsdc = (target - sol) * solPrice * 1.03;
-  const amountUsdc = Math.min(Number(neededUsdc.toFixed(2)), Math.floor(usdc * 100) / 100);
+  // The balance API rounds USDC to the cent, so stay a cent under what it reports.
+  const amountUsdc = Math.min(Number(neededUsdc.toFixed(2)), Math.floor((usdc - 0.01) * 100) / 100);
   if (amountUsdc < 1) {
     if (sol >= minRequired) {
       return { success: true, skipped: true, reason: "enough SOL for deploy + reserve", reserveSol, minRequired };

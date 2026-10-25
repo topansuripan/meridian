@@ -410,7 +410,8 @@ export async function reconcileWallet() {
   }
 }
 
-// One lock for every SOL<->USDC treasury move: top-up + deploy, and each park.
+// Serializes the bot's own treasury moves: top-up + deploy, and each park.
+// (The crash guard's swaps and the LLM's swap_token tool are not covered.)
 const withTreasuryLock = createMutex();
 
 function parkingDeps() {
@@ -422,14 +423,28 @@ function parkingDeps() {
   };
 }
 
-async function parkExcessSolToUsdc() {
+async function parkExcessSolToUsdc({ skipIfBusy = false, ...opts } = {}) {
   if (!config.management.autoParkUsdcAfterClose) {
     return { skipped: true, reason: "auto park disabled" };
+  }
+  if (config.spectateMode) {
+    return { skipped: true, reason: "spectate mode" };
   }
   if (process.env.DRY_RUN === "true") {
     return { skipped: true, reason: "dry run" };
   }
-  return withTreasuryLock(() => parkExcessSol(parkingDeps()));
+  // After a close, don't queue behind an in-flight deploy: that would hold the
+  // close (and the PnL poller's other stop-losses) until the deploy lands.
+  // The next close parks whatever is left.
+  if (skipIfBusy && withTreasuryLock.busy) {
+    return { skipped: true, reason: "deploy in flight — next close parks the excess" };
+  }
+  return withTreasuryLock(() => parkExcessSol({ ...parkingDeps(), ...opts }));
+}
+
+/** `/park on`: park idle SOL now instead of waiting for the next close. */
+export function parkIdleSolNow() {
+  return parkExcessSolToUsdc({ attempts: 1 });
 }
 
 async function ensureSolForDeploy(amountSol) {
@@ -1104,7 +1119,7 @@ export async function executeTool(name, args) {
           // The close already landed — a park failure must not turn it into an error.
           let parkStable;
           try {
-            parkStable = await parkExcessSolToUsdc();
+            parkStable = await parkExcessSolToUsdc({ skipIfBusy: true });
           } catch (e) {
             parkStable = { success: false, error: e.message };
           }
