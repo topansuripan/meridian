@@ -29,22 +29,42 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   return cleaned || null;
 }
 
+// True while state.json exists but can't be parsed. Saving then would replace every
+// position record with the near-empty state load() returned, and the bot would treat
+// its own positions as the operator's (manual-positions.js). So saves pause until the
+// file parses again; getTrackedPositionSet() meanwhile reports null (all positions
+// count as the bot's).
+let _stateUnreadable = false;
+
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
+    _stateUnreadable = false;
     return { positions: {}, recentEvents: [], alerts: {}, lastReports: {}, lastUpdated: null };
   }
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    _stateUnreadable = false;
+    return state;
   } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
+    if (!_stateUnreadable) {
+      const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+      try { fs.copyFileSync(STATE_FILE, backup); } catch { /* best effort */ }
+      log("state_error", `Failed to read state.json: ${err.message} — saves paused so the file isn't overwritten (copy at ${backup})`);
+    }
+    _stateUnreadable = true;
     return { positions: {}, recentEvents: [], alerts: {}, lastReports: {}, lastUpdated: null };
   }
 }
 
 function save(state) {
+  if (_stateUnreadable) return;
   try {
     state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    // Write-then-rename so a crash mid-write can't leave a truncated state.json.
+    const tmp = `${STATE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, STATE_FILE);
+    rememberTrackedSet(state);
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }
@@ -322,33 +342,40 @@ export function getTrackedPosition(position_address) {
   return state.positions[position_address] || null;
 }
 
-let _trackedSetCache = null; // { mtimeMs, size, set }
+const _trackedSetCache = new Map(); // file → { mtimeMs, size, set }
 
 /**
  * Addresses of every position the bot has recorded, open or closed. Returns an empty
  * set when there's no state.json yet, and null when it can't be read; callers then treat
- * every position as the bot's (manual-positions.js). Cached on the file's mtime/size:
- * getMyPositions calls this on every PnL tick and state.json is large.
+ * every position as the bot's (manual-positions.js). Cached on the file's mtime/size and
+ * refreshed by save(): getMyPositions calls this on every PnL tick and state.json is large.
+ * `file` exists for tests.
  */
-export function getTrackedPositionSet() {
+export function getTrackedPositionSet(file = STATE_FILE) {
   let stat;
   try {
-    stat = fs.statSync(STATE_FILE);
+    stat = fs.statSync(file);
   } catch {
     return new Set();
   }
-  if (_trackedSetCache && _trackedSetCache.mtimeMs === stat.mtimeMs && _trackedSetCache.size === stat.size) {
-    return _trackedSetCache.set;
-  }
+  const cached = _trackedSetCache.get(file);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.set;
+  let set = null;
   try {
-    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    const set = new Set(Object.keys(state.positions || {}));
-    _trackedSetCache = { mtimeMs: stat.mtimeMs, size: stat.size, set };
-    return set;
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    set = new Set(Object.keys(state.positions || {}));
   } catch (err) {
-    log("state_error", `Failed to read state.json for position ownership: ${err.message}`);
-    return null;
+    log("state_error", `state.json can't be parsed (${err.message}) — every position counts as the bot's until it's fixed`);
   }
+  _trackedSetCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, set });
+  return set;
+}
+
+function rememberTrackedSet(state) {
+  try {
+    const stat = fs.statSync(STATE_FILE);
+    _trackedSetCache.set(STATE_FILE, { mtimeMs: stat.mtimeMs, size: stat.size, set: new Set(Object.keys(state.positions || {})) });
+  } catch { /* next getTrackedPositionSet re-reads */ }
 }
 
 /**
