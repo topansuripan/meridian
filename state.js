@@ -322,6 +322,35 @@ export function getTrackedPosition(position_address) {
   return state.positions[position_address] || null;
 }
 
+let _trackedSetCache = null; // { mtimeMs, size, set }
+
+/**
+ * Addresses of every position the bot has recorded, open or closed. Returns an empty
+ * set when there's no state.json yet, and null when it can't be read; callers then treat
+ * every position as the bot's (manual-positions.js). Cached on the file's mtime/size:
+ * getMyPositions calls this on every PnL tick and state.json is large.
+ */
+export function getTrackedPositionSet() {
+  let stat;
+  try {
+    stat = fs.statSync(STATE_FILE);
+  } catch {
+    return new Set();
+  }
+  if (_trackedSetCache && _trackedSetCache.mtimeMs === stat.mtimeMs && _trackedSetCache.size === stat.size) {
+    return _trackedSetCache.set;
+  }
+  try {
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const set = new Set(Object.keys(state.positions || {}));
+    _trackedSetCache = { mtimeMs: stat.mtimeMs, size: stat.size, set };
+    return set;
+  } catch (err) {
+    log("state_error", `Failed to read state.json for position ownership: ${err.message}`);
+    return null;
+  }
+}
+
 /**
  * Summarize state for the agent system prompt.
  */
