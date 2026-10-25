@@ -1,0 +1,69 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { splitPositions, listedPositions, createManualAlerter, manualGuardReason } from "../manual-positions.js";
+
+const A = { position: "AAAA1111", pair: "A/SOL" };
+const B = { position: "BBBB2222", pair: "B/SOL" };
+const C = { position: "CCCC3333", pair: "C/SOL" };
+
+test("split: tracked positions are the bot's, the rest are manual", () => {
+  const { bot, manual } = splitPositions([A, B, C], new Set(["AAAA1111", "CCCC3333"]));
+  assert.deepEqual(bot, [A, C]);
+  assert.deepEqual(manual, [B]);
+});
+
+test("split: unreadable state (null set) keeps every position as the bot's", () => {
+  const { bot, manual } = splitPositions([A, B], null);
+  assert.deepEqual(bot, [A, B]);
+  assert.deepEqual(manual, []);
+});
+
+test("listedPositions: bot positions first, then manual; tolerates missing arrays", () => {
+  assert.deepEqual(listedPositions({ positions: [A], manual_positions: [B] }), [A, B]);
+  assert.deepEqual(listedPositions({ positions: [A] }), [A]);
+  assert.deepEqual(listedPositions(null), []);
+});
+
+test("alerter: announces a manual position once, only after the grace period", () => {
+  const alerter = createManualAlerter({ graceMs: 1000 });
+  assert.deepEqual(alerter.observe([B], 0), []);
+  assert.deepEqual(alerter.observe([B], 999), []);
+  assert.deepEqual(alerter.observe([B], 1000), [B]);
+  assert.deepEqual(alerter.observe([B], 5000), []);
+});
+
+test("alerter: a position that disappears before the grace ends is never announced", () => {
+  const alerter = createManualAlerter({ graceMs: 1000 });
+  alerter.observe([B], 0);
+  alerter.observe([], 500); // e.g. the bot recorded its own deploy
+  assert.deepEqual(alerter.observe([B], 1200), []); // grace restarts from 1200
+  assert.deepEqual(alerter.observe([B], 2200), [B]);
+});
+
+test("alerter: an announced position is not announced again after a flicker", () => {
+  const alerter = createManualAlerter({ graceMs: 1000 });
+  alerter.observe([B], 0);
+  assert.deepEqual(alerter.observe([B], 1000), [B]);
+  alerter.observe([], 2000);
+  assert.deepEqual(alerter.observe([B], 4000), []);
+});
+
+test("guard: automatic roles cannot close or claim a manual position", () => {
+  const trackedSet = new Set(["AAAA1111"]);
+  for (const agentType of ["MANAGER", "SCREENER"]) {
+    for (const toolName of ["close_position", "claim_fees"]) {
+      const reason = manualGuardReason({ agentType, toolName, args: { position_address: "BBBB2222" }, trackedSet });
+      assert.match(reason, /manual position/, `${agentType} ${toolName}`);
+    }
+  }
+});
+
+test("guard: allows the bot's own positions, other tools, operator chat and unreadable state", () => {
+  const trackedSet = new Set(["AAAA1111"]);
+  const manualArgs = { position_address: "BBBB2222" };
+  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "close_position", args: { position_address: "AAAA1111" }, trackedSet }), null);
+  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "get_position_pnl", args: manualArgs, trackedSet }), null);
+  assert.equal(manualGuardReason({ agentType: "GENERAL", toolName: "close_position", args: manualArgs, trackedSet }), null);
+  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "close_position", args: manualArgs, trackedSet: null }), null);
+  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "close_position", args: {}, trackedSet }), null);
+});
