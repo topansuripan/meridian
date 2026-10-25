@@ -87,7 +87,8 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
-import { getStateSummary } from "./state.js";
+import { getStateSummary, getTrackedPositionSet } from "./state.js";
+import { manualGuardReason } from "./manual-positions.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
 
@@ -462,6 +463,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             tool_call_id: toolCall.id,
             content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
           };
+        }
+
+        // Automatic runs never touch a position the operator opened by hand.
+        const manualBlock = manualGuardReason({ interactive, toolName: functionName, args: functionArgs, trackedSet: getTrackedPositionSet() });
+        if (manualBlock) {
+          log("agent", manualBlock);
+          const result = { blocked: true, reason: manualBlock };
+          await onToolFinish?.({ name: functionName, args: functionArgs, result, success: false, step });
+          return { role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result) };
         }
 
         await onToolStart?.({ name: functionName, args: functionArgs, step });

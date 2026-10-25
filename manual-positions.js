@@ -60,11 +60,12 @@ export function createManualAlerter({ graceMs = MANUAL_ALERT_GRACE_MS } = {}) {
 }
 
 /**
- * Block reason when an automatic role (anything but the operator's GENERAL chat)
- * tries to close or claim a manual position; null when the call may proceed.
+ * Block reason when an automatic run tries to close or claim a manual position; null
+ * when the call may proceed. Keyed on `interactive` (operator chat / REPL), not the
+ * role: Telegram chat runs as MANAGER whenever the text mentions "close".
  */
-export function manualGuardReason({ agentType, toolName, args, trackedSet }) {
-  if (agentType === "GENERAL" || !GUARDED_TOOLS.has(toolName) || !trackedSet) return null;
+export function manualGuardReason({ interactive, toolName, args, trackedSet }) {
+  if (interactive || !GUARDED_TOOLS.has(toolName) || !trackedSet) return null;
   const address = args?.position_address;
   if (!address || trackedSet.has(address)) return null;
   return `${toolName} blocked: ${address.slice(0, 8)}… is a manual position (opened outside the bot). Only the operator manages it.`;

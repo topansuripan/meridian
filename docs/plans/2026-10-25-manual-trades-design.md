@@ -28,7 +28,7 @@ The alternative was a `manual` tag filtered at each of the ~10 automatic call si
    - `splitPositions(positions, trackedSet)` returns `{ bot, manual }`. A `null` set (state unreadable) returns everything as bot, which is today's behaviour.
    - `listedPositions(result)` returns bot positions followed by manual ones.
    - `createManualAlerter({ graceMs })` returns `observe(manual, now)`, which yields the manual positions to announce. A position is announced once, only after it has been seen untracked for `graceMs` (3 min), so a bot deploy that hasn't been recorded yet is never announced.
-   - `manualGuardReason({ agentType, toolName, args, trackedSet })` returns a block reason when an automatic role (anything but `GENERAL`) calls `close_position` or `claim_fees` on a manual position.
+   - `manualGuardReason({ interactive, toolName, args, trackedSet })` returns a block reason when an automatic run calls `close_position` or `claim_fees` on a manual position. It keys on `interactive`, the flag set for operator chat (Telegram and REPL), not on the role: Telegram chat runs as MANAGER whenever the text mentions "close".
 2. **`state.js` `getTrackedPositionSet()`** returns the set of tracked addresses, open or closed. It returns an empty set when `state.json` is missing and `null` when the file can't be parsed.
 3. **`getMyPositions`** splits the result on both the RPC and the Meteora paths. `syncOpenPositions` still receives every address. A lookup for another wallet (`wallet_address`) is not split.
 4. **Callers that see everything** (`listedPositions`):
@@ -43,7 +43,7 @@ The alternative was a `manual` tag filtered at each of the ~10 automatic call si
    - the screening and opportunity pre-checks and the post-management screening trigger;
    - `/closeall`, which now says how many manual positions it left open;
    - `/status` and the agent's system prompt.
-6. **Agent guard** (`agent.js`, before `executeTool`): uses `manualGuardReason`, so MANAGER and SCREENER can never close or claim a manual position. The operator's chat (`GENERAL`) still can.
+6. **Agent guard** (`agent.js`, before `executeTool`): uses `manualGuardReason`, so the automatic cycles (management, screening, health check) can never close or claim a manual position. The operator's chat (`interactive: true`) still can.
 7. **Reconcile sweep:** `reconcileWalletToSol` takes an optional `isBotToken(mint)`. When it's given, only bot tokens are swept. `reconcileWallet` passes the 24-hour pool-memory check. The pending-swap queue only ever holds bot tokens, so it is unchanged.
 8. **Alert:** the management cycle runs every 5 min, even with no positions, and feeds `manual_positions` to the alerter. It sends one Telegram message per position: "👤 Manual position detected: PAIR (addr…) — the bot won't manage it. If you didn't open it, check the wallet."
 
@@ -64,7 +64,7 @@ The alternative was a `manual` tag filtered at each of the ~10 automatic call si
 - the split, including the `null` fallback;
 - `listedPositions` ordering;
 - the alerter's grace, alert-once and forgetting;
-- the guard matrix (role × tool × tracked);
+- the guard matrix (interactive × tool × tracked);
 - the `isBotToken` filter in `reconcileWalletToSol`.
 
 The existing reconcile tests run unchanged.

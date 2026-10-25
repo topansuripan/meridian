@@ -48,22 +48,21 @@ test("alerter: an announced position is not announced again after a flicker", ()
   assert.deepEqual(alerter.observe([B], 4000), []);
 });
 
-test("guard: automatic roles cannot close or claim a manual position", () => {
+test("guard: automatic runs cannot close or claim a manual position", () => {
   const trackedSet = new Set(["AAAA1111"]);
-  for (const agentType of ["MANAGER", "SCREENER"]) {
-    for (const toolName of ["close_position", "claim_fees"]) {
-      const reason = manualGuardReason({ agentType, toolName, args: { position_address: "BBBB2222" }, trackedSet });
-      assert.match(reason, /manual position/, `${agentType} ${toolName}`);
-    }
+  for (const toolName of ["close_position", "claim_fees"]) {
+    const reason = manualGuardReason({ interactive: false, toolName, args: { position_address: "BBBB2222" }, trackedSet });
+    assert.match(reason, /manual position/, toolName);
   }
 });
 
 test("guard: allows the bot's own positions, other tools, operator chat and unreadable state", () => {
   const trackedSet = new Set(["AAAA1111"]);
   const manualArgs = { position_address: "BBBB2222" };
-  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "close_position", args: { position_address: "AAAA1111" }, trackedSet }), null);
-  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "get_position_pnl", args: manualArgs, trackedSet }), null);
-  assert.equal(manualGuardReason({ agentType: "GENERAL", toolName: "close_position", args: manualArgs, trackedSet }), null);
-  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "close_position", args: manualArgs, trackedSet: null }), null);
-  assert.equal(manualGuardReason({ agentType: "MANAGER", toolName: "close_position", args: {}, trackedSet }), null);
+  assert.equal(manualGuardReason({ interactive: false, toolName: "close_position", args: { position_address: "AAAA1111" }, trackedSet }), null);
+  assert.equal(manualGuardReason({ interactive: false, toolName: "get_position_pnl", args: manualArgs, trackedSet }), null);
+  // Telegram chat runs as MANAGER when the text mentions "close", but it is the operator asking.
+  assert.equal(manualGuardReason({ interactive: true, toolName: "close_position", args: manualArgs, trackedSet }), null);
+  assert.equal(manualGuardReason({ interactive: false, toolName: "close_position", args: manualArgs, trackedSet: null }), null);
+  assert.equal(manualGuardReason({ interactive: false, toolName: "close_position", args: {}, trackedSet }), null);
 });

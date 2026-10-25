@@ -292,7 +292,7 @@ Run `node --test test-wallet-reconcile.js`. Expected: the first new test FAILs.
 
 ```js
         // Automatic roles never touch a position the operator opened by hand.
-        const manualBlock = manualGuardReason({ agentType, toolName: functionName, args: functionArgs, trackedSet: getTrackedPositionSet() });
+        const manualBlock = manualGuardReason({ interactive, toolName: functionName, args: functionArgs, trackedSet: getTrackedPositionSet() });
         if (manualBlock) {
           log("agent", manualBlock);
           const result = { blocked: true, reason: manualBlock };
@@ -340,3 +340,5 @@ Verify with `node --check index.js`. Commit: `feat(telegram): show manual positi
   2. VPS: `git merge --ff-only` in a quiet window;
   3. `pm2 restart meridian --update-env`;
   4. check the boot log, and that `node cli.js positions` shows `manual_positions`.
+
+**Execution note:** Task 5 changed during implementation. Telegram chat runs as MANAGER whenever the text mentions "close", so the guard keys on `interactive` rather than `agentType`. The Task 1 tests were updated to match.
