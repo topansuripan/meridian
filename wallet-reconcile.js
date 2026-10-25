@@ -11,7 +11,9 @@
  *  2. `reconcileWalletToSol` — safety-net sweep that swaps any stray, non
  *     SOL/USDC token sitting in the wallet above the dust threshold back to SOL.
  *     Backstop for every orphan path (close-verification lag, relay-zap
- *     fallback, late-arriving tokens, process restarts).
+ *     fallback, late-arriving tokens, process restarts). With `isBotToken`,
+ *     only the bot's own tokens are swept, so tokens the operator bought by
+ *     hand stay put (manual-positions.js).
  *
  * All I/O in `reconcileWalletToSol` is injected so it is unit-testable without
  * a wallet or network.
@@ -43,6 +45,7 @@ export async function reconcileWalletToSol({
   minUsd = 0.1,
   solMint = DEFAULT_SOL_MINT,
   usdcMint = DEFAULT_USDC_MINT,
+  isBotToken = null,
 } = {}) {
   const balances = await getWalletBalances();
   const tokens = Array.isArray(balances?.tokens) ? balances.tokens : [];
@@ -68,6 +71,7 @@ export async function reconcileWalletToSol({
 
   const strays = tokens.filter((t) => {
     if (!t?.mint || protectedMints.has(t.mint)) return false;
+    if (isBotToken && !isBotToken(t.mint)) return false;
     const usd = Number(t.usd);
     return Number.isFinite(usd) && usd >= minUsd;
   });

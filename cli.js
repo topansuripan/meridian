@@ -297,8 +297,9 @@ switch (subcommand) {
       poolAddress = tracked.pool;
     } else {
       // Fall back: scan positions to find pool
+      const { listedPositions } = await import("./manual-positions.js");
       const pos = await getMyPositions({ force: true });
-      const found = pos.positions?.find(p => p.position === positionAddress);
+      const found = listedPositions(pos).find(p => p.position === positionAddress);
       if (!found) die("Position not found", { position: positionAddress });
       poolAddress = found.pool;
     }

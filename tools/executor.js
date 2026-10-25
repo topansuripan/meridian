@@ -13,6 +13,7 @@ import { getWalletBalances, swapToken, waitForWalletTokenBalance, getWalletToken
 import { addPendingSwap, recordSwapAttempt, removePendingSwap, getPendingSwaps } from "../pending-swaps.js";
 import { shouldRunPostCloseSweep, reconcileWalletToSol } from "../wallet-reconcile.js";
 import { parkExcessSol, fundSolForDeploy, createMutex } from "../usdc-parking.js";
+import { listedPositions, BOT_TOKEN_WINDOW_MS } from "../manual-positions.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction, getTrackedPosition } from "../state.js";
@@ -397,7 +398,9 @@ export async function reconcileWallet() {
   try {
     return await reconcileWalletToSol({
       getWalletBalances: () => getWalletBalances({}),
-      getOpenPositions: async () => (await getMyPositions({ force: true }))?.positions || [],
+      // Manual positions' tokens are protected too, and only the bot's own tokens are swept.
+      getOpenPositions: async () => listedPositions(await getMyPositions({ force: true })),
+      isBotToken: (mint) => wasBaseMintDeployedSince(mint, new Date(Date.now() - BOT_TOKEN_WINDOW_MS)),
       autoSwapToSol,
       addPendingSwap,
       log,
@@ -1363,19 +1366,21 @@ async function runSafetyChecks(name, args) {
           reason: `Max ${isDegen ? "degen" : "normal"} positions (${typeMax}) reached. Close a ${isDegen ? "degen" : "normal"} position first.`,
         };
       }
-      const alreadyInPool = positions.positions.some(
+      // Duplicate checks include manual positions: don't pile into what the operator holds.
+      const allPositions = listedPositions(positions);
+      const alreadyInPool = allPositions.some(
         (p) => p.pool === args.pool_address
       );
       if (alreadyInPool) {
         return {
           pass: false,
-          reason: `Already have an open position in pool ${args.pool_address}. Cannot open duplicate.`,
+          reason: `Already have an open position (yours or the bot's) in pool ${args.pool_address}. Cannot open duplicate.`,
         };
       }
 
       // Block same base token across different pools (use resolved CA, not LLM symbol)
       if (baseMint) {
-        const alreadyHasMint = positions.positions.some(
+        const alreadyHasMint = allPositions.some(
           (p) => p.base_mint === baseMint
         );
         if (alreadyHasMint) {

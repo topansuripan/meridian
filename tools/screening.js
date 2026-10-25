@@ -7,6 +7,7 @@ import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { discoverGmgnPools } from "./gmgn.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { resolvePoolDetail } from "../pool-detail-resolver.js";
+import { listedPositions } from "../manual-positions.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -725,8 +726,9 @@ export async function getTopCandidates({ limit = 10, allowRelaxedFallback = true
   }
 
   // Exclude pools where the wallet already has an open position
+  // Includes manual positions: the bot doesn't pile into pools/tokens the operator holds.
   const { getMyPositions } = await import("./dlmm.js");
-  const { positions } = await getMyPositions();
+  const positions = listedPositions(await getMyPositions());
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
   const minTvl = source === "gmgn"

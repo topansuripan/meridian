@@ -169,3 +169,16 @@ test("queues a stray token for retry when its swap fails", async () => {
   assert.equal(queued[0].mint, MINT_A);
   assert.equal(queued[0].source, "reconcile");
 });
+
+test("with isBotToken, only the bot's own tokens are swept", async () => {
+  const { swapped, deps } = makeDeps({ isBotToken: (mint) => mint !== MINT_A });
+  const res = await reconcileWalletToSol(deps);
+  assert.deepEqual(swapped, []);
+  assert.equal(res.strays, 0);
+});
+
+test("with isBotToken, a bot token is still swept", async () => {
+  const { swapped, deps } = makeDeps({ isBotToken: (mint) => mint === MINT_A });
+  await reconcileWalletToSol(deps);
+  assert.deepEqual(swapped, [MINT_A]);
+});
