@@ -71,9 +71,10 @@ export async function reconcileWalletToSol({
 
   const strays = tokens.filter((t) => {
     if (!t?.mint || protectedMints.has(t.mint)) return false;
-    if (isBotToken && !isBotToken(t.mint)) return false;
     const usd = Number(t.usd);
-    return Number.isFinite(usd) && usd >= minUsd;
+    if (!Number.isFinite(usd) || usd < minUsd) return false;
+    // Last: it reads pool-memory.json, so only run it for tokens worth sweeping.
+    return !isBotToken || isBotToken(t.mint);
   });
 
   let swept = 0;
