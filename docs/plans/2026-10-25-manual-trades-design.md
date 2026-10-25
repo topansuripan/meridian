@@ -78,3 +78,9 @@ A code review before shipping found the following. All of them are fixed.
 - **Telegram `<n>` could shift** between `/positions` and `/close <n>`. It now resolves against the last listing.
 - **The reconcile sweep ran the pool-memory lookup before the dust check.** It now checks dust first.
 - **The plan told the implementer to run `test/test-agent.js`,** which is a live script. That instruction is removed.
+
+A second review of those fixes found more, also fixed:
+- the temp file is now per process (`state.json.<pid>.tmp`);
+- while saves are paused, `deploy_position` is refused (a deploy then couldn't be recorded) and Telegram gets one alert;
+- only a JSON `SyntaxError` counts as corruption, and an I/O error is retried once;
+- `/positions` resets its listing before fetching, so a failed or empty fetch can't leave an older listing for `/close <n>`.

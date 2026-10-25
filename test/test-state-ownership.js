@@ -40,7 +40,7 @@ test("tracked set: picks up a new record written by trackPosition", () => {
   track("NEW1");
   assert.ok(state.getTrackedPositionSet(STATE).has("NEW1"));
   assert.ok(state.getTrackedPositionSet(STATE).has("AAA"));
-  assert.ok(!fs.existsSync(`${STATE}.tmp`), "temp file renamed into place");
+  assert.ok(!fs.readdirSync(SANDBOX).some((f) => f.endsWith(".tmp")), "temp file renamed into place");
 });
 
 test("save: a corrupt state.json is never overwritten, and saves resume once it parses", () => {
@@ -48,9 +48,11 @@ test("save: a corrupt state.json is never overwritten, and saves resume once it 
   track("NEW2");
   assert.equal(fs.readFileSync(STATE, "utf8"), "{ truncated");
   assert.ok(fs.readdirSync(SANDBOX).some((f) => f.startsWith("state.json.corrupt-")), "backup copy written");
+  assert.equal(state.isStateWritable(), false, "deploys must stop while records can't be saved");
 
   write({ positions: { AAA: {} } });
   track("NEW3");
+  assert.equal(state.isStateWritable(), true);
   const saved = JSON.parse(fs.readFileSync(STATE, "utf8"));
   assert.deepEqual(Object.keys(saved.positions).sort(), ["AAA", "NEW3"]);
 });

@@ -21,6 +21,7 @@ import { listedPositions, createManualAlerter, resolveListedPosition } from "./m
 const manualAlerter = createManualAlerter();
 // Addresses in the order the last /positions showed them; /close, /pool and /set resolve <n> against it.
 let _positionsListing = null;
+let _stateUnreadableAlerted = false;
 import {
   startPolling,
   stopPolling,
@@ -35,7 +36,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal, shouldSendAlert } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal, shouldSendAlert, isStateWritable } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { getHolographicRecall, getHolographicStrategyHint, isTopLPStudyStale } from "./holographic-memory.js";
@@ -508,6 +509,15 @@ export async function runManagementCycle({ silent = false } = {}) {
       log("cron_error", `Management cycle: could not read positions (${livePositions.error}) — skipping this cycle (no screening triggered)`);
       mgmtReport = `Management cycle skipped: could not read positions (${livePositions.error}).`;
       return mgmtReport;
+    }
+
+    if (!isStateWritable()) {
+      if (!_stateUnreadableAlerted) {
+        _stateUnreadableAlerted = true;
+        sendMessage("⚠️ state.json can't be read. Deploys are paused and position records aren't being saved (see the state.json.corrupt-* copy). Open positions are still managed. Fix or restore state.json.").catch(() => {});
+      }
+    } else {
+      _stateUnreadableAlerted = false;
     }
 
     // Positions opened by hand are left alone; say so once, so an unrecorded bot deploy can't hide.
@@ -2516,7 +2526,9 @@ async function telegramHandler(msg) {
 
   if (text === "/positions") {
     try {
+      _positionsListing = []; // an older listing must never resolve a later /close <n>
       const result = await getMyPositions({ force: true });
+      if (result?.error) { await sendMessage(`Couldn't read positions: ${result.error}`); return; }
       const positions = listedPositions(result);
       if (positions.length === 0) { await sendMessage("No open positions."); return; }
       const manualSet = new Set((result.manual_positions || []).map((p) => p.position));

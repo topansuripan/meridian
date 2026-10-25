@@ -19,7 +19,7 @@ gmgn-config.json
 
 # Runtime state (position tracking, lessons — user-specific)
 state.json
-state.json.tmp
+state.json.*.tmp
 state.json.corrupt-*
 lessons.json
 smart-wallets.json

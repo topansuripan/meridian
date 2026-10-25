@@ -16,7 +16,7 @@ import { parkExcessSol, fundSolForDeploy, createMutex } from "../usdc-parking.js
 import { listedPositions, BOT_TOKEN_WINDOW_MS } from "../manual-positions.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, getTrackedPosition } from "../state.js";
+import { setPositionInstruction, getTrackedPosition, isStateWritable } from "../state.js";
 
 import { getPoolMemory, addPoolNote, wasBaseMintDeployedSince, setDeployFailureCooldown } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -1190,6 +1190,10 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      // A deploy that can't be recorded is never managed (manual-positions.js), so wait it out.
+      if (!isStateWritable()) {
+        return { pass: false, skipCooldown: true, reason: "state.json can't be read, so a new position couldn't be recorded. Deploys resume once it reads again." };
+      }
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);

@@ -29,12 +29,26 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   return cleaned || null;
 }
 
-// True while state.json exists but can't be parsed. Saving then would replace every
+// True while state.json exists but can't be read. Saving then would replace every
 // position record with the near-empty state load() returned, and the bot would treat
 // its own positions as the operator's (manual-positions.js). So saves pause until the
-// file parses again; getTrackedPositionSet() meanwhile reports null (all positions
-// count as the bot's).
+// file reads again, deploys are refused (isStateWritable), and getTrackedPositionSet()
+// reports null meanwhile (all positions count as the bot's).
 let _stateUnreadable = false;
+
+export function isStateWritable() {
+  return !_stateUnreadable;
+}
+
+function readStateFile() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch (err) {
+    if (err instanceof SyntaxError) throw err;
+    // One retry for a transient I/O error (EBUSY from antivirus, EMFILE).
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  }
+}
 
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
@@ -42,14 +56,18 @@ function load() {
     return { positions: {}, recentEvents: [], alerts: {}, lastReports: {}, lastUpdated: null };
   }
   try {
-    const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const state = readStateFile();
+    if (_stateUnreadable) log("state", "state.json readable again — saves resumed");
     _stateUnreadable = false;
     return state;
   } catch (err) {
     if (!_stateUnreadable) {
-      const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
-      try { fs.copyFileSync(STATE_FILE, backup); } catch { /* best effort */ }
-      log("state_error", `Failed to read state.json: ${err.message} — saves paused so the file isn't overwritten (copy at ${backup})`);
+      let note = "";
+      if (err instanceof SyntaxError) {
+        const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+        try { fs.copyFileSync(STATE_FILE, backup); note = ` (copy at ${backup})`; } catch { /* best effort */ }
+      }
+      log("state_error", `Failed to read state.json: ${err.message} — saves paused and deploys refused until it reads again${note}`);
     }
     _stateUnreadable = true;
     return { positions: {}, recentEvents: [], alerts: {}, lastReports: {}, lastUpdated: null };
@@ -57,11 +75,15 @@ function load() {
 }
 
 function save(state) {
-  if (_stateUnreadable) return;
+  if (_stateUnreadable) {
+    log("state_error", "Skipped a state.json write: the file on disk can't be read");
+    return;
+  }
   try {
     state.lastUpdated = new Date().toISOString();
-    // Write-then-rename so a crash mid-write can't leave a truncated state.json.
-    const tmp = `${STATE_FILE}.tmp`;
+    // Write-then-rename so a crash mid-write can't leave a truncated state.json. The temp
+    // name is per process: a cli.js run alongside the pm2 bot must not share it.
+    const tmp = `${STATE_FILE}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
     fs.renameSync(tmp, STATE_FILE);
     rememberTrackedSet(state);
