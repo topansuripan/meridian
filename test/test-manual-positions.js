@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { splitPositions, listedPositions, createManualAlerter, manualGuardReason } from "../manual-positions.js";
+import { splitPositions, listedPositions, createManualAlerter, manualGuardReason, resolveListedPosition } from "../manual-positions.js";
 
 const A = { position: "AAAA1111", pair: "A/SOL" };
 const B = { position: "BBBB2222", pair: "B/SOL" };
@@ -82,4 +82,19 @@ test("guard: automatic runs may swap SOL, USDC and the bot's own tokens; the ope
     assert.equal(auto(mint), null, mint);
   }
   assert.equal(manualGuardReason({ interactive: true, toolName: "swap_token", args: { input_mint: "USERMINT" }, trackedSet: new Set(), isBotToken }), null);
+});
+
+test("resolveListedPosition: <n> means the position /positions showed at n, even if the list shifted", () => {
+  const listing = ["AAAA1111", "BBBB2222"]; // as /positions showed them
+  // A new bot deploy C now sorts before the manual B.
+  const live = [A, C, B];
+  assert.deepEqual(resolveListedPosition(live, 2, listing), { pos: B });
+  assert.match(resolveListedPosition([A], 2, listing).error, /run \/positions again/);
+  assert.match(resolveListedPosition(live, 3, listing).error, /Invalid number/);
+  assert.match(resolveListedPosition(live, 0, listing).error, /Invalid number/);
+});
+
+test("resolveListedPosition: without a /positions listing, <n> indexes the live list", () => {
+  assert.deepEqual(resolveListedPosition([A, B], 2, null), { pos: B });
+  assert.match(resolveListedPosition([A], 2, null).error, /Invalid number/);
 });

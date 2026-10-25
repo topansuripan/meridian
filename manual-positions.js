@@ -44,6 +44,21 @@ export function listedPositions(result) {
   return [...(result?.positions || []), ...(result?.manual_positions || [])];
 }
 
+/**
+ * Telegram `/close <n>` etc.: `n` means the position the last `/positions` showed at n
+ * (`listing` = its addresses in order), so a deploy or close in between can't shift n
+ * onto a different position. Without a listing, n indexes the live list.
+ */
+export function resolveListedPosition(positions, n, listing) {
+  const invalid = { error: "Invalid number. Use /positions first." };
+  if (!Number.isInteger(n) || n < 1) return invalid;
+  if (!listing) return positions[n - 1] ? { pos: positions[n - 1] } : invalid;
+  const address = listing[n - 1];
+  if (!address) return invalid;
+  const pos = positions.find((p) => p.position === address);
+  return pos ? { pos } : { error: "That position has closed since /positions — run /positions again." };
+}
+
 export function createManualAlerter({ graceMs = MANUAL_ALERT_GRACE_MS } = {}) {
   const firstSeen = new Map();
   const announced = new Set();
