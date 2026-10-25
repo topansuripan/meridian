@@ -22,7 +22,9 @@ import {
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
+  getTrackedPositionSet,
 } from "../state.js";
+import { splitPositions, listedPositions } from "../manual-positions.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown, recordPoolDeployStart } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
@@ -687,9 +689,10 @@ export async function deployPosition({
       await new Promise((resolve) => setTimeout(resolve, 5000));
       _positionsCacheAt = 0;
       const refreshed = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      const matching = refreshed?.positions?.find(
+      // The new position isn't recorded yet, so it sits in manual_positions until trackPosition below.
+      const matching = listedPositions(refreshed).find(
         (position) => position.pool === pool_address && position.lower_bin === minBinId && position.upper_bin === maxBinId,
-      ) || refreshed?.positions?.find((position) => position.pool === pool_address);
+      ) || listedPositions(refreshed).find((position) => position.pool === pool_address);
 
       const positionAddress = matching?.position || null;
       if (positionAddress) {
@@ -970,7 +973,7 @@ export async function getPositionPnl({ pool_address, position_address }) {
   if (config.pnl.source === "rpc") {
     try {
       const payload = await getMyPositions({ force: true, silent: true });
-      const p = payload?.positions?.find((position) => position.position === position_address);
+      const p = listedPositions(payload).find((position) => position.position === position_address);
       if (p) {
         return {
           pnl_usd: p.pnl_usd,
@@ -1156,6 +1159,13 @@ async function fetchRawOpenPositionsFromMeridian({ walletAddress, agentId }) {
 }
 
 // ─── Get My Positions ──────────────────────────────────────────
+// Bot-recorded positions stay in `positions`; anything opened outside the bot goes to
+// `manual_positions`, so every automatic consumer ignores it (manual-positions.js).
+function splitByOwnership(result) {
+  const { bot, manual } = splitPositions(result.positions, getTrackedPositionSet());
+  return { ...result, positions: bot, total_positions: bot.length, manual_positions: manual };
+}
+
 export async function getMyPositions({ force = false, silent = false, wallet_address = null } = {}) {
   let walletOverride = null;
   try {
@@ -1185,12 +1195,12 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       try {
         if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
         const rpcResult = await computePositions(walletAddress);
-        if (useLocalWallet) {
-          syncOpenPositions(rpcResult.positions.map((p) => p.position));
-          _positionsCache = rpcResult;
-          _positionsCacheAt = Date.now();
-        }
-        return rpcResult;
+        if (!useLocalWallet) return rpcResult;
+        syncOpenPositions(rpcResult.positions.map((p) => p.position));
+        const split = splitByOwnership(rpcResult);
+        _positionsCache = split;
+        _positionsCacheAt = Date.now();
+        return split;
       } catch (error) {
         log("positions_warn", `RPC PnL path failed; falling back to Meteora portfolio API: ${error.message}`);
       }
@@ -1356,12 +1366,12 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       positions,
       source: "meteora",
     };
-    if (useLocalWallet) {
-      syncOpenPositions(positions.map(p => p.position));
-      _positionsCache = result;
-      _positionsCacheAt = Date.now();
-    }
-    return result;
+    if (!useLocalWallet) return result;
+    syncOpenPositions(positions.map(p => p.position));
+    const split = splitByOwnership(result);
+    _positionsCache = split;
+    _positionsCacheAt = Date.now();
+    return split;
   } catch (error) {
     log("positions_error", `Portfolio fetch failed: ${error.stack || error.message}`);
     return { wallet: walletAddress, total_positions: 0, positions: [], error: error.message };
@@ -1495,7 +1505,7 @@ export async function claimFees({ position_address }) {
     let feesUsd = 0;
     try {
       const livePositions = await getMyPositions({ silent: true });
-      const livePosition = livePositions?.positions?.find((p) => p.position === position_address);
+      const livePosition = listedPositions(livePositions).find((p) => p.position === position_address);
       if (livePosition) {
         feesUsd = livePosition.unclaimed_fees_true_usd ?? livePosition.unclaimed_fees_usd ?? 0;
       }
@@ -1599,7 +1609,7 @@ export async function closePosition({ position_address, reason }) {
         config.tokens.SOL,
       ];
       const livePositions = await getMyPositions({ force: true, silent: true });
-      const livePosition = livePositions?.positions?.find((position) => position.position === position_address);
+      const livePosition = listedPositions(livePositions).find((position) => position.position === position_address);
       // Snapshot live PnL BEFORE the close-confirmation loop trashes _positionsCache.
       // Used as the fallback if the closed-PnL API hasn't settled after the close.
       const snapshotPnl = livePosition
@@ -1679,7 +1689,7 @@ export async function closePosition({ position_address, reason }) {
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
           const refreshed = await getMyPositions({ force: true, silent: true });
-          const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
+          const stillOpen = listedPositions(refreshed).some((p) => p.position === position_address);
           if (!stillOpen) {
             closedConfirmed = true;
             break;
@@ -1882,7 +1892,7 @@ export async function closePosition({ position_address, reason }) {
     let localSnapshotPnl = null;
     try {
       const livePositions = await getMyPositions({ silent: true });
-      const livePosition = livePositions?.positions?.find((p) => p.position === position_address);
+      const livePosition = listedPositions(livePositions).find((p) => p.position === position_address);
       if (livePosition) {
         localSnapshotPnl = {
           pnl_true_usd: livePosition.pnl_true_usd,
@@ -1983,7 +1993,7 @@ export async function closePosition({ position_address, reason }) {
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
         const refreshed = await getMyPositions({ force: true, silent: true });
-        const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
+        const stillOpen = listedPositions(refreshed).some((p) => p.position === position_address);
         if (!stillOpen) {
           closedConfirmed = true;
           break;
@@ -2089,7 +2099,7 @@ export async function closePosition({ position_address, reason }) {
       // only if that snapshot is missing (it may still hold the record here since
       // the local path times out only when the position still appears open).
       if (finalValueUsd === 0) {
-        const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
+        const cachedPos = listedPositions(_positionsCache).find(p => p.position === position_address);
         if (cachedPos) {
           pnlTrueUsd    = cachedPos.pnl_true_usd ?? (config.management.solMode ? 0 : cachedPos.pnl_usd) ?? 0;
           pnlUsd        = config.management.solMode ? (cachedPos.pnl_usd ?? 0) : pnlTrueUsd;
@@ -2223,7 +2233,7 @@ async function lookupPoolForPosition(position_address, walletAddress) {
   if (tracked?.pool) return tracked.pool;
 
   // Check in-memory positions cache
-  const cached = _positionsCache?.positions?.find((p) => p.position === position_address);
+  const cached = listedPositions(_positionsCache).find((p) => p.position === position_address);
   if (cached?.pool) return cached.pool;
 
   // SDK scan (last resort)
