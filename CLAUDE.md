@@ -116,6 +116,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `briefing.js` | 71 | HTML daily report. 24h activity, performance, lessons, current portfolio. Sent at 1:00 UTC. |
 | `envcrypt.js` | 121 | XOR-cipher with a key from `.envrypt`/`ENVRYPT_KEY`. Encrypts anything matching `*_KEY`, `*SECRET*`, `*TOKEN*`, `*MNEMONIC*`, etc. The `# encrypted` marker in `.env` precedes encrypted lines. |
 | `network-defaults.js` | 8 | Imported second in `index.js`. Raises Node's happy-eyeballs per-address timeout from 250 ms to 5 s; at 250 ms, Telegram sends and polls failed with `fetch failed (ETIMEDOUT [ETIMEDOUT, ENETUNREACH])` whenever the event loop stalled (VPS→Telegram ≈175 ms, no IPv6). |
+| `usdc-parking.js` | 133 | Idle funds live in USDC. `parkExcessSol` (after each close, `autoParkUsdcAfterClose`) swaps SOL above the reserve to USDC; `fundSolForDeploy` (before `deploy_position`, `autoFundSolFromUsdc`) swaps the shortfall ×1.03 back, targeting deploy + reserve + `DEPLOY_RENT_SOL` (0.05, position rent). Dependency-injected; wrappers in `executor.js`. See docs/plans/2026-10-25-usdc-parking-design.md. |
 | `logger.js` | 75 | Daily-rotating `logs/agent-YYYY-MM-DD.log`. `logAction({tool, args, result, duration_ms, success})` writes JSONL `actions-YYYY-MM-DD.jsonl` audit trail. Level via `LOG_LEVEL` env. |
 | **Other** | | |
 | `discord-listener/`, `test/`, `scripts/`, `utils/` | | Discord listener (above), syntax-checked tests, envcrypt CLI, `safeNumber`. |
@@ -570,6 +571,16 @@ A global watch-only mode. Cron cycles keep running and monitoring continues, but
 **Config**: `autoReconcileWallet` (management, default true) — per-cycle safety-net sweep of stray tokens → SOL.
 
 **Tests**: `test-wallet-reconcile.js` (node:test, gitignored per convention) — `shouldRunPostCloseSweep` truth table (success / blocked / genuine failure / verification-timeout with & without base_mint & txs) and `reconcileWalletToSol` (sweeps strays, skips SOL/USDC/dust, protects open positions, queues on swap failure).
+
+---
+
+## USDC Parking (October 2026)
+
+**Behaviour**: after a close swaps the token back to SOL, SOL above the reserve (`max(gasReserve, solUsdReserve / solPrice)`, ~$8) is parked to USDC. Before a deploy, `ensureSolForDeploy` swaps just enough USDC back to SOL. Every pre-deploy balance check (`getLiquidSolEquivalent`, the safety check, `computeDeployAmount`) already counts USDC as buying power, and the reconcile sweep never touches SOL/USDC.
+
+**Gotchas**: a deploy pays ~0.042–0.044 SOL position rent on top of the amount, so funding targets deploy + reserve + 0.05 SOL; if USDC can't cover the buffer but SOL covers deploy + reserve, the deploy proceeds. The post-close park is wrapped in try/catch so a park failure never reports a landed close as failed (before Oct 2026 a `solPrice` scope bug threw on every successful park). Each park/top-up sends a swap notification.
+
+**Tests**: `test/test-usdc-parking.js`.
 
 ---
 

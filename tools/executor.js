@@ -12,6 +12,7 @@ import {
 import { getWalletBalances, swapToken, waitForWalletTokenBalance, getWalletTokenBalance } from "./wallet.js";
 import { addPendingSwap, recordSwapAttempt, removePendingSwap, getPendingSwaps } from "../pending-swaps.js";
 import { shouldRunPostCloseSweep, reconcileWalletToSol } from "../wallet-reconcile.js";
+import { parkExcessSol, fundSolForDeploy } from "../usdc-parking.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction, getTrackedPosition } from "../state.js";
@@ -409,115 +410,27 @@ export async function reconcileWallet() {
   }
 }
 
-async function parkExcessSolToUsdc({ minUsd = 1, attempts = 4, delayMs = 3000 } = {}) {
+function parkingDeps() {
+  return {
+    getWalletBalances: () => getWalletBalances({}),
+    swapToken,
+    reserveFor: getTargetSolReserve,
+    usdcMint: config.tokens.USDC,
+  };
+}
+
+async function parkExcessSolToUsdc() {
   if (!config.management.autoParkUsdcAfterClose) {
     return { skipped: true, reason: "auto park disabled" };
   }
-
-  let balances = null;
-  let reserveSol = config.management.gasReserve || 0;
-  let excessSol = 0;
-  let excessUsd = 0;
-
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    balances = await getWalletBalances({});
-    const solPrice = Number(balances.sol_price || 0);
-    reserveSol = getTargetSolReserve(balances);
-    excessSol = Number((balances.sol || 0) - reserveSol);
-    excessUsd = solPrice > 0 ? excessSol * solPrice : 0;
-
-    if (Number.isFinite(excessSol) && excessSol > 0 && Number.isFinite(excessUsd) && excessUsd >= minUsd) {
-      break;
-    }
-    if (attempt < attempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-
-  if (!Number.isFinite(excessSol) || excessSol <= 0) {
-    return { skipped: true, reason: "no excess SOL to park", reserveSol, excessSol, excessUsd };
-  }
-  if (!Number.isFinite(excessUsd) || excessUsd < minUsd) {
-    return { skipped: true, reason: `excess SOL below $${minUsd}`, reserveSol, excessSol, excessUsd };
-  }
-
-  const amountToSwap = Math.max(0, Number(excessSol.toFixed(4)));
-  if (amountToSwap <= 0) {
-    return { skipped: true, reason: "amount rounds to zero", reserveSol };
-  }
-
-  const swapResult = await swapToken({
-    input_mint: "SOL",
-    output_mint: config.tokens.USDC,
-    amount: amountToSwap,
-  });
-
-  return {
-    ...swapResult,
-    success: swapResult?.success !== false && !swapResult?.error,
-    amount: amountToSwap,
-    reserveSol,
-    reserveUsd: solPrice > 0 ? reserveSol * solPrice : null,
-  };
+  return parkExcessSol(parkingDeps());
 }
 
 async function ensureSolForDeploy(amountSol) {
   if (!config.management.autoFundSolFromUsdc) {
     return { skipped: true, reason: "auto fund disabled" };
   }
-
-  const before = await getWalletBalances({});
-  const reserveSol = getTargetSolReserve(before);
-  const minRequired = amountSol + reserveSol;
-  if ((before.sol || 0) >= minRequired) {
-    return {
-      success: true,
-      skipped: true,
-      reason: "enough SOL already available",
-      reserveSol,
-      minRequired,
-    };
-  }
-
-  const solPrice = Number(before.sol_price || 0);
-  if (!(solPrice > 0)) {
-    return { success: false, error: "Cannot estimate SOL price to fund deploy from USDC" };
-  }
-
-  const deficitSol = minRequired - (before.sol || 0);
-  const neededUsdc = deficitSol * solPrice * 1.03;
-  if ((before.usdc || 0) < neededUsdc) {
-    return {
-      success: false,
-      error: `Insufficient liquid balance: need about ${neededUsdc.toFixed(2)} USDC to top up ${deficitSol.toFixed(4)} SOL, have ${Number(before.usdc || 0).toFixed(2)} USDC`,
-    };
-  }
-
-  const amountUsdc = Math.max(0.1, Number(neededUsdc.toFixed(2)));
-  const swapResult = await swapToken({
-    input_mint: config.tokens.USDC,
-    output_mint: "SOL",
-    amount: amountUsdc,
-  });
-  if (swapResult?.success === false || swapResult?.error) {
-    return {
-      success: false,
-      error: swapResult?.error || "USDC → SOL top-up failed",
-    };
-  }
-
-  await new Promise((resolve) => setTimeout(resolve, 4000));
-  const after = await getWalletBalances({});
-  const funded = (after.sol || 0) >= minRequired;
-  return {
-    success: funded,
-    tx: swapResult.tx,
-    amountUsdc,
-    reserveSol,
-    minRequired,
-    finalSol: after.sol || 0,
-    error: funded ? null : `Top-up completed but SOL still below required amount (${(after.sol || 0).toFixed(4)} < ${minRequired.toFixed(4)})`,
-  };
+  return fundSolForDeploy(amountSol, parkingDeps());
 }
 
 function coerceBoolean(value, key) {
@@ -1172,7 +1085,13 @@ export async function executeTool(name, args) {
           }
         }
         if (!args.skip_swap) {
-          const parkStable = await parkExcessSolToUsdc();
+          // The close already landed — a park failure must not turn it into an error.
+          let parkStable;
+          try {
+            parkStable = await parkExcessSolToUsdc();
+          } catch (e) {
+            parkStable = { success: false, error: e.message };
+          }
           if (parkStable?.success) {
             result.parked_to_usdc = true;
             result.park_to_usdc_note = `Excess SOL already parked to USDC while keeping ~${Number(parkStable.reserveSol || 0).toFixed(4)} SOL reserve.`;
@@ -1185,7 +1104,6 @@ export async function executeTool(name, args) {
             }).catch(() => {});
           } else if (!parkStable?.skipped) {
             log("executor_warn", `Auto-park after close failed: ${parkStable?.error || "unknown error"}`);
-
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
