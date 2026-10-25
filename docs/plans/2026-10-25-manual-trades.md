@@ -301,7 +301,7 @@ Run `node --test test-wallet-reconcile.js`. Expected: the first new test FAILs.
         }
 ```
 
-Imports: `manualGuardReason` from `./manual-positions.js` and `getTrackedPositionSet` from `./state.js`. Verify with `node --check agent.js` and `node --test test/test-agent.js`. Commit: `feat(agent): block automatic close/claim of manual positions`.
+Imports: `manualGuardReason` from `./manual-positions.js` and `getTrackedPositionSet` from `./state.js`. Verify with `node --check agent.js`. (Do NOT run `test/test-agent.js`: it is a live script that runs the real agent and deploys SOL.) Commit: `feat(agent): block automatic close/claim of manual positions`.
 
 ---
 
@@ -333,7 +333,7 @@ Verify with `node --check index.js`. Commit: `feat(telegram): show manual positi
   - add a module row for `manual-positions.js`;
   - add a "## Manual Trades in the Bot Wallet (October 2026)" section covering ownership, what ignores manual positions, `listedPositions` callers, the alert, the reconcile 24 h window, the `null` fallback and tests;
   - update the reconcile and `/closeall` lines.
-- Run every test file: `for f in test/*.js test-*.js; do node --test $f; done`. Expected: all pass.
+- Run every unit test file: `for f in $(grep -l "node:test" test/*.js test-*.js); do node --test --test-force-exit $f; done`. Expected: all pass. Only files importing `node:test` are unit tests; `test/test-agent.js` and the screening scripts are live.
 - Dispatch a code reviewer subagent on the diff `5ff7ed6..HEAD`, then fix confirmed findings.
 - Deploy:
   1. `git push origin feature/degen-mode` (origin only);

@@ -68,3 +68,13 @@ The alternative was a `manual` tag filtered at each of the ~10 automatic call si
 - the `isBotToken` filter in `reconcileWalletToSol`.
 
 The existing reconcile tests run unchanged.
+
+## Review fixes
+
+A code review before shipping found the following. All of them are fixed.
+- **Critical: automatic runs could still sell a hand-bought token.** The MANAGER prompt makes `swap_token` mandatory after every close and lists every wallet token. The agent guard now also blocks non-interactive `swap_token` unless the input is SOL/USDC, an open bot position's token, or a token the bot traded in the last 24 h.
+- **A corrupt `state.json` could make the null fallback temporary.** `load()` returned an empty state on a parse error, and the next non-atomic `save()` wiped every record, which turned every bot position manual. Saves are now atomic (write and rename), they pause while the file can't be parsed (a backup copy is made), and `save()` refreshes the ownership cache.
+- **The relay deploy looked for its own position once, after 5 s.** It now retries for ~30 s and warns if the position still isn't found. It also clears the cached split after recording.
+- **Telegram `<n>` could shift** between `/positions` and `/close <n>`. It now resolves against the last listing.
+- **The reconcile sweep ran the pool-memory lookup before the dust check.** It now checks dust first.
+- **The plan told the implementer to run `test/test-agent.js`,** which is a live script. That instruction is removed.
