@@ -726,7 +726,8 @@ After executing, write a brief one-line result per position.
             executeTool("close_position", { position_address, reason }),
           swapSolToUsdc: async () => {
             const b = await getWalletBalances();
-            const swappable = Math.max(0, b.sol - config.solCrashGuard.keepGasReserveSol);
+            // Never sell below the parking reserve (keepGasReserveSol falls back to gasReserve, which can be 0).
+            const swappable = Math.max(0, b.sol - Math.max(config.solCrashGuard.keepGasReserveSol, getTargetSolReserve(b)));
             if (swappable <= 0) return { usdcOut: 0 };
             const before = (await getWalletBalances()).usdc;
             await swapToken({ input_mint: "SOL", output_mint: config.tokens.USDC, amount: swappable });
@@ -734,6 +735,8 @@ After executing, write a brief one-line result per position.
             return { usdcOut: Math.max(0, after - before) };
           },
           swapUsdcToSol: async (parkedUsdc) => {
+            // With deploy funding on, parked USDC stays put; each deploy swaps back what it needs.
+            if (config.management.autoFundSolFromUsdc) return { solOut: null };
             const b = await getWalletBalances();
             // Only swap back what the breaker parked — never sweep unrelated operator USDC.
             // If parkedUsdc is null/0 (e.g. the trip's SOL->USDC swap had failed), swap nothing.
@@ -1658,8 +1661,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
           getWalletBalances().catch(() => null),
         ]);
         if (!positions || (positions.total_positions ?? 0) >= config.risk.maxPositions) return;
-        const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-        if (process.env.DRY_RUN !== "true" && (!balance || balance.sol < minRequired)) return;
+        // Parked USDC counts: deploy_position tops SOL back up from it (usdc-parking.js).
+        if (!balance && process.env.DRY_RUN !== "true") return;
+        const minRequired = config.management.deployAmountSol + (balance ? getTargetSolReserve(balance) : 0);
+        if (process.env.DRY_RUN !== "true" && getLiquidSolEquivalent(balance) < minRequired) return;
 
         const top = await getTopCandidates({ limit: config.opportunity.limit }).catch(() => null);
         const candidates = (top?.candidates || []).slice().sort((a, b) => degenScore(b, config.opportunity) - degenScore(a, config.opportunity));

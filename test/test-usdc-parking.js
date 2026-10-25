@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parkExcessSol, fundSolForDeploy, DEPLOY_RENT_SOL } from "../usdc-parking.js";
+import { parkExcessSol, fundSolForDeploy, createMutex, DEPLOY_RENT_SOL } from "../usdc-parking.js";
 
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -132,4 +132,81 @@ test("fund: fails without a SOL price", async () => {
   const r = await fundSolForDeploy(1, deps);
   assert.equal(r.success, false);
   assert.equal(swaps.length, 0);
+});
+
+test("park: reports USDC received in UI units (swap returns raw base units)", async () => {
+  const { deps } = fakes({
+    balances: { sol: 2, usdc: 0, sol_price: 100 },
+    swapResult: { success: true, tx: "sig1", amount_out: "191800000" },
+  });
+  const r = await parkExcessSol(deps);
+  assert.equal(r.usdcOut, 191.8);
+});
+
+test("fund: a string amount is treated as a number, not concatenated", async () => {
+  const { deps, swaps } = fakes({ balances: { sol: 5, usdc: 0, sol_price: 100 } });
+  const r = await fundSolForDeploy("0.5", deps);
+  assert.equal(r.success, true);
+  assert.equal(r.skipped, true);
+  assert.equal(swaps.length, 0);
+});
+
+test("fund: rejects a missing or non-positive amount without swapping", async () => {
+  for (const bad of [undefined, 0, -1, "abc"]) {
+    const { deps, swaps } = fakes({ balances: { sol: 0.08, usdc: 500, sol_price: 100 } });
+    const r = await fundSolForDeploy(bad, deps);
+    assert.equal(r.success, false, `amount ${bad}`);
+    assert.equal(swaps.length, 0);
+  }
+});
+
+test("fund: tops up with all the USDC there is when it covers deploy + reserve but not the buffer", async () => {
+  const { deps, swaps } = fakes({
+    balances: [
+      { sol: 0.08, usdc: 62.004, sol_price: 100 },
+      { sol: 0.7, usdc: 0, sol_price: 100 },
+    ],
+  });
+  // floor 0.6 + 0.08 = 0.68 SOL; full target would need 66.95 USDC; only 62 available.
+  const r = await fundSolForDeploy(0.6, deps);
+  assert.deepEqual(swaps, [{ input_mint: USDC, output_mint: "SOL", amount: 62 }]);
+  assert.equal(r.success, true);
+});
+
+test("fund: blocks without swapping when SOL + USDC can't cover deploy + reserve", async () => {
+  const { deps, swaps } = fakes({ balances: { sol: 0.08, usdc: 50, sol_price: 100 } });
+  const r = await fundSolForDeploy(0.6, deps);
+  assert.equal(r.success, false);
+  assert.match(r.error, /Insufficient liquid balance/);
+  assert.equal(swaps.length, 0);
+});
+
+test("fund: keeps polling while the balance lags behind a landed swap", async () => {
+  const { deps } = fakes({
+    balances: [
+      { sol: 0.08, usdc: 500, sol_price: 100 },
+      { sol: 0.08, usdc: 500, sol_price: 100 },
+      { sol: 0.08, usdc: 500, sol_price: 100 },
+      { sol: 1.16, usdc: 391, sol_price: 100 },
+    ],
+  });
+  const r = await fundSolForDeploy(1, deps);
+  assert.equal(r.success, true);
+  assert.equal(r.finalSol, 1.16);
+});
+
+test("createMutex runs critical sections one at a time, even when one throws", async () => {
+  const lock = createMutex();
+  const events = [];
+  const slow = (name, ms, fail = false) => lock(async () => {
+    events.push(`${name}:start`);
+    await new Promise((res) => setTimeout(res, ms));
+    events.push(`${name}:end`);
+    if (fail) throw new Error(name);
+    return name;
+  });
+  const results = await Promise.allSettled([slow("a", 20, true), slow("b", 1), slow("c", 1)]);
+  assert.deepEqual(events, ["a:start", "a:end", "b:start", "b:end", "c:start", "c:end"]);
+  assert.equal(results[0].status, "rejected");
+  assert.equal(results[1].value, "b");
 });

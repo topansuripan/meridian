@@ -13,7 +13,23 @@
 // Funding only deploy + reserve would let that rent eat the gas reserve.
 export const DEPLOY_RENT_SOL = 0.05;
 
+const USDC_DECIMALS = 6;
+
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Serialize async critical sections. The executor holds one lock across
+ * top-up + deploy and across each park, so a park can't sell SOL a deploy just
+ * funded and two deploys can't count the same SOL.
+ */
+export function createMutex() {
+  let tail = Promise.resolve();
+  return (fn) => {
+    const run = tail.then(() => fn());
+    tail = run.catch(() => {});
+    return run;
+  };
+}
 
 export async function parkExcessSol({
   getWalletBalances,
@@ -63,10 +79,13 @@ export async function parkExcessSol({
     amount: amountToSwap,
   });
 
+  // swapToken reports amount_out in raw base units.
+  const rawOut = Number(swapResult?.amount_out);
   return {
     ...swapResult,
     success: swapResult?.success !== false && !swapResult?.error,
     amount: amountToSwap,
+    usdcOut: Number.isFinite(rawOut) ? rawOut / 10 ** USDC_DECIMALS : null,
     reserveSol,
     reserveUsd: solPrice > 0 ? reserveSol * solPrice : null,
   };
@@ -77,14 +96,21 @@ export async function fundSolForDeploy(amountSol, {
   swapToken,
   reserveFor,
   usdcMint,
-  settleMs = 4000,
+  settleMs = 3000,
+  settleChecks = 4,
   sleep = wait,
 }) {
+  const amount = Number(amountSol);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { success: false, error: `Invalid deploy amount for SOL funding: ${amountSol}` };
+  }
+
   const before = await getWalletBalances();
   const sol = Number(before.sol || 0);
+  const usdc = Number(before.usdc || 0);
   const reserveSol = reserveFor(before);
-  // The deploy itself only needs `minRequired`; the rent buffer keeps the reserve intact.
-  const minRequired = amountSol + reserveSol;
+  // The deploy itself needs `minRequired`; the rent buffer keeps the reserve intact.
+  const minRequired = amount + reserveSol;
   const target = minRequired + DEPLOY_RENT_SOL;
   if (sol >= target) {
     return { success: true, skipped: true, reason: "enough SOL already available", reserveSol, minRequired };
@@ -94,20 +120,23 @@ export async function fundSolForDeploy(amountSol, {
   if (!(solPrice > 0)) {
     return { success: false, error: "Cannot estimate SOL price to fund deploy from USDC" };
   }
-
-  const deficitSol = target - sol;
-  const neededUsdc = deficitSol * solPrice * 1.03;
-  if ((before.usdc || 0) < neededUsdc) {
-    if (sol >= minRequired) {
-      return { success: true, skipped: true, reason: "enough SOL for deploy + reserve (no USDC for rent buffer)", reserveSol, minRequired };
-    }
+  if (sol + usdc / solPrice < minRequired) {
     return {
       success: false,
-      error: `Insufficient liquid balance: need about ${neededUsdc.toFixed(2)} USDC to top up ${deficitSol.toFixed(4)} SOL, have ${Number(before.usdc || 0).toFixed(2)} USDC`,
+      error: `Insufficient liquid balance: need ${minRequired.toFixed(4)} SOL for deploy + reserve, have ${sol.toFixed(4)} SOL + ${usdc.toFixed(2)} USDC`,
     };
   }
 
-  const amountUsdc = Math.max(0.1, Number(neededUsdc.toFixed(2)));
+  // Full top-up when USDC allows; otherwise whatever USDC there is (covers the floor, not all the buffer).
+  const neededUsdc = (target - sol) * solPrice * 1.03;
+  const amountUsdc = Math.min(Number(neededUsdc.toFixed(2)), Math.floor(usdc * 100) / 100);
+  if (amountUsdc < 1) {
+    if (sol >= minRequired) {
+      return { success: true, skipped: true, reason: "enough SOL for deploy + reserve", reserveSol, minRequired };
+    }
+    return { success: false, error: `USDC top-up too small to fund deploy (${amountUsdc.toFixed(2)} USDC)` };
+  }
+
   const swapResult = await swapToken({
     input_mint: usdcMint,
     output_mint: "SOL",
@@ -117,9 +146,13 @@ export async function fundSolForDeploy(amountSol, {
     return { success: false, error: swapResult?.error || "USDC → SOL top-up failed" };
   }
 
-  await sleep(settleMs);
-  const after = await getWalletBalances();
-  const finalSol = Number(after.sol || 0);
+  // The balance can lag the confirmed swap by a few seconds.
+  let finalSol = sol;
+  for (let check = 0; check < settleChecks; check++) {
+    await sleep(settleMs);
+    finalSol = Number((await getWalletBalances()).sol || 0);
+    if (finalSol >= minRequired) break;
+  }
   const funded = finalSol >= minRequired;
   return {
     success: funded,

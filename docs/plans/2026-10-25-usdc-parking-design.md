@@ -38,6 +38,18 @@ Each meridian deploy pays 0.042–0.044 SOL of position rent on top of the amoun
 
 A park that throws is caught at the `close_position` call site. A close that already landed is therefore never reported to the LLM as failed.
 
+## Review fixes
+
+A code review before shipping found these, and all of them are fixed:
+- **The opportunity poller only checked SOL.** That would have silently stopped it once funds were parked. It now uses the liquid SOL equivalent plus the reserve.
+- **There was no lock between a top-up and its deploy, or around each park.** One treasury mutex now covers both.
+- **A string `amount_y` broke the funding math.** It is now coerced and validated.
+- **Funding checked the balance only once after the swap.** It now polls.
+- **DRY_RUN faked a park.** Parking is now skipped under DRY_RUN.
+- **Funding couldn't top up partially.** It now swaps whatever USDC there is when that covers deploy + reserve.
+- **The park notification showed raw USDC units.** It now shows normal units.
+- **SOL-crash guard:** re-entry no longer swaps its USDC back when deploy funding is on. The trip-time SOL→USDC swap keeps the parking reserve, because `keepGasReserveSol` falls back to `gasReserve`, which is 0 on the VPS.
+
 ## Behaviour after
 
 - A position closes. The token is swapped to SOL as today. Then SOL above about $8 is swapped to USDC.

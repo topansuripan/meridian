@@ -12,7 +12,7 @@ import {
 import { getWalletBalances, swapToken, waitForWalletTokenBalance, getWalletTokenBalance } from "./wallet.js";
 import { addPendingSwap, recordSwapAttempt, removePendingSwap, getPendingSwaps } from "../pending-swaps.js";
 import { shouldRunPostCloseSweep, reconcileWalletToSol } from "../wallet-reconcile.js";
-import { parkExcessSol, fundSolForDeploy } from "../usdc-parking.js";
+import { parkExcessSol, fundSolForDeploy, createMutex } from "../usdc-parking.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction, getTrackedPosition } from "../state.js";
@@ -410,6 +410,9 @@ export async function reconcileWallet() {
   }
 }
 
+// One lock for every SOL<->USDC treasury move: top-up + deploy, and each park.
+const withTreasuryLock = createMutex();
+
 function parkingDeps() {
   return {
     getWalletBalances: () => getWalletBalances({}),
@@ -423,7 +426,10 @@ async function parkExcessSolToUsdc() {
   if (!config.management.autoParkUsdcAfterClose) {
     return { skipped: true, reason: "auto park disabled" };
   }
-  return parkExcessSol(parkingDeps());
+  if (process.env.DRY_RUN === "true") {
+    return { skipped: true, reason: "dry run" };
+  }
+  return withTreasuryLock(() => parkExcessSol(parkingDeps()));
 }
 
 async function ensureSolForDeploy(amountSol) {
@@ -1012,28 +1018,38 @@ export async function executeTool(name, args) {
 
   // ─── Execute ──────────────────────────────
   try {
+    let result;
     if (name === "deploy_position" && process.env.DRY_RUN !== "true") {
-      const amountY = args.amount_y ?? args.amount_sol ?? 0;
-      const funding = await ensureSolForDeploy(amountY);
-      if (funding?.success === false) {
-        log("safety_block", `deploy_position blocked: ${funding.error}`);
+      // Hold the treasury lock from top-up through the deploy so a concurrent park
+      // can't sell the SOL this deploy was just funded with.
+      let fundingBlock = null;
+      result = await withTreasuryLock(async () => {
+        const funding = await ensureSolForDeploy(args.amount_y ?? args.amount_sol ?? 0);
+        if (funding?.success === false) {
+          fundingBlock = funding;
+          return null;
+        }
+        if (funding?.tx) {
+          notifySwap({
+            inputSymbol: "USDC",
+            outputSymbol: "SOL",
+            amountIn: funding.amountUsdc,
+            amountOut: null,
+            tx: funding.tx,
+          }).catch(() => {});
+        }
+        return fn(args);
+      });
+      if (fundingBlock) {
+        log("safety_block", `deploy_position blocked: ${fundingBlock.error}`);
         return {
           blocked: true,
-          reason: funding.error,
+          reason: fundingBlock.error,
         };
       }
-      if (funding?.tx) {
-        notifySwap({
-          inputSymbol: "USDC",
-          outputSymbol: "SOL",
-          amountIn: funding.amountUsdc,
-          amountOut: null,
-          tx: funding.tx,
-        }).catch(() => {});
-      }
+    } else {
+      result = await fn(args);
     }
-
-    const result = await fn(args);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
 
@@ -1099,7 +1115,7 @@ export async function executeTool(name, args) {
               inputSymbol: "SOL",
               outputSymbol: "USDC",
               amountIn: parkStable.amount,
-              amountOut: parkStable.amount_out ?? null,
+              amountOut: parkStable.usdcOut ?? null,
               tx: parkStable.tx,
             }).catch(() => {});
           } else if (!parkStable?.skipped) {
