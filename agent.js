@@ -88,7 +88,8 @@ import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 import { getStateSummary, getTrackedPositionSet } from "./state.js";
-import { manualGuardReason } from "./manual-positions.js";
+import { manualGuardReason, BOT_TOKEN_WINDOW_MS } from "./manual-positions.js";
+import { wasBaseMintDeployedSince } from "./pool-memory.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
 
@@ -202,6 +203,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const { interactive = false, onToolStart = null, onToolFinish = null, degen = false } = options;
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+  // Tokens an automatic run may sell: open bot positions' tokens and anything the bot traded in the last 24h.
+  const openBotMints = new Set((positions?.positions || []).map((p) => p.base_mint).filter(Boolean));
+  const isBotToken = (mint) => openBotMints.has(mint) || wasBaseMintDeployedSince(mint, new Date(Date.now() - BOT_TOKEN_WINDOW_MS));
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType, degen });
   const perfSummary = getPerformanceSummary();
@@ -465,8 +469,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           };
         }
 
-        // Automatic runs never touch a position the operator opened by hand.
-        const manualBlock = manualGuardReason({ interactive, toolName: functionName, args: functionArgs, trackedSet: getTrackedPositionSet() });
+        // Automatic runs never touch a position or token the operator holds by hand.
+        const manualBlock = manualGuardReason({ interactive, toolName: functionName, args: functionArgs, trackedSet: getTrackedPositionSet(), isBotToken });
         if (manualBlock) {
           log("agent", manualBlock);
           const result = { blocked: true, reason: manualBlock };

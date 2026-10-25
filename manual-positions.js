@@ -17,6 +17,16 @@ export const MANUAL_ALERT_GRACE_MS = 3 * 60 * 1000;
 
 const GUARDED_TOOLS = new Set(["close_position", "claim_fees"]);
 
+// SOL spellings match wallet.js normalizeMint (incl. Helius's no-trailing-2 variant).
+const SOL_OR_USDC = new Set([
+  "SOL",
+  "native",
+  "So11111111111111111111111111111111111111112",
+  "So11111111111111111111111111111111111111111",
+  "USDC",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+]);
+
 /**
  * `trackedSet` null means state.json couldn't be read: keep every position as the
  * bot's (the behaviour before manual positions existed) rather than drop its stop losses.
@@ -60,12 +70,20 @@ export function createManualAlerter({ graceMs = MANUAL_ALERT_GRACE_MS } = {}) {
 }
 
 /**
- * Block reason when an automatic run tries to close or claim a manual position; null
- * when the call may proceed. Keyed on `interactive` (operator chat / REPL), not the
- * role: Telegram chat runs as MANAGER whenever the text mentions "close".
+ * Block reason when an automatic run tries to close or claim a manual position, or to
+ * sell a token that isn't the bot's (the MANAGER prompt makes a swap after every close
+ * mandatory and lists every wallet token); null when the call may proceed. Keyed on
+ * `interactive` (operator chat / REPL), not the role: Telegram chat runs as MANAGER
+ * whenever the text mentions "close".
  */
-export function manualGuardReason({ interactive, toolName, args, trackedSet }) {
-  if (interactive || !GUARDED_TOOLS.has(toolName) || !trackedSet) return null;
+export function manualGuardReason({ interactive, toolName, args, trackedSet, isBotToken = null }) {
+  if (interactive) return null;
+  if (toolName === "swap_token") {
+    const mint = args?.input_mint;
+    if (!mint || SOL_OR_USDC.has(mint) || isBotToken?.(mint)) return null;
+    return `swap_token blocked: ${String(mint).slice(0, 8)}… isn't a token the bot traded in the last 24h, so it may be the operator's. Only the operator swaps it.`;
+  }
+  if (!GUARDED_TOOLS.has(toolName) || !trackedSet) return null;
   const address = args?.position_address;
   if (!address || trackedSet.has(address)) return null;
   return `${toolName} blocked: ${address.slice(0, 8)}… is a manual position (opened outside the bot). Only the operator manages it.`;

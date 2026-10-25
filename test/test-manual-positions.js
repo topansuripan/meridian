@@ -66,3 +66,20 @@ test("guard: allows the bot's own positions, other tools, operator chat and unre
   assert.equal(manualGuardReason({ interactive: false, toolName: "close_position", args: manualArgs, trackedSet: null }), null);
   assert.equal(manualGuardReason({ interactive: false, toolName: "close_position", args: {}, trackedSet }), null);
 });
+
+test("guard: automatic runs cannot swap a token that isn't the bot's", () => {
+  const isBotToken = (mint) => mint === "BOTMINT1";
+  const reason = manualGuardReason({ interactive: false, toolName: "swap_token", args: { input_mint: "USERMINT", output_mint: "SOL" }, trackedSet: new Set(), isBotToken });
+  assert.match(reason, /swap_token blocked/);
+  // Unknown ownership is treated as the operator's.
+  assert.match(manualGuardReason({ interactive: false, toolName: "swap_token", args: { input_mint: "USERMINT" }, trackedSet: null }), /swap_token blocked/);
+});
+
+test("guard: automatic runs may swap SOL, USDC and the bot's own tokens; the operator may swap anything", () => {
+  const isBotToken = (mint) => mint === "BOTMINT1";
+  const auto = (input_mint) => manualGuardReason({ interactive: false, toolName: "swap_token", args: { input_mint }, trackedSet: new Set(), isBotToken });
+  for (const mint of ["SOL", "native", "So11111111111111111111111111111111111111112", "USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "BOTMINT1"]) {
+    assert.equal(auto(mint), null, mint);
+  }
+  assert.equal(manualGuardReason({ interactive: true, toolName: "swap_token", args: { input_mint: "USERMINT" }, trackedSet: new Set(), isBotToken }), null);
+});
