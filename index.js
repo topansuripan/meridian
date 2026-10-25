@@ -792,6 +792,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
   _screeningBusy = true; // set immediately — prevents TOCTOU race with concurrent callers
   _screeningLastTriggered = Date.now();
 
+  // The cycle's chat message is opt-in (/setcfg screeningReports true); deploys notify on their own.
+  const announce = !silent && config.screening.reportsToTelegram === true;
+
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance, normalPositionCount;
   let liveMessage = null;
@@ -859,7 +862,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
+  if (announce && telegramEnabled()) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
@@ -1223,7 +1226,7 @@ IMPORTANT:
     }
   } finally {
     _screeningBusy = false;
-    if (!silent && telegramEnabled()) {
+    if (announce && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });

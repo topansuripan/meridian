@@ -130,6 +130,7 @@ export const config = {
   // ─── Pool Screening Thresholds ───────────
   screening: {
     source:            u.screeningSource    ?? "meteora", // meteora | gmgn
+    reportsToTelegram: u.screeningReports === true, // "🔍 Screening Cycle" chat message; deploys still notify
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
     minTvl:            u.minTvl            ?? 10_000,

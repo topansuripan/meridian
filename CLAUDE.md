@@ -671,7 +671,7 @@ network call must never be indistinguishable from an empty wallet.
 
 **Queueing**: while a management/screening cycle or free-form agentLoop is busy, inbound messages are queued (`_telegramQueue`, max 5). Overflow sends "Queue is full".
 
-**Live messages**: `createLiveMessage` returns a handle. `toolStart`/`toolFinish` push per-tool lines (with `ℹ️`/`✅`/`❌` icons) into a single Telegram message that gets edited in place. While a live message is active, standalone notifications (`notifyDeploy`/`notifyClose`/`notifySwap`/`notifyOutOfRange`) are suppressed to avoid spam.
+**Live messages**: `createLiveMessage` returns a handle. `toolStart`/`toolFinish` push per-tool lines (with `ℹ️`/`✅`/`❌` icons) into a single Telegram message that gets edited in place. While a live message is active, standalone notifications (`notifyDeploy`/`notifyClose`/`notifySwap`/`notifyOutOfRange`) are suppressed to avoid spam. The screening cycle's live message ("🔍 Screening Cycle") is opt-in: `/setcfg screeningReports true` (default off, `config.screening.reportsToTelegram`). With it off, a screening deploy arrives as a standalone `notifyDeploy`.
 
 ---
 
